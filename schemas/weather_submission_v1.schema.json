@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://powerpals.dev/schemas/weather_submission_v1.schema.json",
+  "title": "PowerPals Weather Submission v1",
+  "type": "object",
+  "required": [
+    "task_id",
+    "region",
+    "target_date",
+    "data_cutoff_time",
+    "provider_results",
+    "aggregated_forecast",
+    "confidence",
+    "key_factors",
+    "risk_notes",
+    "disclaimer"
+  ],
+  "properties": {
+    "task_id": { "type": "string", "pattern": "^WEATHER-SZ-[0-9]{8}-DAYAHEAD-[0-9]{3}$" },
+    "region": { "type": "string" },
+    "target_date": { "type": "string", "format": "date" },
+    "data_cutoff_time": { "type": "string" },
+    "provider_results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/provider_forecast" }
+    },
+    "aggregated_forecast": { "$ref": "#/$defs/aggregated_forecast" },
+    "confidence": {
+      "type": "object",
+      "required": ["score", "description"],
+      "properties": {
+        "score": { "type": "number" },
+        "description": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "key_factors": { "type": "array", "items": { "type": "string" } },
+    "risk_notes": { "type": "array", "items": { "type": "string" } },
+    "disclaimer": { "type": "string" }
+  },
+  "$defs": {
+    "forecast_point": {
+      "type": "object",
+      "required": ["time"],
+      "properties": {
+        "time": { "type": "string" },
+        "temperature": { "type": ["number", "null"] },
+        "precipitation_probability": { "type": ["number", "null"] },
+        "wind_speed": { "type": ["number", "null"] },
+        "cloud_cover": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "provider_forecast": {
+      "type": "object",
+      "required": ["provider", "status", "points"],
+      "properties": {
+        "provider": { "type": "string" },
+        "status": { "enum": ["ok", "disabled", "error"] },
+        "points": { "type": "array", "items": { "$ref": "#/$defs/forecast_point" } },
+        "error_message": { "type": ["string", "null"] },
+        "raw": { "type": ["object", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "forecast_summary": {
+      "type": "object",
+      "required": ["main_weather", "high_risk_period"],
+      "properties": {
+        "max_temperature": { "type": ["number", "null"] },
+        "min_temperature": { "type": ["number", "null"] },
+        "rain_probability": { "type": ["number", "null"] },
+        "wind_speed": { "type": ["number", "null"] },
+        "cloud_cover": { "type": ["number", "null"] },
+        "main_weather": { "type": "string" },
+        "high_risk_period": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "aggregated_forecast": {
+      "type": "object",
+      "required": ["providers_used", "points", "summary"],
+      "properties": {
+        "providers_used": { "type": "array", "items": { "type": "string" } },
+        "points": { "type": "array", "items": { "$ref": "#/$defs/forecast_point" } },
+        "summary": { "$ref": "#/$defs/forecast_summary" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
