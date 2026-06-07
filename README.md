@@ -1,6 +1,6 @@
 # PowerPals 全国气象机器人与任务发布机器人
 
-PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、评分、复盘的开源示范项目。本仓库当前提供一套可运行的 **全国气象预测机器人 + 气象任务发布机器人**。
+PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、评分、复盘的开源示范项目。本仓库当前提供一套可运行的 **全国气象预测机器人 + 气象任务发布机器人**，并提供一个最小可用的气象裁判评分接口。
 
 项目目标不是给出交易或报价建议，而是跑通社区可复用的共测闭环：
 
@@ -14,14 +14,16 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 共建是宗旨，共测是机制，评分是工具，复盘是方法，成长是结果。
 ```
 
-## 两个机器人
+## 两个主机器人
 
 | 机器人 | 作用 | 典型输入 | 典型输出 |
 |---|---|---|---|
-| 气象预测机器人 | 查询城市、地区或经纬度对应的逐小时气象预测 | `广州明天天气`、`23.1291,113.2644 天气` | `weather_submission_v1` JSON、飞书预测卡片 |
-| 气象任务发布机器人 | 发布共测任务、统一提交口径、提醒提交、关闭窗口、记录状态 | `今日广州气象任务`、`发布北京气象任务 2026-06-10` | 任务卡片、任务记录、后续评分输入 |
+| 全国气象预测机器人 | 查询城市、地区或经纬度对应的逐小时气象预测，只负责预测和解释 | `广州明天天气`、`22.8016,113.5252 明天天气` | `weather_submission_v1` JSON、飞书预测卡片，响应中标记 `bot_role=weather_forecast_bot` |
+| 气象任务发布机器人 | 发布共测任务、统一提交口径、提醒提交、关闭窗口、记录状态，不计算天气 | `今日广州气象任务`、`22.8016,113.5252 今日气象任务` | 任务卡片、任务记录、后续评分输入，响应中标记 `bot_role=weather_task_bot` |
 
 任务机器人本身不计算天气。它负责“组织比赛/共测流程”：告诉大家测哪里、测哪天、什么时候截止、用什么格式提交，并把任务状态写入飞书多维表格或本地 JSONL。
+
+裁判目前不是第三个完整业务机器人，而是一个最小评分工具：输入标准预测 JSON 和实况摘要，输出温度误差、降水命中、风速误差和综合分。后续可以扩展为独立裁判 Bot、榜单和复盘报告。
 
 ## 全国位置支持
 
@@ -62,6 +64,7 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 | `POST` | `/api/weather/forecast/range` | 生成多日标准气象预测提交 |
 | `POST` | `/api/weather/submission` | 记录外部 Bot 的标准提交 |
 | `POST` | `/api/weather/publish` | 生成预测、发布预测卡片并记录 |
+| `POST` | `/api/judge/weather/score` | 用实况摘要对单条气象预测做基础评分 |
 | `POST` | `/api/tasks/weather/create` | 生成任务草稿 |
 | `POST` | `/api/tasks/weather/publish` | 发布任务卡片并记录任务 |
 | `POST` | `/api/tasks/weather/remind` | 发布提交提醒并记录任务状态 |
@@ -110,6 +113,14 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/tasks/weather/publish `
   -Body '{"region":"广州南沙","latitude":22.8016,"longitude":113.5252,"target_date":"2026-06-10"}'
 ```
 
+最小裁判评分：
+
+```powershell
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/judge/weather/score `
+  -ContentType "application/json" `
+  -Body '{"submission":{...},"truth":{"max_temperature":31.0,"min_temperature":26.0,"rain_observed":false,"wind_speed":3.0}}'
+```
+
 ## 任务 ID
 
 全国通用格式：
@@ -137,12 +148,14 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 @机器人 广州明天天气
 @机器人 北京气象预测 2026-06-10
 @机器人 广州未来三天天气
+@机器人 22.8016,113.5252 明天天气
 @机器人 今日广州气象任务
+@机器人 22.8016,113.5252 今日气象任务
 @机器人 发布北京气象任务 2026-06-10
 @机器人 帮助
 ```
 
-如果一句话同时包含“任务”和“天气预测”，系统优先按任务命令处理。后续可继续升级为更完整的 Intent Router。
+如果一句话同时包含“任务”和“天气预测”，系统优先按任务命令处理。当前响应会通过 `bot_role` 明确返回是预测机器人还是任务机器人处理，后续可继续升级为更完整的 Intent Router。
 
 ## 标准提交格式
 
@@ -170,6 +183,28 @@ disclaimer
 examples/weather_submission_shenzhen.json
 schemas/weather_submission_v1.schema.json
 ```
+
+## 最小裁判评分
+
+`/api/judge/weather/score` 用于后续裁判 Bot 的第一步，不依赖大模型，不生成榜单。输入：
+
+```text
+submission: weather_submission_v1
+truth: max_temperature, min_temperature, rain_observed, wind_speed
+```
+
+输出包含：
+
+```text
+judge_bot_id
+scoring_version
+metrics
+component_scores
+total_score
+summary
+```
+
+当前规则：温度分占 45%，降水命中占 35%，风速误差占 20%。降水以 `rain_probability >= 50%` 作为是否预测有雨的阈值。该接口只用于共测评分和复盘，不构成气象业务认证。
 
 ## 定时节奏
 
@@ -260,6 +295,8 @@ Compose 包含两个服务：
 docker compose config
 docker compose build
 ```
+
+仓库包含 GitHub Actions CI，push 或 PR 时会自动运行测试、编译检查、Schema 示例校验、`docker compose config` 和 Docker 构建。
 
 ## 合规边界
 

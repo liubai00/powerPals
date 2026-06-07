@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from services.weather_bot.cards import build_feishu_card
 from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuClient, verify_feishu_token
+from services.weather_bot.judge import WeatherJudgeRequest, WeatherJudgeResult, score_weather_submission
 from services.weather_bot.location import BUILTIN_LOCATIONS, LocationResolver, location_slug
 from services.weather_bot.models import ForecastRequest, SubmissionRecord, WeatherSubmission
 from services.weather_bot.service import ForecastService
@@ -31,11 +32,21 @@ def create_app(
     expected_token = feishu_verification_token if feishu_verification_token is not None else settings.feishu_verification_token
     task_index: dict[str, WeatherTask] = {}
 
-    app = FastAPI(title="PowerPals Weather Bot", version="0.3.0")
+    app = FastAPI(title="PowerPals Weather Bot", version="0.4.0")
 
     def _cache_task(task: WeatherTask) -> WeatherTask:
         task_index[task.task_id] = task
         return task
+
+    def _load_task_from_local_log(task_id: str) -> WeatherTask | None:
+        for payload in reversed(task_recorder.read_json_objects()):
+            if payload.get("task_id") != task_id:
+                continue
+            try:
+                return _cache_task(WeatherTask.model_validate(payload))
+            except ValueError:
+                continue
+        return None
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -65,6 +76,10 @@ def create_app(
         recorder.append(SubmissionRecord(submission=submission))
         await feishu.write_bitable_record(submission)
         return {"status": "accepted", "task_id": submission.task_id}
+
+    @app.post("/api/judge/weather/score", response_model=WeatherJudgeResult)
+    async def judge_weather_score(request: WeatherJudgeRequest) -> WeatherJudgeResult:
+        return score_weather_submission(request)
 
     @app.post("/api/weather/publish")
     async def publish(request: ForecastRequest | None = None) -> dict[str, Any]:
@@ -126,6 +141,9 @@ def create_app(
         cached = task_index.get(task_id)
         if cached:
             return cached.model_dump(mode="json")
+        stored = _load_task_from_local_log(task_id)
+        if stored:
+            return stored.model_dump(mode="json")
 
         match = re.match(r"^WEATHER-CN-(.+)-(\d{4})(\d{2})(\d{2})-DAYAHEAD-001$", task_id)
         if not match:
@@ -157,7 +175,13 @@ def create_app(
             card = build_task_card(task)
             task_recorder.append(task)
             await feishu.write_task_bitable_record(task)
-            return {"status": "handled", "task": task.model_dump(mode="json"), "card": card, "text": build_task_text(task)}
+            return {
+                "status": "handled",
+                "bot_role": "weather_task_bot",
+                "task": task.model_dump(mode="json"),
+                "card": card,
+                "text": build_task_text(task),
+            }
         if _is_weather_command(text):
             request = _request_from_text(text)
             if request.days > 1:
@@ -168,12 +192,13 @@ def create_app(
                     submissions.append((await service.forecast(current)).model_dump(mode="json"))
                 return {
                     "status": "handled",
+                    "bot_role": "weather_forecast_bot",
                     "region": submissions[0]["region"] if submissions else request.region,
                     "days": request.days,
                     "submissions": submissions,
                 }
             result = await service.forecast(request)
-            return {"status": "handled", "card": build_feishu_card(result)}
+            return {"status": "handled", "bot_role": "weather_forecast_bot", "card": build_feishu_card(result)}
         return {"status": "ignored"}
 
     return app
@@ -206,6 +231,17 @@ def _is_help_command(text: str) -> bool:
 
 def _request_from_text(text: str) -> ForecastRequest:
     target_date = _target_date_from_text(text)
+    coordinates = _coordinates_from_text(text)
+    if coordinates:
+        latitude, longitude = coordinates
+        return ForecastRequest(
+            region=_coordinate_region(latitude, longitude),
+            latitude=latitude,
+            longitude=longitude,
+            target_date=target_date,
+            days=_days_from_text(text),
+            granularity="1h",
+        )
     return ForecastRequest(
         region=_region_from_text(text),
         target_date=target_date,
@@ -215,6 +251,15 @@ def _request_from_text(text: str) -> ForecastRequest:
 
 
 def _task_request_from_text(text: str) -> WeatherTaskRequest:
+    coordinates = _coordinates_from_text(text)
+    if coordinates:
+        latitude, longitude = coordinates
+        return WeatherTaskRequest(
+            region=_coordinate_region(latitude, longitude),
+            latitude=latitude,
+            longitude=longitude,
+            target_date=_target_date_from_text(text),
+        )
     return WeatherTaskRequest(region=_region_from_text(text), target_date=_target_date_from_text(text))
 
 
@@ -248,6 +293,30 @@ def _region_from_text(text: str) -> str:
     return "广东省深圳市"
 
 
+def _coordinates_from_text(text: str) -> tuple[float, float] | None:
+    import re
+
+    pair_match = re.search(r"(-?\d{1,2}(?:\.\d+)?)\s*[,，]\s*(-?\d{1,3}(?:\.\d+)?)", text)
+    if pair_match:
+        return _validated_coordinates(float(pair_match.group(1)), float(pair_match.group(2)))
+
+    named_match = re.search(r"北纬\s*(\d{1,2}(?:\.\d+)?)\D+东经\s*(\d{1,3}(?:\.\d+)?)", text)
+    if named_match:
+        return _validated_coordinates(float(named_match.group(1)), float(named_match.group(2)))
+
+    return None
+
+
+def _validated_coordinates(latitude: float, longitude: float) -> tuple[float, float] | None:
+    if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+        return latitude, longitude
+    return None
+
+
+def _coordinate_region(latitude: float, longitude: float) -> str:
+    return f"经纬度 {latitude:.4f},{longitude:.4f}"
+
+
 async def _resolve_task_location(location_resolver: LocationResolver, request: WeatherTaskRequest):
     return await location_resolver.resolve(
         ForecastRequest(
@@ -265,12 +334,15 @@ async def _resolve_task_location(location_resolver: LocationResolver, request: W
 def _help_text() -> str:
     return "\n".join(
         [
-            "支持命令：",
-            "@机器人 明天深圳天气",
+            "全国气象预测机器人：负责城市、地区、经纬度天气预测，不发布共测任务。",
             "@机器人 广州明天天气",
             "@机器人 北京气象预测 2026-06-10",
             "@机器人 广州未来三天天气",
+            "@机器人 22.8016,113.5252 明天天气",
+            "",
+            "气象任务发布机器人：负责发布、提醒、关闭和记录气象共测任务，不计算天气。",
             "@机器人 今日广州气象任务",
+            "@机器人 22.8016,113.5252 今日气象任务",
             "@机器人 帮助",
         ]
     )

@@ -56,7 +56,25 @@ def test_feishu_event_supports_city_weather_forecast_command():
 
     assert response.status_code == 200
     assert response.json()["status"] == "handled"
+    assert response.json()["bot_role"] == "weather_forecast_bot"
     assert service.seen_request.region == "广州"
+
+
+def test_feishu_event_supports_coordinate_weather_forecast_command():
+    service = CapturingForecastService()
+    client = TestClient(create_app(forecast_service=service))
+
+    response = client.post(
+        "/feishu/events",
+        json={"event": {"message": {"content": "@机器人 22.8016,113.5252 明天天气"}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "handled"
+    assert response.json()["bot_role"] == "weather_forecast_bot"
+    assert service.seen_request.region == "经纬度 22.8016,113.5252"
+    assert service.seen_request.latitude == 22.8016
+    assert service.seen_request.longitude == 113.5252
 
 
 def test_feishu_event_supports_city_weather_task_command():
@@ -70,8 +88,25 @@ def test_feishu_event_supports_city_weather_task_command():
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "handled"
+    assert body["bot_role"] == "weather_task_bot"
     assert body["task"]["task_id"].startswith("WEATHER-CN-440100-")
     assert body["task"]["region"] == "广东省广州市"
+
+
+def test_feishu_event_supports_coordinate_weather_task_command():
+    client = TestClient(create_app(forecast_service=CapturingForecastService()))
+
+    response = client.post(
+        "/feishu/events",
+        json={"event": {"message": {"content": "@机器人 22.8016,113.5252 今日气象任务"}}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "handled"
+    assert body["bot_role"] == "weather_task_bot"
+    assert body["task"]["task_id"].startswith("WEATHER-CN-COORD-22_8016-113_5252-")
+    assert body["task"]["region"] == "经纬度 22.8016,113.5252"
 
 
 def test_feishu_event_supports_city_multi_day_weather_command():
@@ -86,6 +121,22 @@ def test_feishu_event_supports_city_multi_day_weather_command():
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "handled"
+    assert body["bot_role"] == "weather_forecast_bot"
     assert body["days"] == 3
     assert len(body["submissions"]) == 3
     assert [request.region for request in service.seen_requests] == ["广州", "广州", "广州"]
+
+
+def test_feishu_help_describes_two_weather_bots():
+    client = TestClient(create_app(forecast_service=CapturingForecastService()))
+
+    response = client.post(
+        "/feishu/events",
+        json={"event": {"message": {"content": "@机器人 帮助"}}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "handled"
+    assert "全国气象预测机器人" in body["text"]
+    assert "气象任务发布机器人" in body["text"]

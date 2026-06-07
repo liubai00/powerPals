@@ -13,13 +13,14 @@ metadata:
 
 # PowerPals Weather
 
-Use this skill when the user asks for China weather forecasts, PowerPals weather submissions, Feishu-ready summaries, or weather task publishing for the PowerPals community scoring flow.
+Use this skill when the user asks for China weather forecasts, PowerPals weather submissions, Feishu-ready summaries, weather task publishing, or minimal weather submission scoring for the PowerPals community scoring flow.
 
 ## Boundaries
 
 - Support city, region, and explicit latitude/longitude inputs.
 - Use the configured default location when the user provides no location; the packaged default is Guangdong Shenzhen for backward compatibility.
 - Follow the rhythm: task publish, Bot submission, Feishu display, record, later scoring and review.
+- Treat forecast and task publishing as separate bot roles. Forecast calls should describe `weather_forecast_bot`; task calls should describe `weather_task_bot`.
 - Do not provide trading advice, quote advice, investment advice, profit promises, or commercial certification.
 - Do not invent weather values. Use the PowerPals Weather Bot API response.
 - If the API reports a provider as disabled or error, clearly state which source was unavailable.
@@ -106,6 +107,18 @@ Task IDs use:
 WEATHER-CN-<location-token>-YYYYMMDD-DAYAHEAD-001
 ```
 
+## Minimal Judge API
+
+Score one forecast submission against a truth summary:
+
+```bash
+curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/judge/weather/score" \
+  -H "Content-Type: application/json" \
+  -d '{"submission":{},"truth":{"max_temperature":31.0,"min_temperature":26.0,"rain_observed":false,"wind_speed":3.0}}'
+```
+
+Use this only for community scoring and review. It is not a meteorological certification engine or a ranking platform by itself.
+
 ## Example Prompt Handling
 
 User:
@@ -131,3 +144,16 @@ Action:
 1. Call `/api/tasks/weather/publish`.
 2. Return the task ID, region, coordinates, data cutoff time, submission deadline, status, and Feishu-card summary.
 3. Remind the user that outputs are only for community co-building, scoring, and review.
+
+User:
+
+```text
+给这条气象提交做基础裁判评分
+```
+
+Action:
+
+1. Ask for or use the provided `weather_submission_v1` JSON.
+2. Ask for truth summary fields if missing: max temperature, min temperature, rain observed, wind speed.
+3. Call `/api/judge/weather/score`.
+4. Return the metrics, component scores, total score, and scoring disclaimer.

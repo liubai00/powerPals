@@ -1,9 +1,10 @@
 # 全国气象机器人 V1 实施说明
 
-本文档说明 PowerPals 气象共测的两个机器人：
+本文档说明 PowerPals 气象共测的两个主机器人和一个最小裁判评分工具：
 
-- **气象预测机器人**：根据城市、地区或经纬度生成逐小时气象预测、官方提交 JSON、飞书预测卡片和提交记录。
-- **气象任务发布机器人**：发布任务、提醒提交、关闭提交窗口、记录任务状态，为后续裁判 Bot 评分和复盘留痕。
+- **全国气象预测机器人**：根据城市、地区或经纬度生成逐小时气象预测、官方提交 JSON、飞书预测卡片和提交记录，响应标记 `bot_role=weather_forecast_bot`。
+- **气象任务发布机器人**：发布任务、提醒提交、关闭提交窗口、记录任务状态，为后续裁判 Bot 评分和复盘留痕，响应标记 `bot_role=weather_task_bot`。
+- **最小裁判评分工具**：输入标准预测 JSON 和实况摘要，输出基础误差、命中情况和综合分。它暂时不是完整榜单平台。
 
 深圳仍是默认地区，但不再是限制。当前版本支持全国城市/地区/经纬度输入。
 
@@ -24,7 +25,7 @@
 
 - 不编造天气数据。
 - 不替代气象预测机器人。
-- 不直接打分。
+- 不直接打分，打分由裁判工具或后续裁判 Bot 完成。
 - 不给交易、报价、投资或收益建议。
 
 ## 位置输入
@@ -98,6 +99,8 @@ Feishu command / scheduled task / HTTP API
 | `POST` | `/api/tasks/weather/publish` | 发布任务 |
 | `POST` | `/api/tasks/weather/remind` | 提醒提交 |
 | `POST` | `/api/tasks/weather/close` | 关闭任务 |
+| `GET` | `/api/tasks/weather/{task_id}` | 按任务 ID 查询任务，优先读内存，再读本地 JSONL |
+| `POST` | `/api/judge/weather/score` | 对单条标准预测做基础评分 |
 | `POST` | `/feishu/events` | 飞书回调 |
 
 ## 任务 ID
@@ -124,12 +127,14 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 @机器人 明天深圳天气
 @机器人 广州明天天气
 @机器人 广州未来三天天气
+@机器人 22.8016,113.5252 明天天气
 @机器人 今日广州气象任务
+@机器人 22.8016,113.5252 今日气象任务
 @机器人 发布北京气象任务 2026-06-10
 @机器人 帮助
 ```
 
-当前规则：如果一句话同时包含“气象任务”和“天气预测”，优先按任务处理。后续可以引入更完整的 Intent Router，在混合意图时主动澄清或拆成两步。
+当前规则：如果一句话同时包含“气象任务”和“天气预测”，优先按任务处理。响应里的 `bot_role` 会明确说明由预测机器人还是任务机器人处理。后续可以引入更完整的 Intent Router，在混合意图时主动澄清或拆成两步。
 
 ## 标准提交
 
@@ -159,6 +164,29 @@ submissions[2] -> 第三天 weather_submission_v1
 
 这样既支持“未来三天查询”，又不破坏后续裁判 Bot 的单日评分逻辑。
 
+## 最小裁判评分
+
+`/api/judge/weather/score` 先服务于“能不能复盘”的问题，不追求完整榜单。输入包含：
+
+```text
+submission: 标准 weather_submission_v1
+truth.max_temperature
+truth.min_temperature
+truth.rain_observed
+truth.wind_speed
+```
+
+输出包含：
+
+```text
+metrics: 温度误差、降水预测/实况/命中、风速误差
+component_scores: temperature, rain, wind
+total_score: 综合分
+summary: 中文评分摘要
+```
+
+默认权重为温度 45%、降水 35%、风速 20%。降水以 `rain_probability >= 50%` 作为有雨预测阈值。后续裁判 Bot 可以在这个接口之上增加实况数据拉取、多 Bot 汇总、排行榜和复盘报告。
+
 ## 定时节奏
 
 默认节奏仍为：
@@ -180,6 +208,8 @@ submissions[2] -> 第三天 weather_submission_v1
 - 可以发布经纬度任务。
 - 可以查询未来三天。
 - 任务记录包含地区、经纬度、位置来源。
+- 服务重启后，可以从本地 JSONL 回查已发布任务。
+- 可以对单条标准预测做最小裁判评分。
 - 标准提交 JSON 通过 schema 校验。
 - 不配置飞书时，本地 JSONL 可留痕。
 

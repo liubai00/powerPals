@@ -79,6 +79,32 @@ def test_get_weather_task_returns_created_coordinate_task():
     assert body["longitude"] == 113.5252
 
 
+def test_get_weather_task_loads_published_coordinate_task_from_local_jsonl_after_restart(tmp_path):
+    task_log = tmp_path / "weather_tasks.jsonl"
+    settings = Settings(local_task_jsonl_path=str(task_log))
+    client = TestClient(create_app(forecast_service=FakeForecastService(), settings=settings))
+    published = client.post(
+        "/api/tasks/weather/publish",
+        json={
+            "region": "广州南沙",
+            "latitude": 22.8016,
+            "longitude": 113.5252,
+            "target_date": "2026-06-10",
+        },
+    ).json()["task"]
+
+    restarted_client = TestClient(create_app(forecast_service=FakeForecastService(), settings=settings))
+    response = restarted_client.get(f"/api/tasks/weather/{published['task_id']}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task_id"] == "WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001"
+    assert body["status"] == "published"
+    assert body["region"] == "广州南沙"
+    assert body["latitude"] == 22.8016
+    assert body["longitude"] == 113.5252
+
+
 def test_feishu_event_today_weather_task_returns_task_card():
     client = TestClient(create_app(forecast_service=FakeForecastService()))
 

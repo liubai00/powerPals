@@ -71,7 +71,7 @@ class AggregatedForecast(BaseModel):
 class BotProfile(BaseModel):
     bot_id: str = "powerpals-weather-bot"
     bot_name: str = "PowerPals Weather Bot"
-    bot_version: str = "v0.3.0"
+    bot_version: str = "v0.4.0"
     owner: str = "PowerPals"
     maturity_group: str = "Baseline Bot"
 

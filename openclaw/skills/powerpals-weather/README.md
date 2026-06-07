@@ -6,6 +6,7 @@ This OpenClaw skill calls the PowerPals Weather Bot API. It can:
 - query nationwide weather by city, region, or coordinates;
 - return Feishu-readable weather summaries;
 - publish, remind, and close weather forecast tasks.
+- score one weather submission against a truth summary with the minimal judge endpoint.
 
 ## Setup
 
@@ -50,3 +51,15 @@ POST /api/tasks/weather/close
 ```
 
 All outputs are only for community co-building, scoring, and review.
+
+## Judge Example
+
+```text
+用实况最高31度、最低26度、无降水、风速3.0m/s 评分这条 PowerPals 气象提交
+```
+
+The skill calls:
+
+```text
+POST /api/judge/weather/score
+```
