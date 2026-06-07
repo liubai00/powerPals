@@ -1,6 +1,6 @@
 # PowerPals 全国气象机器人与任务发布机器人
 
-PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、评分、复盘的开源示范项目。本仓库当前提供一套可运行的 **全国气象预测机器人 + 气象任务发布机器人**，并提供一个最小可用的气象裁判评分接口。
+PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、评分、复盘的开源示范项目。本仓库当前提供一套可运行的 **全国气象预测机器人 + 气象任务发布机器人 + 气象数据工作台**，并提供一个最小可用的气象裁判评分接口。
 
 项目目标不是给出交易或报价建议，而是跑通社区可复用的共测闭环：
 
@@ -61,10 +61,17 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 |---|---|---|
 | `GET` | `/health` | 服务健康检查 |
 | `POST` | `/api/weather/forecast` | 生成单日标准气象预测提交 |
-| `POST` | `/api/weather/forecast/range` | 生成多日标准气象预测提交 |
+| `POST` | `/api/weather/forecast/range` | 生成最多 16 天标准气象预测提交 |
+| `POST` | `/api/weather/batch` | 批量生成多个城市/经纬度预测 |
+| `POST`/`GET` | `/api/weather/export` | 导出 Excel 可直接打开的 CSV |
+| `GET` | `/reports/weather` | 飞书群可打开的网页报告 |
 | `POST` | `/api/weather/submission` | 记录外部 Bot 的标准提交 |
 | `POST` | `/api/weather/publish` | 生成预测、发布预测卡片并记录 |
 | `POST` | `/api/judge/weather/score` | 用实况摘要对单条气象预测做基础评分 |
+| `GET`/`POST`/`DELETE` | `/api/locations` | 地址收藏，支持别名和经纬度 |
+| `GET`/`POST` | `/api/news/*` | 电力资讯摘要的本地聚合入口 |
+| `GET`/`POST` | `/api/hydrology/*` | 水情记录和导出入口 |
+| `GET` | `/api/data/export/catalog` | 数据导出中心目录 |
 | `POST` | `/api/tasks/weather/create` | 生成任务草稿 |
 | `POST` | `/api/tasks/weather/publish` | 发布任务卡片并记录任务 |
 | `POST` | `/api/tasks/weather/remind` | 发布提交提醒并记录任务状态 |
@@ -105,12 +112,45 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/weather/forecast/range 
   -Body '{"region":"广州","target_date":"2026-06-10","days":3,"providers":["open_meteo"]}'
 ```
 
+查询广州未来 16 天：
+
+```powershell
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/weather/forecast/range `
+  -ContentType "application/json" `
+  -Body '{"region":"广州","target_date":"2026-06-10","days":16,"providers":["open_meteo"]}'
+```
+
+如果部分日期超出数据源可用窗口，接口会返回 `status=partial`，已成功日期仍在 `submissions`，失败日期会进入 `errors`。
+
 按经纬度发布任务：
 
 ```powershell
 Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/tasks/weather/publish `
   -ContentType "application/json" `
   -Body '{"region":"广州南沙","latitude":22.8016,"longitude":113.5252,"target_date":"2026-06-10"}'
+```
+
+导出气象 CSV：
+
+```powershell
+Invoke-WebRequest -Method Post http://127.0.0.1:8000/api/weather/export `
+  -ContentType "application/json" `
+  -Body '{"region":"广州","target_date":"2026-06-10","days":7}' `
+  -OutFile weather.csv
+```
+
+打开网页报告：
+
+```text
+http://127.0.0.1:8000/reports/weather?region=广州&target_date=2026-06-10&days=7
+```
+
+收藏地址：
+
+```powershell
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/locations `
+  -ContentType "application/json" `
+  -Body '{"alias":"南沙基地","name":"广州南沙","latitude":22.8016,"longitude":113.5252}'
 ```
 
 最小裁判评分：
@@ -155,7 +195,20 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 @机器人 帮助
 ```
 
-如果一句话同时包含“任务”和“天气预测”，系统优先按任务命令处理。当前响应会通过 `bot_role` 明确返回是预测机器人还是任务机器人处理，后续可继续升级为更完整的 Intent Router。
+如果一句话同时包含“任务”和“天气预测”，系统优先按任务命令处理。当前响应会通过 `bot_role` 明确返回是预测机器人还是任务机器人处理。配置 `PUBLIC_BASE_URL` 后，预测卡片会带 **打开网页报告** 和 **下载CSV** 按钮，适合直接在飞书群里转发。
+
+## 气象数据工作台
+
+工作台吸收了电力资讯插件类工具里最适合 PowerPals 的能力，但保持开源和可审计：
+
+- 气象预测最多 16 天。
+- 支持城市、地区、经纬度、收藏地址别名。
+- 支持批量预测。
+- 支持 CSV 下载，Excel 可直接打开。
+- 支持飞书群点击打开的网页报告。
+- 支持本地电力资讯摘要记录，不抓取未授权公众号正文。
+- 支持水情记录和 CSV 导出。
+- 所有本地留痕默认写入 `data/`，密钥不进入仓库。
 
 ## 标准提交格式
 
@@ -271,6 +324,10 @@ FEISHU_BITABLE_TABLE_ID=
 FEISHU_TASK_BITABLE_TABLE_ID=
 LOCAL_JSONL_PATH=data/weather_submissions.jsonl
 LOCAL_TASK_JSONL_PATH=data/weather_tasks.jsonl
+LOCAL_LOCATIONS_PATH=data/locations.json
+LOCAL_NEWS_JSONL_PATH=data/news_items.jsonl
+LOCAL_HYDROLOGY_JSONL_PATH=data/hydrology_records.jsonl
+PUBLIC_BASE_URL=
 ```
 
 ## Docker

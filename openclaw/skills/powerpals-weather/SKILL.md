@@ -13,7 +13,7 @@ metadata:
 
 # PowerPals Weather
 
-Use this skill when the user asks for China weather forecasts, PowerPals weather submissions, Feishu-ready summaries, weather task publishing, or minimal weather submission scoring for the PowerPals community scoring flow.
+Use this skill when the user asks for China weather forecasts, PowerPals weather submissions, Feishu-ready summaries, weather task publishing, web reports, CSV exports, favorite locations, hydrology records, news digests, or minimal weather submission scoring for the PowerPals community scoring flow.
 
 ## Boundaries
 
@@ -21,6 +21,8 @@ Use this skill when the user asks for China weather forecasts, PowerPals weather
 - Use the configured default location when the user provides no location; the packaged default is Guangdong Shenzhen for backward compatibility.
 - Follow the rhythm: task publish, Bot submission, Feishu display, record, later scoring and review.
 - Treat forecast and task publishing as separate bot roles. Forecast calls should describe `weather_forecast_bot`; task calls should describe `weather_task_bot`.
+- Prefer web report and CSV links when the user wants to share results in a Feishu group.
+- Do not scrape unauthorized WeChat article bodies. Record only user-provided or authorized news summaries.
 - Do not provide trading advice, quote advice, investment advice, profit promises, or commercial certification.
 - Do not invent weather values. Use the PowerPals Weather Bot API response.
 - If the API reports a provider as disabled or error, clearly state which source was unavailable.
@@ -56,7 +58,23 @@ Multiple days:
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/weather/forecast/range" \
   -H "Content-Type: application/json" \
-  -d '{"region":"广州","target_date":"YYYY-MM-DD","days":3}'
+  -d '{"region":"广州","target_date":"YYYY-MM-DD","days":16}'
+```
+
+If a provider has no data for some dates, treat `status=partial` as usable: explain the returned `submissions`, mention the missing dates from `errors`, and do not invent weather values for missing dates.
+
+Export CSV:
+
+```bash
+curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/weather/export" \
+  -H "Content-Type: application/json" \
+  -d '{"region":"广州","target_date":"YYYY-MM-DD","days":7}'
+```
+
+Open report:
+
+```text
+GET /reports/weather?region=广州&target_date=YYYY-MM-DD&days=7
 ```
 
 Preserve these official fields from every `weather_submission_v1` object:
@@ -118,6 +136,32 @@ curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/judge/weather/score" \
 ```
 
 Use this only for community scoring and review. It is not a meteorological certification engine or a ranking platform by itself.
+
+## Data Workbench APIs
+
+Favorite location:
+
+```bash
+curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/locations" \
+  -H "Content-Type: application/json" \
+  -d '{"alias":"南沙基地","name":"广州南沙","latitude":22.8016,"longitude":113.5252}'
+```
+
+News digest item:
+
+```bash
+curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/news/items" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"广东电力市场动态","source":"示例来源","url":"https://example.com/news","tags":["电力交易"]}'
+```
+
+Hydrology record:
+
+```bash
+curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/hydrology/records" \
+  -H "Content-Type: application/json" \
+  -d '{"station":"示例水库","basin":"珠江","water_level":12.3,"flow":456.7,"observed_at":"YYYY-MM-DDT08:00:00+08:00"}'
+```
 
 ## Example Prompt Handling
 

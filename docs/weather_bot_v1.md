@@ -1,10 +1,11 @@
 # 全国气象机器人 V1 实施说明
 
-本文档说明 PowerPals 气象共测的两个主机器人和一个最小裁判评分工具：
+本文档说明 PowerPals 气象共测的两个主机器人、气象数据工作台和一个最小裁判评分工具：
 
 - **全国气象预测机器人**：根据城市、地区或经纬度生成逐小时气象预测、官方提交 JSON、飞书预测卡片和提交记录，响应标记 `bot_role=weather_forecast_bot`。
 - **气象任务发布机器人**：发布任务、提醒提交、关闭提交窗口、记录任务状态，为后续裁判 Bot 评分和复盘留痕，响应标记 `bot_role=weather_task_bot`。
 - **最小裁判评分工具**：输入标准预测 JSON 和实况摘要，输出基础误差、命中情况和综合分。它暂时不是完整榜单平台。
+- **气象数据工作台**：提供网页报告、CSV 下载、地址收藏、批量查询、资讯摘要和水情记录入口，方便飞书群转发和运营复盘。
 
 深圳仍是默认地区，但不再是限制。当前版本支持全国城市/地区/经纬度输入。
 
@@ -94,7 +95,13 @@ Feishu command / scheduled task / HTTP API
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/weather/forecast` | 单日气象预测 |
-| `POST` | `/api/weather/forecast/range` | 多日气象预测 |
+| `POST` | `/api/weather/forecast/range` | 最多 16 天气象预测 |
+| `POST` | `/api/weather/batch` | 批量预测 |
+| `POST`/`GET` | `/api/weather/export` | 导出 CSV |
+| `GET` | `/reports/weather` | 网页报告 |
+| `GET`/`POST`/`DELETE` | `/api/locations` | 地址收藏 |
+| `GET`/`POST` | `/api/news/*` | 电力资讯摘要入口 |
+| `GET`/`POST` | `/api/hydrology/*` | 水情记录和导出 |
 | `POST` | `/api/tasks/weather/create` | 创建任务草稿 |
 | `POST` | `/api/tasks/weather/publish` | 发布任务 |
 | `POST` | `/api/tasks/weather/remind` | 提醒提交 |
@@ -154,7 +161,7 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 
 ## 多日预测
 
-`/api/weather/forecast/range` 会连续生成多个单日标准提交。它不会改变单日评分格式，而是返回：
+`/api/weather/forecast/range` 会连续生成最多 16 个单日标准提交。它不会改变单日评分格式，而是返回：
 
 ```text
 submissions[0] -> 第一天 weather_submission_v1
@@ -162,7 +169,26 @@ submissions[1] -> 第二天 weather_submission_v1
 submissions[2] -> 第三天 weather_submission_v1
 ```
 
+如果部分日期超出数据源可用窗口，接口返回 `status=partial`，可用日期仍保留在 `submissions`，失败日期和原因进入 `errors`。这样不会因为第 16 天没有数据而影响前面已可用的预测。
+
 这样既支持“未来三天查询”，又不破坏后续裁判 Bot 的单日评分逻辑。
+
+## 网页报告与下载
+
+配置 `PUBLIC_BASE_URL` 后，飞书预测卡片会提供：
+
+```text
+打开网页报告 -> /reports/weather
+下载CSV -> /api/weather/export
+```
+
+网页报告是轻量 HTML 页面，适合在飞书群里打开；CSV 带 UTF-8 BOM，Excel 可直接打开。当前不做复杂前端应用，先保证群内查看、下载、转发三件事顺畅。
+
+## 地址收藏、资讯和水情
+
+地址收藏用于把常用电厂、变电站、新能源场站或水库别名绑定到经纬度，例如 `南沙基地`。后续预测和任务可以直接使用别名。
+
+资讯入口只记录可授权、可公开引用的信息摘要，不直接抓取未授权公众号正文。水情入口先做记录和导出，后续可接官方水情数据源。
 
 ## 最小裁判评分
 
@@ -207,6 +233,11 @@ summary: 中文评分摘要
 - 可以发布全国城市任务。
 - 可以发布经纬度任务。
 - 可以查询未来三天。
+- 可以查询最多 16 天。
+- 可以打开网页报告并下载 CSV。
+- 可以收藏地址别名并用于预测。
+- 可以批量查询多个地点。
+- 可以记录电力资讯摘要和水情数据。
 - 任务记录包含地区、经纬度、位置来源。
 - 服务重启后，可以从本地 JSONL 回查已发布任务。
 - 可以对单条标准预测做最小裁判评分。

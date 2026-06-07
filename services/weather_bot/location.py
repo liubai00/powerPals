@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,6 +20,78 @@ class ResolvedLocation(BaseModel):
     country: str = "中国"
     province: str | None = None
     city: str | None = None
+
+
+class FavoriteLocation(BaseModel):
+    alias: str
+    name: str
+    latitude: float
+    longitude: float
+    code: str | None = None
+    notes: str = ""
+
+
+class LocationBook:
+    def __init__(self, settings: Settings):
+        self.path = Path(settings.local_locations_path)
+
+    def list(self) -> list[FavoriteLocation]:
+        if not self.path.exists():
+            return []
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        locations: list[FavoriteLocation] = []
+        for item in payload:
+            try:
+                locations.append(FavoriteLocation.model_validate(item))
+            except ValueError:
+                continue
+        return locations
+
+    def get(self, alias: str) -> FavoriteLocation | None:
+        normalized = alias.strip()
+        for location in self.list():
+            if location.alias == normalized:
+                return location
+        return None
+
+    def upsert(self, location: FavoriteLocation) -> FavoriteLocation:
+        locations = [item for item in self.list() if item.alias != location.alias]
+        locations.append(location)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps([item.model_dump(mode="json") for item in locations], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return location
+
+    def delete(self, alias: str) -> bool:
+        locations = self.list()
+        kept = [item for item in locations if item.alias != alias]
+        if len(kept) == len(locations):
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps([item.model_dump(mode="json") for item in kept], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return True
+
+    def resolve(self, alias: str) -> ResolvedLocation | None:
+        favorite = self.get(alias)
+        if not favorite:
+            return None
+        return ResolvedLocation(
+            name=favorite.name,
+            code=favorite.code,
+            latitude=favorite.latitude,
+            longitude=favorite.longitude,
+            source="favorite",
+        )
 
 
 BUILTIN_LOCATIONS: dict[str, ResolvedLocation] = {
@@ -90,6 +164,7 @@ BUILTIN_LOCATIONS: dict[str, ResolvedLocation] = {
 class LocationResolver:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings()
+        self.location_book = LocationBook(self.settings)
 
     async def resolve(self, request: ForecastRequest) -> ResolvedLocation:
         if request.latitude is not None and request.longitude is not None:
@@ -98,13 +173,17 @@ class LocationResolver:
                 code=request.location_code,
                 latitude=request.latitude,
                 longitude=request.longitude,
-                source="coordinates",
+                source=request.location_source or "coordinates",
             )
 
         region = request.region.strip()
         builtin = BUILTIN_LOCATIONS.get(region)
         if builtin:
             return builtin
+
+        favorite = self.location_book.resolve(region)
+        if favorite:
+            return favorite
 
         if self.settings.qweather_api_key:
             qweather = await self._resolve_with_qweather(region)

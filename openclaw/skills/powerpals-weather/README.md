@@ -7,6 +7,8 @@ This OpenClaw skill calls the PowerPals Weather Bot API. It can:
 - return Feishu-readable weather summaries;
 - publish, remind, and close weather forecast tasks.
 - score one weather submission against a truth summary with the minimal judge endpoint.
+- open web reports and export CSV files for Feishu group sharing.
+- store favorite locations and query hydrology/news workbench records.
 
 ## Setup
 
@@ -33,6 +35,9 @@ The skill calls:
 ```text
 POST /api/weather/forecast
 POST /api/weather/forecast/range
+POST /api/weather/batch
+POST /api/weather/export
+GET  /reports/weather
 ```
 
 ## Task Examples
@@ -62,4 +67,26 @@ The skill calls:
 
 ```text
 POST /api/judge/weather/score
+```
+
+## Workbench Examples
+
+```text
+把广州未来7天气象导出 CSV
+打开南沙基地气象网页报告
+收藏 南沙基地 = 22.8016,113.5252
+记录一条广东电力市场资讯摘要
+记录示例水库水位和流量
+```
+
+The skill calls:
+
+```text
+POST /api/locations
+GET  /api/locations
+POST /api/news/items
+GET  /api/news/digest
+POST /api/hydrology/records
+GET  /api/hydrology/export
+GET  /api/data/export/catalog
 ```

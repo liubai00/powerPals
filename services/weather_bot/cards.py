@@ -35,9 +35,70 @@ def build_text_summary(submission: WeatherSubmission) -> str:
     )
 
 
-def build_feishu_card(submission: WeatherSubmission) -> dict:
+def build_feishu_card(submission: WeatherSubmission, report_url: str | None = None, download_url: str | None = None) -> dict:
     summary = submission.aggregated_forecast.summary
     content = build_text_summary(submission)
+    elements = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    f"**任务 ID**：{submission.task_id}\n"
+                    f"**区域**：{submission.region}\n"
+                    f"**预测日**：{submission.target_date}\n"
+                    f"**数据截止**：{submission.data_cutoff_time}\n"
+                    f"**数据来源**：{' / '.join(submission.aggregated_forecast.providers_used)}"
+                ),
+            },
+        },
+        {"tag": "hr"},
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    f"**最高/最低温**：{summary.max_temperature}℃ / {summary.min_temperature}℃\n"
+                    f"**降水概率**：{summary.rain_probability}%\n"
+                    f"**风速**：{summary.wind_speed} m/s\n"
+                    f"**云量**：{summary.cloud_cover}%\n"
+                    f"**主要天气**：{summary.main_weather}\n"
+                    f"**高风险时段**：{summary.high_risk_period}"
+                ),
+            },
+        },
+    ]
+    actions = []
+    if report_url:
+        actions.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "打开网页报告"},
+                "url": report_url,
+                "type": "primary",
+            }
+        )
+    if download_url:
+        actions.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "下载CSV"},
+                "url": download_url,
+                "type": "default",
+            }
+        )
+    if actions:
+        elements.extend([{"tag": "hr"}, {"tag": "action", "actions": actions}])
+    elements.extend(
+        [
+            {"tag": "hr"},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": submission.disclaimer}]},
+            {
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": content[:900]}],
+            },
+        ]
+    )
     return {
         "msg_type": "interactive",
         "card": {
@@ -46,41 +107,6 @@ def build_feishu_card(submission: WeatherSubmission) -> dict:
                 "template": "blue",
                 "title": {"tag": "plain_text", "content": f"{submission.region}气象预测"},
             },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": (
-                            f"**任务 ID**：{submission.task_id}\n"
-                            f"**区域**：{submission.region}\n"
-                            f"**预测日**：{submission.target_date}\n"
-                            f"**数据截止**：{submission.data_cutoff_time}\n"
-                            f"**数据来源**：{' / '.join(submission.aggregated_forecast.providers_used)}"
-                        ),
-                    },
-                },
-                {"tag": "hr"},
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": (
-                            f"**最高/最低温**：{summary.max_temperature}℃ / {summary.min_temperature}℃\n"
-                            f"**降水概率**：{summary.rain_probability}%\n"
-                            f"**风速**：{summary.wind_speed} m/s\n"
-                            f"**云量**：{summary.cloud_cover}%\n"
-                            f"**主要天气**：{summary.main_weather}\n"
-                            f"**高风险时段**：{summary.high_risk_period}"
-                        ),
-                    },
-                },
-                {"tag": "hr"},
-                {"tag": "note", "elements": [{"tag": "plain_text", "content": submission.disclaimer}]},
-                {
-                    "tag": "note",
-                    "elements": [{"tag": "plain_text", "content": content[:900]}],
-                },
-            ],
+            "elements": elements,
         },
     }
