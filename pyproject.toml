@@ -1,7 +1,7 @@
 [project]
 name = "powerpals-weather-bot"
-version = "0.1.0"
-description = "PowerPals Shenzhen weather forecast bot."
+version = "0.3.0"
+description = "PowerPals nationwide weather forecast and task publishing bot."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.111.0",

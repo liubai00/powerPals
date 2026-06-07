@@ -1,13 +1,14 @@
-name: powerpals-shenzhen-weather
-version: 0.1.0
-description: PowerPals Shenzhen weather forecast skill for OpenClaw.
+name: powerpals-weather
+version: 0.3.0
+description: PowerPals nationwide weather forecast and task publishing skill for OpenClaw.
 author: PowerPals
 license: MIT
 tags:
   - weather
   - feishu
   - powerpals
-  - shenzhen
+  - china
+  - task
   - forecast
 runtime:
   env:

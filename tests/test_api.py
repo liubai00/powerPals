@@ -7,7 +7,7 @@ from services.weather_bot.models import AggregatedForecast, ForecastPoint, Forec
 class FakeForecastService:
     async def forecast(self, request):
         return WeatherSubmission(
-            task_id="WEATHER-SZ-20260610-DAYAHEAD-001",
+            task_id="WEATHER-CN-440300-20260610-DAYAHEAD-001",
             region="广东省深圳市",
             target_date="2026-06-10",
             data_cutoff_time="2026-06-09T16:00:00+08:00",
@@ -64,7 +64,7 @@ def test_forecast_endpoint_returns_standard_submission():
 
     assert response.status_code == 200
     body = response.json()
-    assert body["task_id"] == "WEATHER-SZ-20260610-DAYAHEAD-001"
+    assert body["task_id"] == "WEATHER-CN-440300-20260610-DAYAHEAD-001"
     assert body["region"] == "广东省深圳市"
     assert body["aggregated_forecast"]["providers_used"] == ["open_meteo"]
 

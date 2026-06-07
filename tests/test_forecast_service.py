@@ -46,7 +46,7 @@ async def test_forecast_service_builds_standard_weather_submission():
         )
     )
 
-    assert result.task_id == "WEATHER-SZ-20260610-DAYAHEAD-001"
+    assert result.task_id == "WEATHER-CN-440300-20260610-DAYAHEAD-001"
     assert result.region == "广东省深圳市"
     assert result.target_date == "2026-06-10"
     assert result.provider_results[0].provider == "open_meteo"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 DEFAULT_DISCLAIMER = (
@@ -12,7 +12,12 @@ DEFAULT_DISCLAIMER = (
 
 class ForecastRequest(BaseModel):
     region: str = "广东省深圳市"
+    latitude: float | None = None
+    longitude: float | None = None
+    location_code: str | None = None
+    location_source: str | None = None
     target_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    days: int = Field(default=1, ge=1, le=7)
     granularity: Literal["1h", "day"] = "1h"
     providers: list[str] = Field(default_factory=lambda: ["open_meteo", "qweather", "caiyun"])
 
@@ -23,6 +28,12 @@ class ForecastRequest(BaseModel):
         if normalized in {"深圳", "深圳市", "广东深圳", "广东省深圳市"}:
             return "广东省深圳市"
         return normalized
+
+    @model_validator(mode="after")
+    def validate_coordinates(self) -> "ForecastRequest":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        return self
 
 
 class ForecastPoint(BaseModel):
@@ -58,9 +69,9 @@ class AggregatedForecast(BaseModel):
 
 
 class BotProfile(BaseModel):
-    bot_id: str = "powerpals-shenzhen-weather-bot"
-    bot_name: str = "PowerPals Shenzhen Weather Bot"
-    bot_version: str = "v0.2.0"
+    bot_id: str = "powerpals-weather-bot"
+    bot_name: str = "PowerPals Weather Bot"
+    bot_version: str = "v0.3.0"
     owner: str = "PowerPals"
     maturity_group: str = "Baseline Bot"
 
@@ -69,6 +80,7 @@ class ScopeProfile(BaseModel):
     region: str = "广东省深圳市"
     target_date: str | None = None
     time_granularity: str = "1h"
+    location: dict[str, Any] = Field(default_factory=dict)
     applicable_scenarios: list[str] = Field(
         default_factory=lambda: ["负荷预测参考", "新能源出力观察", "电价复盘辅助", "储能运行观察"]
     )

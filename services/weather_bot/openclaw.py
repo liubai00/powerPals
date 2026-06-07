@@ -17,7 +17,7 @@ class OpenClawExplainer:
 
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         payload = {
-            "task": "explain_shenzhen_weather_forecast",
+            "task": "explain_powerpals_weather_forecast",
             "submission": submission.model_dump(mode="json"),
         }
         try:
@@ -28,16 +28,21 @@ class OpenClawExplainer:
         except httpx.HTTPError:
             return _deterministic_explanation(submission)
 
+        fallback = _deterministic_explanation(submission)
         return {
-            "key_factors": body.get("key_factors") or _deterministic_explanation(submission)["key_factors"],
-            "risk_notes": body.get("risk_notes") or _deterministic_explanation(submission)["risk_notes"],
+            "key_factors": body.get("key_factors") or fallback["key_factors"],
+            "risk_notes": body.get("risk_notes") or fallback["risk_notes"],
         }
 
 
 def _deterministic_explanation(submission: WeatherSubmission) -> dict[str, list[str]]:
     summary = submission.aggregated_forecast.summary
-    factors = ["多源气象预报融合", "深圳沿海城市局地天气变化", "逐小时温度、降水、风速和云量综合判断"]
-    risks = ["局地短时强降水和云量变化可能导致误差放大"]
+    factors = [
+        "多源气象预报融合",
+        f"{submission.region}局地天气变化",
+        "逐小时温度、降水、风速和云量综合判断",
+    ]
+    risks = ["局地短时强降水、风速和云量变化可能导致误差放大"]
     if summary.rain_probability is not None and summary.rain_probability >= 50:
         risks.append("降水概率偏高，建议复盘实际降水发生时段")
     if summary.wind_speed is not None and summary.wind_speed >= 8:

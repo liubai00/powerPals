@@ -7,7 +7,7 @@ def build_text_summary(submission: WeatherSubmission) -> str:
     summary = submission.aggregated_forecast.summary
     return "\n".join(
         [
-            "【正式提交｜深圳气象预测】",
+            f"【正式提交｜{submission.region}气象预测】",
             "",
             f"任务 ID：{submission.task_id}",
             f"区域：{submission.region}",
@@ -44,7 +44,7 @@ def build_feishu_card(submission: WeatherSubmission) -> dict:
             "config": {"wide_screen_mode": True},
             "header": {
                 "template": "blue",
-                "title": {"tag": "plain_text", "content": "深圳气象预测"},
+                "title": {"tag": "plain_text", "content": f"{submission.region}气象预测"},
             },
             "elements": [
                 {
@@ -53,6 +53,7 @@ def build_feishu_card(submission: WeatherSubmission) -> dict:
                         "tag": "lark_md",
                         "content": (
                             f"**任务 ID**：{submission.task_id}\n"
+                            f"**区域**：{submission.region}\n"
                             f"**预测日**：{submission.target_date}\n"
                             f"**数据截止**：{submission.data_cutoff_time}\n"
                             f"**数据来源**：{' / '.join(submission.aggregated_forecast.providers_used)}"

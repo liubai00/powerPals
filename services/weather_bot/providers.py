@@ -18,9 +18,10 @@ class OpenMeteoProvider:
 
     async def fetch(self, request: ForecastRequest) -> ProviderForecast:
         target = date.fromisoformat(request.target_date)
+        latitude, longitude = _coordinates(request)
         params = {
-            "latitude": SHENZHEN_LATITUDE,
-            "longitude": SHENZHEN_LONGITUDE,
+            "latitude": latitude,
+            "longitude": longitude,
             "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,cloud_cover",
             "timezone": "Asia/Shanghai",
             "start_date": target.isoformat(),
@@ -43,7 +44,8 @@ class QWeatherProvider:
         if not self.api_key:
             return ProviderForecast(provider=self.name, status="disabled", points=[], error_message="Missing API key")
 
-        params = {"location": f"{SHENZHEN_LONGITUDE},{SHENZHEN_LATITUDE}", "key": self.api_key}
+        latitude, longitude = _coordinates(request)
+        params = {"location": f"{longitude},{latitude}", "key": self.api_key}
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.get("https://devapi.qweather.com/v7/weather/24h", params=params)
             response.raise_for_status()
@@ -62,9 +64,10 @@ class CaiyunProvider:
             return ProviderForecast(provider=self.name, status="disabled", points=[], error_message="Missing API key")
 
         target = date.fromisoformat(request.target_date)
+        latitude, longitude = _coordinates(request)
         url = (
             f"https://api.caiyunapp.com/v2.6/{self.api_key}/"
-            f"{SHENZHEN_LONGITUDE},{SHENZHEN_LATITUDE}/hourly"
+            f"{longitude},{latitude}/hourly"
         )
         params = {"hourlysteps": 24}
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -82,6 +85,13 @@ def build_default_providers(settings: Settings | None = None) -> dict[str, objec
         "qweather": QWeatherProvider(settings.qweather_api_key),
         "caiyun": CaiyunProvider(settings.caiyun_api_key),
     }
+
+
+def _coordinates(request: ForecastRequest) -> tuple[float, float]:
+    return (
+        request.latitude if request.latitude is not None else SHENZHEN_LATITUDE,
+        request.longitude if request.longitude is not None else SHENZHEN_LONGITUDE,
+    )
 
 
 def _open_meteo_points(body: dict[str, Any]) -> list[ForecastPoint]:

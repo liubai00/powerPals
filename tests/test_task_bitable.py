@@ -7,7 +7,10 @@ def test_task_bitable_fields_match_community_task_table():
 
     fields = task_bitable_fields(task)
 
-    assert fields["task_id"] == "WEATHER-SZ-20260610-DAYAHEAD-001"
+    assert fields["task_id"] == "WEATHER-CN-440300-20260610-DAYAHEAD-001"
+    assert fields["location_code"] == "440300"
+    assert fields["latitude"] == 22.5431
+    assert fields["longitude"] == 114.0579
     assert fields["track"] == "weather_forecast"
     assert fields["region"] == "广东省深圳市"
     assert fields["target_date"] == "2026-06-10"

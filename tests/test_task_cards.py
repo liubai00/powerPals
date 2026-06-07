@@ -7,8 +7,8 @@ def test_task_text_contains_required_community_rhythm_and_boundaries():
 
     text = build_task_text(task)
 
-    assert "【任务发布｜深圳气象预测】" in text
-    assert "WEATHER-SZ-20260610-DAYAHEAD-001" in text
+    assert "【任务发布｜广东省深圳市气象预测】" in text
+    assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in text
     assert "D-1 16:00" in text
     assert "D-1 17:00" in text
     assert "weather_submission_v1" in text
@@ -22,7 +22,8 @@ def test_task_card_uses_feishu_interactive_shape():
     card = build_task_card(task)
 
     assert card["msg_type"] == "interactive"
-    assert card["card"]["header"]["title"]["content"] == "深圳气象预测任务"
+    assert card["card"]["header"]["title"]["content"] == "广东省深圳市气象预测任务"
     content = card["card"]["elements"][0]["text"]["content"]
-    assert "WEATHER-SZ-20260610-DAYAHEAD-001" in content
+    assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in content
     assert "提交截止" in content
+    assert "22.5431, 114.0579" in content

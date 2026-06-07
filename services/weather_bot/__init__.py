@@ -1,4 +1,4 @@
-"""Shenzhen weather forecast bot."""
+"""PowerPals weather forecast bot."""
 
 from services.weather_bot.main import app, create_app
 

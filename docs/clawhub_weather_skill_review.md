@@ -10,7 +10,7 @@ Observed listing details:
 - Description: current weather and forecasts, no API key required
 - Primary sources: `wttr.in` and Open-Meteo
 - Security audit: pass
-- Current version: v1.0.0
+- Current version: v0.3.0
 - License: MIT-0
 
 ## Fit For PowerPals
@@ -21,7 +21,7 @@ The skill is useful as a reference or fallback because it is simple and keyless.
 - Feishu Bitable recording;
 - QWeather and Caiyun provider integration;
 - PowerPals `weather_submission_v1` JSON;
-- Shenzhen-only task IDs and scoring workflow;
+- PowerPals nationwide task IDs and scoring workflow;
 - community disclaimers and risk notes.
 
 ## Decision
@@ -29,7 +29,7 @@ The skill is useful as a reference or fallback because it is simple and keyless.
 Do not install the third-party skill directly into the production bot. Keep our own auditable OpenClaw skill in:
 
 ```text
-openclaw/skills/powerpals-shenzhen-weather/
+openclaw/skills/powerpals-weather/
 ```
 
 The local skill calls our FastAPI service and preserves the PowerPals data contract.

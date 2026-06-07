@@ -26,7 +26,7 @@
   ],
   "properties": {
     "submission_type": { "const": "official_submission" },
-    "task_id": { "type": "string", "pattern": "^WEATHER-SZ-[0-9]{8}-DAYAHEAD-[0-9]{3}$" },
+    "task_id": { "type": "string", "pattern": "^WEATHER-CN-[A-Z0-9_\\-]+-[0-9]{8}-DAYAHEAD-[0-9]{3}$" },
     "track": { "const": "weather_forecast" },
     "bot": { "$ref": "#/$defs/bot" },
     "scope": { "$ref": "#/$defs/scope" },
@@ -71,12 +71,28 @@
     },
     "scope": {
       "type": "object",
-      "required": ["region", "target_date", "time_granularity", "applicable_scenarios"],
+      "required": ["region", "target_date", "time_granularity", "location", "applicable_scenarios"],
       "properties": {
         "region": { "type": "string" },
         "target_date": { "type": "string" },
         "time_granularity": { "type": "string" },
+        "location": { "$ref": "#/$defs/location" },
         "applicable_scenarios": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "location": {
+      "type": "object",
+      "required": ["name", "latitude", "longitude", "source"],
+      "properties": {
+        "name": { "type": "string" },
+        "code": { "type": ["string", "null"] },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "source": { "type": "string" },
+        "country": { "type": ["string", "null"] },
+        "province": { "type": ["string", "null"] },
+        "city": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     },

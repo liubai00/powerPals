@@ -28,7 +28,8 @@ async def test_forecast_service_outputs_document_style_official_submission():
 
     assert result.submission_type == "official_submission"
     assert result.track == "weather_forecast"
-    assert result.bot.bot_name == "PowerPals Shenzhen Weather Bot"
+    assert result.bot.bot_name == "PowerPals Weather Bot"
+    assert result.scope.location["code"] == "440300"
     assert result.scope.applicable_scenarios == ["负荷预测参考", "新能源出力观察", "电价复盘辅助", "储能运行观察"]
     assert result.time_info.submit_time.endswith("+08:00")
     assert result.time_info.data_cutoff_time == "2026-06-09T16:00:00+08:00"

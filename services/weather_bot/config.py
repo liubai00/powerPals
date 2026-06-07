@@ -19,5 +19,8 @@ class Settings(BaseSettings):
     feishu_task_bitable_table_id: str | None = None
     local_jsonl_path: str = "data/weather_submissions.jsonl"
     local_task_jsonl_path: str = "data/weather_tasks.jsonl"
+    default_weather_region: str = "广东省深圳市"
+    default_weather_latitude: float | None = None
+    default_weather_longitude: float | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

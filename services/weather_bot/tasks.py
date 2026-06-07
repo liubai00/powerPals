@@ -3,22 +3,39 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from services.weather_bot.location import BUILTIN_LOCATIONS, ResolvedLocation, location_slug
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 TRACK_WEATHER = "weather_forecast"
-REGION_SHENZHEN = "广东省深圳市"
+REGION_DEFAULT = "广东省深圳市"
 
 
 class WeatherTaskRequest(BaseModel):
+    region: str = REGION_DEFAULT
+    latitude: float | None = None
+    longitude: float | None = None
+    location_code: str | None = None
+    location_source: str | None = None
     target_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+    @model_validator(mode="after")
+    def validate_coordinates(self) -> "WeatherTaskRequest":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        return self
 
 
 class WeatherTask(BaseModel):
     task_id: str
     track: str
     region: str
+    location_code: str | None = None
+    latitude: float
+    longitude: float
+    location_source: str
     target_date: str
     forecast_start: str
     forecast_end: str
@@ -34,13 +51,18 @@ class WeatherTask(BaseModel):
 
 
 class WeatherTaskService:
-    def create_dayahead_task(self, target_date: str) -> WeatherTask:
+    def create_dayahead_task(self, target_date: str, location: ResolvedLocation | None = None) -> WeatherTask:
+        location = location or BUILTIN_LOCATIONS[REGION_DEFAULT]
         target = date.fromisoformat(target_date)
         previous = target - timedelta(days=1)
         return WeatherTask(
-            task_id=f"WEATHER-SZ-{target.strftime('%Y%m%d')}-DAYAHEAD-001",
+            task_id=f"WEATHER-CN-{location_slug(location)}-{target.strftime('%Y%m%d')}-DAYAHEAD-001",
             track=TRACK_WEATHER,
-            region=REGION_SHENZHEN,
+            region=location.name,
+            location_code=location.code,
+            latitude=location.latitude,
+            longitude=location.longitude,
+            location_source=location.source,
             target_date=target.isoformat(),
             forecast_start=_iso(target, 0, 0),
             forecast_end=_iso(target, 23, 0),

@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Protocol
 
 from services.weather_bot.aggregation import aggregate_provider_forecasts
+from services.weather_bot.location import LocationResolver, apply_location, location_payload, location_slug
 from services.weather_bot.models import (
     DataProfile,
     ExplanationProfile,
@@ -34,11 +35,15 @@ class ForecastService:
         self,
         providers: dict[str, WeatherProvider] | None = None,
         explainer: OpenClawExplainer | None = None,
+        location_resolver: LocationResolver | None = None,
     ):
         self.providers = providers or build_default_providers()
         self.explainer = explainer or OpenClawExplainer()
+        self.location_resolver = location_resolver or LocationResolver()
 
     async def forecast(self, request: ForecastRequest) -> WeatherSubmission:
+        location = await self.location_resolver.resolve(request)
+        request = apply_location(request, location)
         provider_results = []
         for provider_name in request.providers:
             provider = self.providers.get(provider_name)
@@ -65,11 +70,16 @@ class ForecastService:
         data_cutoff_time = _data_cutoff_time(request.target_date)
         forecast_start, forecast_end = _forecast_window(request.target_date)
         submission = WeatherSubmission(
-            task_id=_task_id(request.target_date),
+            task_id=_task_id(request.target_date, location_slug(location)),
             region=request.region,
             target_date=request.target_date,
             data_cutoff_time=data_cutoff_time,
-            scope=ScopeProfile(region=request.region, target_date=request.target_date, time_granularity=request.granularity),
+            scope=ScopeProfile(
+                region=request.region,
+                target_date=request.target_date,
+                time_granularity=request.granularity,
+                location=location_payload(location),
+            ),
             time_info=TimeInfo(
                 submit_time=submit_time,
                 data_cutoff_time=data_cutoff_time,
@@ -102,8 +112,8 @@ class ForecastService:
         return submission
 
 
-def _task_id(target_date: str) -> str:
-    return f"WEATHER-SZ-{target_date.replace('-', '')}-DAYAHEAD-001"
+def _task_id(target_date: str, location_token: str) -> str:
+    return f"WEATHER-CN-{location_token}-{target_date.replace('-', '')}-DAYAHEAD-001"
 
 
 def _data_cutoff_time(target_date: str) -> str:
@@ -139,7 +149,7 @@ def _confidence(providers_used: list[str], requested_providers: list[str]) -> di
 def _business_summary(submission: WeatherSubmission) -> str:
     summary = submission.aggregated_forecast.summary
     return (
-        f"{submission.target_date} 深圳气象预测用于社区共测和复盘。"
+        f"{submission.target_date} {submission.region}气象预测用于社区共测和复盘。"
         f"预计主要天气为{summary.main_weather}，最高温 {summary.max_temperature}℃，"
         f"最低温 {summary.min_temperature}℃，降水概率 {summary.rain_probability}%。"
         "该结果可作为负荷、新能源出力、电价复盘和储能运行观察的参考输入，"

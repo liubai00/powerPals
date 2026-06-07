@@ -9,7 +9,7 @@ from services.weather_bot.models import AggregatedForecast, ForecastPoint, Forec
 
 def make_submission() -> WeatherSubmission:
     return WeatherSubmission(
-        task_id="WEATHER-SZ-20260610-DAYAHEAD-001",
+        task_id="WEATHER-CN-440300-20260610-DAYAHEAD-001",
         region="广东省深圳市",
         target_date="2026-06-10",
         data_cutoff_time="2026-06-09T16:00:00+08:00",
@@ -45,7 +45,7 @@ def make_submission() -> WeatherSubmission:
 def test_text_summary_contains_required_fields_and_disclaimer():
     summary = build_text_summary(make_submission())
 
-    assert "WEATHER-SZ-20260610-DAYAHEAD-001" in summary
+    assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in summary
     assert "广东省深圳市" in summary
     assert "数据截止" in summary
     assert "不构成交易建议" in summary
@@ -56,7 +56,7 @@ def test_feishu_card_uses_message_card_shape():
 
     assert card["msg_type"] == "interactive"
     assert "card" in card
-    assert card["card"]["header"]["title"]["content"] == "深圳气象预测"
+    assert card["card"]["header"]["title"]["content"] == "广东省深圳市气象预测"
 
 
 def test_example_submission_matches_json_schema():
@@ -71,8 +71,9 @@ def test_example_submission_uses_document_style_official_fields():
 
     assert example["submission_type"] == "official_submission"
     assert example["track"] == "weather_forecast"
-    assert example["bot"]["bot_name"] == "PowerPals Shenzhen Weather Bot"
+    assert example["bot"]["bot_name"] == "PowerPals Weather Bot"
     assert example["scope"]["applicable_scenarios"]
+    assert example["scope"]["location"]["code"] == "440300"
     assert example["time_info"]["data_cutoff_time"] == "2026-06-09T16:00:00+08:00"
     assert example["data_profile"]["data_source_group"] == "公开数据组"
     assert example["payload"]["summary"]["main_weather"]

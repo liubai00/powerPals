@@ -15,7 +15,7 @@ def test_create_weather_task_endpoint_returns_task_contract():
 
     assert response.status_code == 200
     body = response.json()
-    assert body["task_id"] == "WEATHER-SZ-20260610-DAYAHEAD-001"
+    assert body["task_id"] == "WEATHER-CN-440300-20260610-DAYAHEAD-001"
     assert body["status"] == "draft"
     assert body["submission_deadline"] == "2026-06-09T17:00:00+08:00"
 
@@ -29,7 +29,7 @@ def test_publish_weather_task_endpoint_returns_task_card():
     body = response.json()
     assert body["task"]["status"] == "published"
     assert body["card"]["msg_type"] == "interactive"
-    assert "WEATHER-SZ-20260610-DAYAHEAD-001" in body["text"]
+    assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in body["text"]
 
 
 def test_publish_weather_task_records_local_task_jsonl(tmp_path):
@@ -41,7 +41,42 @@ def test_publish_weather_task_records_local_task_jsonl(tmp_path):
 
     assert response.status_code == 200
     assert task_log.exists()
-    assert "WEATHER-SZ-20260610-DAYAHEAD-001" in task_log.read_text(encoding="utf-8")
+    assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in task_log.read_text(encoding="utf-8")
+
+
+def test_get_weather_task_returns_created_national_task():
+    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    created = client.post("/api/tasks/weather/create", json={"region": "广州", "target_date": "2026-06-10"}).json()
+
+    response = client.get(f"/api/tasks/weather/{created['task_id']}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task_id"] == "WEATHER-CN-440100-20260610-DAYAHEAD-001"
+    assert body["region"] == "广东省广州市"
+    assert body["location_code"] == "440100"
+
+
+def test_get_weather_task_returns_created_coordinate_task():
+    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    created = client.post(
+        "/api/tasks/weather/create",
+        json={
+            "region": "广州南沙",
+            "latitude": 22.8016,
+            "longitude": 113.5252,
+            "target_date": "2026-06-10",
+        },
+    ).json()
+
+    response = client.get(f"/api/tasks/weather/{created['task_id']}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task_id"] == "WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001"
+    assert body["region"] == "广州南沙"
+    assert body["latitude"] == 22.8016
+    assert body["longitude"] == 113.5252
 
 
 def test_feishu_event_today_weather_task_returns_task_card():
@@ -56,4 +91,4 @@ def test_feishu_event_today_weather_task_returns_task_card():
     body = response.json()
     assert body["status"] == "handled"
     assert body["task"]["status"] == "published"
-    assert body["card"]["card"]["header"]["title"]["content"] == "深圳气象预测任务"
+    assert body["card"]["card"]["header"]["title"]["content"] == "广东省深圳市气象预测任务"

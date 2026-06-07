@@ -1,11 +1,11 @@
 {
   "submission_type": "official_submission",
-  "task_id": "WEATHER-SZ-20260610-DAYAHEAD-001",
+  "task_id": "WEATHER-CN-440300-20260610-DAYAHEAD-001",
   "track": "weather_forecast",
   "bot": {
-    "bot_id": "powerpals-shenzhen-weather-bot",
-    "bot_name": "PowerPals Shenzhen Weather Bot",
-    "bot_version": "v0.2.0",
+    "bot_id": "powerpals-weather-bot",
+    "bot_name": "PowerPals Weather Bot",
+    "bot_version": "v0.3.0",
     "owner": "PowerPals",
     "maturity_group": "Baseline Bot"
   },
@@ -13,6 +13,16 @@
     "region": "广东省深圳市",
     "target_date": "2026-06-10",
     "time_granularity": "1h",
+    "location": {
+      "name": "广东省深圳市",
+      "code": "440300",
+      "latitude": 22.5431,
+      "longitude": 114.0579,
+      "source": "builtin",
+      "country": "中国",
+      "province": "广东省",
+      "city": "深圳市"
+    },
     "applicable_scenarios": ["负荷预测参考", "新能源出力观察", "电价复盘辅助", "储能运行观察"]
   },
   "time_info": {
@@ -63,9 +73,9 @@
     "description": "中等"
   },
   "explanation": {
-    "key_factors": ["多源气象预报融合", "深圳沿海城市局地天气变化"],
+    "key_factors": ["多源气象预报融合", "城市局地天气变化"],
     "risk_notes": ["局地短时强降水和云量变化可能导致误差放大"],
-    "business_readable_summary": "2026-06-10 深圳气象预测用于社区共测和复盘。预计主要天气为多云，最高温 28.0℃，最低温 28.0℃，降水概率 20.0%。该结果可作为负荷、新能源出力、电价复盘和储能运行观察的参考输入，不构成交易建议、报价建议、投资建议或收益承诺。"
+    "business_readable_summary": "2026-06-10 广东省深圳市气象预测用于社区共测和复盘。该结果可作为负荷、新能源出力、电价复盘和储能运行观察的参考输入，不构成交易建议、报价建议、投资建议或收益承诺。"
   },
   "scoring_profile": {
     "participate_in_public_scorecard": true,
@@ -114,7 +124,7 @@
       "high_risk_period": "无明显高风险时段"
     }
   },
-  "key_factors": ["多源气象预报融合", "深圳沿海城市局地天气变化"],
+  "key_factors": ["多源气象预报融合", "城市局地天气变化"],
   "risk_notes": ["局地短时强降水和云量变化可能导致误差放大"],
   "disclaimer": "本输出仅用于小可爱电力社区共建、评分和复盘，不构成交易建议、报价建议、投资建议或收益承诺。"
 }

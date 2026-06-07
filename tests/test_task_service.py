@@ -4,9 +4,12 @@ from services.weather_bot.tasks import WeatherTaskService
 def test_weather_task_service_builds_doc_rhythm_task_window():
     task = WeatherTaskService().create_dayahead_task("2026-06-10")
 
-    assert task.task_id == "WEATHER-SZ-20260610-DAYAHEAD-001"
+    assert task.task_id == "WEATHER-CN-440300-20260610-DAYAHEAD-001"
     assert task.track == "weather_forecast"
     assert task.region == "广东省深圳市"
+    assert task.location_code == "440300"
+    assert task.latitude == 22.5431
+    assert task.longitude == 114.0579
     assert task.status == "draft"
     assert task.forecast_start == "2026-06-10T00:00:00+08:00"
     assert task.forecast_end == "2026-06-10T23:00:00+08:00"
