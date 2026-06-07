@@ -64,3 +64,17 @@ def test_example_submission_matches_json_schema():
     example = json.loads(Path("examples/weather_submission_shenzhen.json").read_text(encoding="utf-8"))
 
     validate(example, schema)
+
+
+def test_example_submission_uses_document_style_official_fields():
+    example = json.loads(Path("examples/weather_submission_shenzhen.json").read_text(encoding="utf-8"))
+
+    assert example["submission_type"] == "official_submission"
+    assert example["track"] == "weather_forecast"
+    assert example["bot"]["bot_name"] == "PowerPals Shenzhen Weather Bot"
+    assert example["scope"]["applicable_scenarios"]
+    assert example["time_info"]["data_cutoff_time"] == "2026-06-09T16:00:00+08:00"
+    assert example["data_profile"]["data_source_group"] == "公开数据组"
+    assert example["payload"]["summary"]["main_weather"]
+    assert example["explanation"]["business_readable_summary"]
+    assert example["scoring_profile"]["participate_in_public_scorecard"] is True

@@ -11,7 +11,7 @@ DEFAULT_DISCLAIMER = (
 
 
 class ForecastRequest(BaseModel):
-    region: str = "深圳"
+    region: str = "广东省深圳市"
     target_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
     granularity: Literal["1h", "day"] = "1h"
     providers: list[str] = Field(default_factory=lambda: ["open_meteo", "qweather", "caiyun"])
@@ -57,8 +57,75 @@ class AggregatedForecast(BaseModel):
     summary: ForecastSummary
 
 
+class BotProfile(BaseModel):
+    bot_id: str = "powerpals-shenzhen-weather-bot"
+    bot_name: str = "PowerPals Shenzhen Weather Bot"
+    bot_version: str = "v0.2.0"
+    owner: str = "PowerPals"
+    maturity_group: str = "Baseline Bot"
+
+
+class ScopeProfile(BaseModel):
+    region: str = "广东省深圳市"
+    target_date: str | None = None
+    time_granularity: str = "1h"
+    applicable_scenarios: list[str] = Field(
+        default_factory=lambda: ["负荷预测参考", "新能源出力观察", "电价复盘辅助", "储能运行观察"]
+    )
+
+
+class TimeInfo(BaseModel):
+    submit_time: str = ""
+    data_cutoff_time: str = ""
+    forecast_start: str = ""
+    forecast_end: str = ""
+
+
+class DataProfile(BaseModel):
+    data_source_group: str = "公开数据组"
+    data_sources_summary: list[str] = Field(default_factory=list)
+    disclosure_level: str = "类型披露"
+    known_limitations: list[str] = Field(default_factory=lambda: ["局地短时强降水和云量变化存在不确定性"])
+    provider_status: dict[str, str] = Field(default_factory=dict)
+
+
+class WeatherPayload(BaseModel):
+    unit: dict[str, str] = Field(
+        default_factory=lambda: {
+            "temperature": "degC",
+            "precipitation_probability": "%",
+            "wind_speed": "m/s",
+            "cloud_cover": "%",
+        }
+    )
+    values: list[ForecastPoint] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExplanationProfile(BaseModel):
+    key_factors: list[str] = Field(default_factory=list)
+    risk_notes: list[str] = Field(default_factory=list)
+    business_readable_summary: str = ""
+
+
+class ScoringProfile(BaseModel):
+    participate_in_public_scorecard: bool = True
+    preferred_group: str = "公开数据组"
+    self_declared_strengths: list[str] = Field(default_factory=lambda: ["逐小时气象预测", "多源聚合", "风险提示"])
+    not_suitable_for: list[str] = Field(default_factory=lambda: ["自动交易指令", "报价建议", "收益承诺"])
+
+
 class WeatherSubmission(BaseModel):
+    submission_type: str = "official_submission"
     task_id: str
+    track: str = "weather_forecast"
+    bot: BotProfile = Field(default_factory=BotProfile)
+    scope: ScopeProfile = Field(default_factory=ScopeProfile)
+    time_info: TimeInfo = Field(default_factory=TimeInfo)
+    data_profile: DataProfile = Field(default_factory=DataProfile)
+    payload: WeatherPayload = Field(default_factory=WeatherPayload)
+    explanation: ExplanationProfile = Field(default_factory=ExplanationProfile)
+    scoring_profile: ScoringProfile = Field(default_factory=ScoringProfile)
     region: str
     target_date: str
     data_cutoff_time: str

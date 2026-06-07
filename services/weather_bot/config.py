@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     feishu_default_chat_id: str | None = None
     feishu_bitable_app_token: str | None = None
     feishu_bitable_table_id: str | None = None
+    feishu_task_bitable_table_id: str | None = None
     local_jsonl_path: str = "data/weather_submissions.jsonl"
+    local_task_jsonl_path: str = "data/weather_tasks.jsonl"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

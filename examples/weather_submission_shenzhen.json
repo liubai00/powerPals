@@ -1,5 +1,78 @@
 {
+  "submission_type": "official_submission",
   "task_id": "WEATHER-SZ-20260610-DAYAHEAD-001",
+  "track": "weather_forecast",
+  "bot": {
+    "bot_id": "powerpals-shenzhen-weather-bot",
+    "bot_name": "PowerPals Shenzhen Weather Bot",
+    "bot_version": "v0.2.0",
+    "owner": "PowerPals",
+    "maturity_group": "Baseline Bot"
+  },
+  "scope": {
+    "region": "广东省深圳市",
+    "target_date": "2026-06-10",
+    "time_granularity": "1h",
+    "applicable_scenarios": ["负荷预测参考", "新能源出力观察", "电价复盘辅助", "储能运行观察"]
+  },
+  "time_info": {
+    "submit_time": "2026-06-09T16:45:00+08:00",
+    "data_cutoff_time": "2026-06-09T16:00:00+08:00",
+    "forecast_start": "2026-06-10T00:00:00+08:00",
+    "forecast_end": "2026-06-10T23:00:00+08:00"
+  },
+  "data_profile": {
+    "data_source_group": "公开数据组",
+    "data_sources_summary": ["open_meteo"],
+    "disclosure_level": "类型披露",
+    "known_limitations": ["局地短时强降水和云量变化存在不确定性"],
+    "provider_status": {
+      "open_meteo": "ok",
+      "qweather": "disabled",
+      "caiyun": "disabled"
+    }
+  },
+  "payload": {
+    "unit": {
+      "temperature": "degC",
+      "precipitation_probability": "%",
+      "wind_speed": "m/s",
+      "cloud_cover": "%"
+    },
+    "values": [
+      {
+        "time": "2026-06-10T00:00:00+08:00",
+        "temperature": 28.0,
+        "precipitation_probability": 20.0,
+        "wind_speed": 2.0,
+        "cloud_cover": 60.0
+      }
+    ],
+    "summary": {
+      "max_temperature": 28.0,
+      "min_temperature": 28.0,
+      "rain_probability": 20.0,
+      "wind_speed": 2.0,
+      "cloud_cover": 60.0,
+      "main_weather": "多云",
+      "high_risk_period": "无明显高风险时段"
+    }
+  },
+  "confidence": {
+    "score": 0.7,
+    "description": "中等"
+  },
+  "explanation": {
+    "key_factors": ["多源气象预报融合", "深圳沿海城市局地天气变化"],
+    "risk_notes": ["局地短时强降水和云量变化可能导致误差放大"],
+    "business_readable_summary": "2026-06-10 深圳气象预测用于社区共测和复盘。预计主要天气为多云，最高温 28.0℃，最低温 28.0℃，降水概率 20.0%。该结果可作为负荷、新能源出力、电价复盘和储能运行观察的参考输入，不构成交易建议、报价建议、投资建议或收益承诺。"
+  },
+  "scoring_profile": {
+    "participate_in_public_scorecard": true,
+    "preferred_group": "公开数据组",
+    "self_declared_strengths": ["逐小时气象预测", "多源聚合", "风险提示"],
+    "not_suitable_for": ["自动交易指令", "报价建议", "收益承诺"]
+  },
   "region": "广东省深圳市",
   "target_date": "2026-06-10",
   "data_cutoff_time": "2026-06-09T16:00:00+08:00",
@@ -40,10 +113,6 @@
       "main_weather": "多云",
       "high_risk_period": "无明显高风险时段"
     }
-  },
-  "confidence": {
-    "score": 0.7,
-    "description": "中等"
   },
   "key_factors": ["多源气象预报融合", "深圳沿海城市局地天气变化"],
   "risk_notes": ["局地短时强降水和云量变化可能导致误差放大"],

@@ -9,3 +9,13 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+
+  weather-scheduler:
+    build: .
+    command: ["python", "-m", "services.weather_bot.scheduler"]
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

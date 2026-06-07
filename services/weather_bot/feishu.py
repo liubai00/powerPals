@@ -6,6 +6,7 @@ import httpx
 
 from services.weather_bot.config import Settings
 from services.weather_bot.models import WeatherSubmission
+from services.weather_bot.tasks import WeatherTask
 
 
 class FeishuClient:
@@ -58,6 +59,22 @@ class FeishuClient:
             response = await client.post(url, headers={"Authorization": f"Bearer {token}"}, json={"fields": fields})
             response.raise_for_status()
 
+    async def write_task_bitable_record(self, task: WeatherTask) -> None:
+        if not self.settings.feishu_bitable_app_token or not self.settings.feishu_task_bitable_table_id:
+            return
+        token = await self.tenant_access_token()
+        url = (
+            "https://open.feishu.cn/open-apis/bitable/v1/apps/"
+            f"{self.settings.feishu_bitable_app_token}/tables/{self.settings.feishu_task_bitable_table_id}/records"
+        )
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                json={"fields": task_bitable_fields(task)},
+            )
+            response.raise_for_status()
+
 
 def verify_feishu_token(payload: dict[str, Any], expected_token: str | None) -> bool:
     if not expected_token:
@@ -84,6 +101,25 @@ def bitable_fields(submission: WeatherSubmission, card_message_id: str | None = 
         "card_message_id": card_message_id or "",
         "status": "accepted",
         "notes": "",
+    }
+
+
+def task_bitable_fields(task: WeatherTask) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "track": task.track,
+        "region": task.region,
+        "target_date": task.target_date,
+        "forecast_start": task.forecast_start,
+        "forecast_end": task.forecast_end,
+        "publish_time": task.publish_time,
+        "data_cutoff_time": task.data_cutoff_time,
+        "submission_deadline": task.submission_deadline,
+        "status": task.status,
+        "task_card_message_id": task.task_card_message_id or "",
+        "submission_format_version": task.submission_format_version,
+        "scoring_status": task.scoring_status,
+        "notes": task.notes,
     }
 
 
