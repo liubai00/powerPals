@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import urlencode
+
 from services.weather_bot.models import WeatherSubmission
 
 
@@ -35,9 +37,16 @@ def build_text_summary(submission: WeatherSubmission) -> str:
     )
 
 
-def build_feishu_card(submission: WeatherSubmission, report_url: str | None = None, download_url: str | None = None) -> dict:
+def build_feishu_card(
+    submission: WeatherSubmission,
+    report_url: str | None = None,
+    download_url: str | None = None,
+    json_url: str | None = None,
+    chart_submissions: list[WeatherSubmission] | None = None,
+) -> dict:
     summary = submission.aggregated_forecast.summary
     content = build_text_summary(submission)
+    chart_items = chart_submissions or [submission]
     elements = [
         {
             "tag": "div",
@@ -68,13 +77,14 @@ def build_feishu_card(submission: WeatherSubmission, report_url: str | None = No
             },
         },
     ]
+    elements.extend(_weather_chart_elements(chart_items))
     actions = []
     if report_url:
         actions.append(
             {
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "打开网页报告"},
-                "url": report_url,
+                "url": feishu_webview_url(report_url),
                 "type": "primary",
             }
         )
@@ -84,6 +94,15 @@ def build_feishu_card(submission: WeatherSubmission, report_url: str | None = No
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "下载CSV"},
                 "url": download_url,
+                "type": "default",
+            }
+        )
+    if json_url:
+        actions.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "下载JSON"},
+                "url": json_url,
                 "type": "default",
             }
         )
@@ -110,3 +129,56 @@ def build_feishu_card(submission: WeatherSubmission, report_url: str | None = No
             "elements": elements,
         },
     }
+
+
+def feishu_webview_url(url: str) -> str:
+    query = urlencode({"url": url, "mode": "sidebar-semi"})
+    return f"https://applink.feishu.cn/client/web_url/open?{query}"
+
+
+def _weather_chart_elements(submissions: list[WeatherSubmission]) -> list[dict]:
+    temperature_values = []
+    rain_values = []
+    for submission in submissions:
+        summary = submission.aggregated_forecast.summary
+        label = submission.target_date[5:] if len(submission.target_date) >= 10 else submission.target_date
+        if summary.max_temperature is not None:
+            temperature_values.append({"date": label, "type": "最高温", "value": summary.max_temperature})
+        if summary.min_temperature is not None:
+            temperature_values.append({"date": label, "type": "最低温", "value": summary.min_temperature})
+        if summary.rain_probability is not None:
+            rain_values.append({"date": label, "rain_probability": summary.rain_probability})
+
+    elements = []
+    if temperature_values:
+        elements.append(
+            {
+                "tag": "chart",
+                "aspect_ratio": "16:9",
+                "chart_spec": {
+                    "type": "line",
+                    "title": {"text": "温度趋势（℃）"},
+                    "data": {"values": temperature_values},
+                    "xField": "date",
+                    "yField": "value",
+                    "seriesField": "type",
+                    "legends": {"visible": True},
+                },
+            }
+        )
+    if rain_values:
+        elements.append(
+            {
+                "tag": "chart",
+                "aspect_ratio": "16:9",
+                "chart_spec": {
+                    "type": "bar",
+                    "title": {"text": "降水概率（%）"},
+                    "data": {"values": rain_values},
+                    "xField": "date",
+                    "yField": "rain_probability",
+                    "axes": [{"orient": "left", "min": 0, "max": 100}],
+                },
+            }
+        )
+    return elements

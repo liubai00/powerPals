@@ -1,7 +1,7 @@
 [project]
 name = "powerpals-weather-bot"
-version = "0.5.0"
-description = "PowerPals weather data workbench, forecast bot, task bot, and judging API."
+version = "0.6.0"
+description = "PowerPals visual Feishu weather card, data workbench, forecast bot, task bot, and judging API."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.111.0",

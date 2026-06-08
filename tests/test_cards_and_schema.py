@@ -59,6 +59,30 @@ def test_feishu_card_uses_message_card_shape():
     assert card["card"]["header"]["title"]["content"] == "广东省深圳市气象预测"
 
 
+def test_feishu_card_embeds_chart_and_download_actions():
+    card = build_feishu_card(
+        make_submission(),
+        report_url="https://powerpals.example.com/reports/weather?region=深圳&target_date=2026-06-10&days=1",
+        download_url="https://powerpals.example.com/api/weather/export?region=深圳&target_date=2026-06-10&days=1",
+        json_url="https://powerpals.example.com/api/weather/export/json?region=深圳&target_date=2026-06-10&days=1",
+        chart_submissions=[make_submission()],
+    )
+
+    elements = card["card"]["elements"]
+    charts = [element for element in elements if element.get("tag") == "chart"]
+    assert len(charts) >= 2
+    assert charts[0]["chart_spec"]["type"] == "line"
+    assert charts[1]["chart_spec"]["type"] == "bar"
+    assert "温度趋势" in charts[0]["chart_spec"]["title"]["text"]
+    assert "降水概率" in charts[1]["chart_spec"]["title"]["text"]
+
+    actions = next(element for element in elements if element.get("tag") == "action")["actions"]
+    button_urls = {action["text"]["content"]: action["url"] for action in actions}
+    assert button_urls["打开网页报告"].startswith("https://applink.feishu.cn/client/web_url/open")
+    assert "下载CSV" in button_urls
+    assert "下载JSON" in button_urls
+
+
 def test_example_submission_matches_json_schema():
     schema = json.loads(Path("schemas/weather_submission_v1.schema.json").read_text(encoding="utf-8"))
     example = json.loads(Path("examples/weather_submission_shenzhen.json").read_text(encoding="utf-8"))

@@ -1,6 +1,6 @@
 name: powerpals-weather
-version: 0.5.0
-description: PowerPals weather data workbench skill for OpenClaw.
+version: 0.6.0
+description: PowerPals visual Feishu weather card and data workbench skill for OpenClaw.
 author: PowerPals
 license: MIT
 tags:

@@ -21,7 +21,7 @@ Use this skill when the user asks for China weather forecasts, PowerPals weather
 - Use the configured default location when the user provides no location; the packaged default is Guangdong Shenzhen for backward compatibility.
 - Follow the rhythm: task publish, Bot submission, Feishu display, record, later scoring and review.
 - Treat forecast and task publishing as separate bot roles. Forecast calls should describe `weather_forecast_bot`; task calls should describe `weather_task_bot`.
-- Prefer web report and CSV links when the user wants to share results in a Feishu group.
+- Prefer visual Feishu cards with chart components, web report links, and CSV/JSON links when the user wants to share results in a Feishu group.
 - Do not scrape unauthorized WeChat article bodies. Record only user-provided or authorized news summaries.
 - Do not provide trading advice, quote advice, investment advice, profit promises, or commercial certification.
 - Do not invent weather values. Use the PowerPals Weather Bot API response.
@@ -67,6 +67,14 @@ Export CSV:
 
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/weather/export" \
+  -H "Content-Type: application/json" \
+  -d '{"region":"广州","target_date":"YYYY-MM-DD","days":7}'
+```
+
+Export standard JSON:
+
+```bash
+curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/weather/export/json" \
   -H "Content-Type: application/json" \
   -d '{"region":"广州","target_date":"YYYY-MM-DD","days":7}'
 ```

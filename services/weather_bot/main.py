@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from typing import Any
 from urllib.parse import urlencode
@@ -46,7 +47,7 @@ def create_app(
     expected_token = feishu_verification_token if feishu_verification_token is not None else settings.feishu_verification_token
     task_index: dict[str, WeatherTask] = {}
 
-    app = FastAPI(title="PowerPals Weather Data Workbench", version="0.5.0")
+    app = FastAPI(title="PowerPals Weather Data Workbench", version="0.6.0")
 
     def _cache_task(task: WeatherTask) -> WeatherTask:
         task_index[task.task_id] = task
@@ -110,6 +111,31 @@ def create_app(
     @app.get("/api/weather/export")
     async def export_weather_get(region: str, target_date: str, days: int = 1) -> Response:
         return await export_weather(ForecastRequest(region=region, target_date=target_date, days=days))
+
+    @app.post("/api/weather/export/json")
+    async def export_weather_json(request: ForecastRequest) -> Response:
+        request = _apply_favorite_alias(request, location_book)
+        submissions, errors = await collect_forecasts_with_errors(service, request)
+        if not submissions:
+            raise HTTPException(status_code=502, detail="No usable provider forecasts")
+        payload = {
+            "status": "partial" if errors else "ok",
+            "region": submissions[0].region if submissions else request.region,
+            "start_date": request.target_date,
+            "days": request.days,
+            "submissions": [submission.model_dump(mode="json") for submission in submissions],
+            "errors": errors,
+        }
+        filename = f"powerpals-weather-{request.target_date}-{request.days}d.json"
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/api/weather/export/json")
+    async def export_weather_json_get(region: str, target_date: str, days: int = 1) -> Response:
+        return await export_weather_json(ForecastRequest(region=region, target_date=target_date, days=days))
 
     @app.get("/reports/weather", response_class=HTMLResponse)
     async def weather_report(region: str, target_date: str, days: int = 1) -> HTMLResponse:
@@ -294,9 +320,20 @@ def create_app(
             request = _apply_favorite_alias(request, location_book)
             report_url = _public_weather_report_url(settings, request)
             download_url = _public_weather_download_url(settings, request)
+            json_url = _public_weather_json_url(settings, request)
             if request.days > 1:
                 submissions, errors = await collect_forecasts_with_errors(service, request)
-                card = build_feishu_card(submissions[0], report_url=report_url, download_url=download_url) if submissions else None
+                card = (
+                    build_feishu_card(
+                        submissions[0],
+                        report_url=report_url,
+                        download_url=download_url,
+                        json_url=json_url,
+                        chart_submissions=submissions,
+                    )
+                    if submissions
+                    else None
+                )
                 return {
                     "status": "partial" if errors else "handled",
                     "bot_role": "weather_forecast_bot",
@@ -304,6 +341,7 @@ def create_app(
                     "days": request.days,
                     "report_url": report_url,
                     "download_url": download_url,
+                    "json_url": json_url,
                     "card": card,
                     "submissions": [submission.model_dump(mode="json") for submission in submissions],
                     "errors": errors,
@@ -314,7 +352,8 @@ def create_app(
                 "bot_role": "weather_forecast_bot",
                 "report_url": report_url,
                 "download_url": download_url,
-                "card": build_feishu_card(result, report_url=report_url, download_url=download_url),
+                "json_url": json_url,
+                "card": build_feishu_card(result, report_url=report_url, download_url=download_url, json_url=json_url),
             }
         return {"status": "ignored"}
 
@@ -481,6 +520,13 @@ def _public_weather_download_url(settings: Settings, request: ForecastRequest) -
         return None
     query = urlencode({"region": request.region, "target_date": request.target_date, "days": request.days})
     return f"{settings.public_base_url.rstrip('/')}/api/weather/export?{query}"
+
+
+def _public_weather_json_url(settings: Settings, request: ForecastRequest) -> str | None:
+    if not settings.public_base_url:
+        return None
+    query = urlencode({"region": request.region, "target_date": request.target_date, "days": request.days})
+    return f"{settings.public_base_url.rstrip('/')}/api/weather/export/json?{query}"
 
 
 async def _resolve_task_location(location_resolver: LocationResolver, request: WeatherTaskRequest):

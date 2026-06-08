@@ -64,6 +64,7 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 | `POST` | `/api/weather/forecast/range` | 生成最多 16 天标准气象预测提交 |
 | `POST` | `/api/weather/batch` | 批量生成多个城市/经纬度预测 |
 | `POST`/`GET` | `/api/weather/export` | 导出 Excel 可直接打开的 CSV |
+| `POST`/`GET` | `/api/weather/export/json` | 导出标准 `weather_submission_v1` JSON |
 | `GET` | `/reports/weather` | 飞书群可打开的网页报告 |
 | `POST` | `/api/weather/submission` | 记录外部 Bot 的标准提交 |
 | `POST` | `/api/weather/publish` | 生成预测、发布预测卡片并记录 |
@@ -139,6 +140,12 @@ Invoke-WebRequest -Method Post http://127.0.0.1:8000/api/weather/export `
   -OutFile weather.csv
 ```
 
+导出标准 JSON：
+
+```text
+http://127.0.0.1:8000/api/weather/export/json?region=广州&target_date=2026-06-10&days=7
+```
+
 打开网页报告：
 
 ```text
@@ -195,7 +202,7 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 @机器人 帮助
 ```
 
-如果一句话同时包含“任务”和“天气预测”，系统优先按任务命令处理。当前响应会通过 `bot_role` 明确返回是预测机器人还是任务机器人处理。配置 `PUBLIC_BASE_URL` 后，预测卡片会带 **打开网页报告** 和 **下载CSV** 按钮，适合直接在飞书群里转发。
+如果一句话同时包含“任务”和“天气预测”，系统优先按任务命令处理。当前响应会通过 `bot_role` 明确返回是预测机器人还是任务机器人处理。配置 `PUBLIC_BASE_URL` 后，预测卡片会带 **卡片内趋势图表**、**打开网页报告**、**下载CSV** 和 **下载JSON** 按钮；网页报告按钮使用飞书 AppLink 在飞书端内打开，适合直接在群里转发。
 
 ## 气象数据工作台
 
@@ -205,7 +212,8 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 - 支持城市、地区、经纬度、收藏地址别名。
 - 支持批量预测。
 - 支持 CSV 下载，Excel 可直接打开。
-- 支持飞书群点击打开的网页报告。
+- 支持飞书卡片内展示温度趋势和降水概率图表。
+- 支持飞书群点击打开的网页报告，报告页内含 SVG 曲线和 CSV/JSON 下载按钮。
 - 支持本地电力资讯摘要记录，不抓取未授权公众号正文。
 - 支持水情记录和 CSV 导出。
 - 所有本地留痕默认写入 `data/`，密钥不进入仓库。

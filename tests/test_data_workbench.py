@@ -106,6 +106,20 @@ def test_weather_export_returns_excel_compatible_csv():
     assert "2026-06-11" in response.text
 
 
+def test_weather_export_json_returns_standard_submissions():
+    client = TestClient(create_app(forecast_service=CapturingForecastService()))
+
+    response = client.get("/api/weather/export/json", params={"region": "广州", "target_date": "2026-06-10", "days": 2})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert "attachment" in response.headers["content-disposition"]
+    body = response.json()
+    assert body["status"] == "ok"
+    assert len(body["submissions"]) == 2
+    assert body["submissions"][0]["task_id"].startswith("WEATHER-CN-WORKBENCH-")
+
+
 def test_weather_report_page_contains_download_and_table():
     client = TestClient(create_app(forecast_service=CapturingForecastService()))
 
@@ -115,7 +129,11 @@ def test_weather_report_page_contains_download_and_table():
     assert response.headers["content-type"].startswith("text/html")
     assert "广州气象数据工作台" in response.text
     assert "/api/weather/export" in response.text
+    assert "/api/weather/export/json" in response.text
+    assert "chart-panel" in response.text
+    assert "<svg" in response.text
     assert "下载CSV" in response.text
+    assert "下载JSON" in response.text
     assert "2026-06-10" in response.text
 
 
@@ -196,8 +214,11 @@ def test_feishu_weather_card_includes_report_and_download_links_when_public_base
     assert body["bot_role"] == "weather_forecast_bot"
     assert body["report_url"].startswith("https://powerpals.example.com/reports/weather")
     assert body["download_url"].startswith("https://powerpals.example.com/api/weather/export")
+    assert body["json_url"].startswith("https://powerpals.example.com/api/weather/export/json")
     assert "打开网页报告" in str(body["card"])
     assert "下载CSV" in str(body["card"])
+    assert "下载JSON" in str(body["card"])
+    assert "'tag': 'chart'" in str(body["card"])
 
 
 def test_feishu_days_parser_supports_16_day_forecast_window():

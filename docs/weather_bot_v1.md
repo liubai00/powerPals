@@ -98,6 +98,7 @@ Feishu command / scheduled task / HTTP API
 | `POST` | `/api/weather/forecast/range` | 最多 16 天气象预测 |
 | `POST` | `/api/weather/batch` | 批量预测 |
 | `POST`/`GET` | `/api/weather/export` | 导出 CSV |
+| `POST`/`GET` | `/api/weather/export/json` | 导出标准 JSON |
 | `GET` | `/reports/weather` | 网页报告 |
 | `GET`/`POST`/`DELETE` | `/api/locations` | 地址收藏 |
 | `GET`/`POST` | `/api/news/*` | 电力资讯摘要入口 |
@@ -178,11 +179,13 @@ submissions[2] -> 第三天 weather_submission_v1
 配置 `PUBLIC_BASE_URL` 后，飞书预测卡片会提供：
 
 ```text
+卡片内图表 -> 温度趋势、降水概率
 打开网页报告 -> /reports/weather
 下载CSV -> /api/weather/export
+下载JSON -> /api/weather/export/json
 ```
 
-网页报告是轻量 HTML 页面，适合在飞书群里打开；CSV 带 UTF-8 BOM，Excel 可直接打开。当前不做复杂前端应用，先保证群内查看、下载、转发三件事顺畅。
+网页报告是轻量 HTML 页面，适合在飞书群里打开；页面内置 SVG 曲线，不依赖外部前端框架。CSV 带 UTF-8 BOM，Excel 可直接打开；JSON 保留标准 `weather_submission_v1`，可给后续裁判 Bot、榜单和复盘脚本使用。网页报告按钮使用飞书 AppLink，优先在飞书端内 WebView 打开。
 
 ## 地址收藏、资讯和水情
 
@@ -234,7 +237,8 @@ summary: 中文评分摘要
 - 可以发布经纬度任务。
 - 可以查询未来三天。
 - 可以查询最多 16 天。
-- 可以打开网页报告并下载 CSV。
+- 可以在飞书卡片内看到趋势图表。
+- 可以打开网页报告并下载 CSV/JSON。
 - 可以收藏地址别名并用于预测。
 - 可以批量查询多个地点。
 - 可以记录电力资讯摘要和水情数据。
