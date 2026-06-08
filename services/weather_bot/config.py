@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,3 +29,10 @@ class Settings(BaseSettings):
     default_weather_longitude: float | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @field_validator("default_weather_latitude", "default_weather_longitude", mode="before")
+    @classmethod
+    def _empty_coordinate_as_none(cls, value: object) -> object:
+        if value == "":
+            return None
+        return value
