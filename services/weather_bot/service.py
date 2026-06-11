@@ -4,7 +4,9 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Protocol
 
 from services.weather_bot.aggregation import aggregate_provider_forecasts
+from services.weather_bot.config import Settings
 from services.weather_bot.location import LocationResolver, apply_location, location_payload, location_slug
+from services.weather_bot.llm import LlmClient
 from services.weather_bot.models import (
     DataProfile,
     ExplanationProfile,
@@ -36,10 +38,18 @@ class ForecastService:
         providers: dict[str, WeatherProvider] | None = None,
         explainer: OpenClawExplainer | None = None,
         location_resolver: LocationResolver | None = None,
+        settings: Settings | None = None,
     ):
-        self.providers = providers or build_default_providers()
-        self.explainer = explainer or OpenClawExplainer()
-        self.location_resolver = location_resolver or LocationResolver()
+        explicit_settings = settings is not None
+        self.settings = settings or Settings()
+        self.providers = providers or build_default_providers(self.settings)
+        llm_client = LlmClient.from_settings(self.settings) if explicit_settings else None
+        self.explainer = explainer or OpenClawExplainer(
+            self.settings.openclaw_api_url,
+            self.settings.openclaw_api_key,
+            llm_client=llm_client,
+        )
+        self.location_resolver = location_resolver or LocationResolver(self.settings)
 
     async def forecast(self, request: ForecastRequest) -> WeatherSubmission:
         location = await self.location_resolver.resolve(request)

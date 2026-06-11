@@ -1,7 +1,15 @@
 from fastapi.testclient import TestClient
 
 from services.weather_bot.config import Settings
-from services.weather_bot.main import _days_from_text, create_app
+from services.weather_bot.main import (
+    _days_from_text,
+    _needs_region_clarification,
+    _needs_task_region_clarification,
+    _region_from_text,
+    _request_from_text,
+    _task_request_from_text,
+    create_app,
+)
 from services.weather_bot.models import AggregatedForecast, ForecastPoint, ForecastSummary, WeatherSubmission
 
 
@@ -93,6 +101,26 @@ def test_weather_range_returns_partial_when_one_day_has_no_provider_data():
     assert body["errors"] == [{"target_date": "2026-06-11", "error": "No usable provider forecasts"}]
 
 
+def test_weather_command_extracts_province_region_and_days():
+    request = _request_from_text("帮我查下辽宁未来三天的气象信息")
+
+    assert request.region == "辽宁"
+    assert request.days == 3
+
+
+def test_weather_command_prefers_city_suffix_over_bare_province_alias():
+    assert _region_from_text("帮我查下吉林市未来三天天气") == "吉林市"
+
+
+def test_task_command_extracts_arbitrary_bare_city_without_changing_weather_parser():
+    task_request = _task_request_from_text("发布珠海最近四天的气象任务")
+
+    assert task_request.region == "珠海"
+    assert task_request.days == 4
+    assert _needs_task_region_clarification("发布珠海最近四天的气象任务") is False
+    assert _needs_region_clarification("帮我查珠海最近四天的气象信息") is True
+
+
 def test_weather_export_returns_excel_compatible_csv():
     client = TestClient(create_app(forecast_service=CapturingForecastService()))
 
@@ -104,6 +132,7 @@ def test_weather_export_returns_excel_compatible_csv():
     assert "target_date,region,max_temperature" in response.text
     assert "2026-06-10" in response.text
     assert "2026-06-11" in response.text
+    assert "task_id" not in response.text.lstrip("\ufeff").splitlines()[0].split(",")
 
 
 def test_weather_export_json_returns_standard_submissions():
@@ -131,10 +160,145 @@ def test_weather_report_page_contains_download_and_table():
     assert "/api/weather/export" in response.text
     assert "/api/weather/export/json" in response.text
     assert "chart-panel" in response.text
+    assert "hourly-chart-grid" in response.text
+    assert 'data-metric="temperature"' in response.text
+    assert 'data-metric="rain"' in response.text
+    assert 'data-metric="wind"' in response.text
+    assert 'data-metric="cloud"' in response.text
+    assert 'data-metric-chart="temperature"' in response.text
+    assert 'data-metric-chart="cloud"' in response.text
+    assert 'id="download-payload"' in response.text
+    assert 'data-download-kind="csv"' in response.text
+    assert 'data-download-kind="json"' in response.text
+    assert 'class="page-shell"' in response.text
+    assert "chart-tooltip" in response.text
+    assert 'data-tooltip="' in response.text
+    assert 'style="pointer-events: all;"' in response.text
     assert "<svg" in response.text
     assert "下载CSV" in response.text
     assert "下载JSON" in response.text
+    assert 'data-download-url="/api/weather/export?' in response.text
+    assert 'href="/api/weather/export?' not in response.text
+    assert 'frame.id = "download-frame"' in response.text
+    assert "startUrlDownload(button)" in response.text
+    assert "小时明细" in response.text
+    assert "最高/最低温趋势" in response.text
+    assert "最高温" in response.text
+    assert "最低温" in response.text
     assert "2026-06-10" in response.text
+
+
+def test_weather_compare_report_contains_multi_region_downloads():
+    service = CapturingForecastService()
+    client = TestClient(create_app(forecast_service=service))
+
+    response = client.get(
+        "/reports/weather/compare",
+        params={"regions": "广州,深圳", "target_date": "2026-06-10", "days": 2},
+    )
+
+    assert response.status_code == 200
+    assert "多地区气象对比报告" in response.text
+    assert "对比地区" in response.text
+    assert "广东省广州市 / 广东省深圳市" in response.text
+    assert "广州" in response.text
+    assert "深圳" in response.text
+    assert response.text.count("<th>区域</th>") >= 2
+    assert "06-10 广东省广州市" in response.text
+    assert "06-10 广东省深圳市" in response.text
+    assert "06-10 00:00 广东省广州市" in response.text
+    assert "06-10 00:00 广东省深圳市" in response.text
+    assert 'data-download-url="/api/weather/compare/export?' in response.text
+    assert "/api/weather/compare/export/json" in response.text
+    assert [request.region for request in service.seen_requests] == ["广东省广州市"] * 2 + ["广东省深圳市"] * 2
+
+
+def test_weather_compare_export_returns_all_requested_regions():
+    service = CapturingForecastService()
+    client = TestClient(create_app(forecast_service=service))
+
+    csv_response = client.get(
+        "/api/weather/compare/export",
+        params={"regions": "广州,深圳", "target_date": "2026-06-10", "days": 2},
+    )
+    json_response = client.get(
+        "/api/weather/compare/export/json",
+        params={"regions": "广州,深圳", "target_date": "2026-06-10", "days": 2},
+    )
+
+    assert csv_response.status_code == 200
+    assert json_response.status_code == 200
+    assert csv_response.text.count("广州") == 2
+    assert csv_response.text.count("深圳") == 2
+    assert json_response.json()["regions"] == ["广东省广州市", "广东省深圳市"]
+    assert len(json_response.json()["submissions"]) == 4
+
+
+def test_weather_report_get_preserves_coordinate_query():
+    service = CapturingForecastService()
+    client = TestClient(create_app(forecast_service=service))
+
+    response = client.get(
+        "/reports/weather",
+        params={
+            "region": "经纬度 39.9042,116.4074",
+            "latitude": 39.9042,
+            "longitude": 116.4074,
+            "target_date": "2026-06-10",
+            "days": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.seen_requests[0].latitude == 39.9042
+    assert service.seen_requests[0].longitude == 116.4074
+    assert "latitude=39.9042" in response.text
+    assert "longitude=116.4074" in response.text
+
+
+def test_weather_report_supports_auto_download_mode():
+    client = TestClient(create_app(forecast_service=CapturingForecastService()))
+
+    response = client.get(
+        "/reports/weather",
+        params={"region": "广州", "target_date": "2026-06-10", "days": 1, "autodownload": "csv"},
+    )
+
+    assert response.status_code == 200
+    assert 'const autoDownloadKind = "csv";' in response.text
+
+
+def test_weather_report_can_focus_on_requested_metrics():
+    client = TestClient(create_app(forecast_service=CapturingForecastService()))
+
+    response = client.get(
+        "/reports/weather",
+        params={"region": "广州", "target_date": "2026-06-10", "days": 2, "metrics": "rain,wind"},
+    )
+
+    assert response.status_code == 200
+    assert 'data-metric="rain"' in response.text
+    assert 'data-metric="wind"' in response.text
+    assert 'data-metric="temperature"' not in response.text
+    assert 'data-metric="cloud"' not in response.text
+    assert "<th>降水概率</th>" in response.text
+    assert "<th>风速</th>" in response.text
+    assert "<th>温度</th>" not in response.text
+
+
+def test_weather_report_downloads_reuse_recent_report_data():
+    service = CapturingForecastService()
+    client = TestClient(create_app(forecast_service=service))
+
+    client.get("/reports/weather", params={"region": "广州", "target_date": "2026-06-10", "days": 2})
+    assert len(service.seen_requests) == 2
+
+    csv_response = client.get("/api/weather/export", params={"region": "广州", "target_date": "2026-06-10", "days": 2})
+    json_response = client.get("/api/weather/export/json", params={"region": "广州", "target_date": "2026-06-10", "days": 2})
+
+    assert csv_response.status_code == 200
+    assert json_response.status_code == 200
+    assert len(service.seen_requests) == 2
 
 
 def test_weather_batch_forecasts_multiple_locations():
@@ -224,3 +388,10 @@ def test_feishu_weather_card_includes_report_and_download_links_when_public_base
 def test_feishu_days_parser_supports_16_day_forecast_window():
     assert _days_from_text("广州未来16天天气") == 16
     assert _days_from_text("广州未来十六天气象预测") == 16
+
+
+def test_feishu_days_parser_supports_recent_and_plain_day_ranges():
+    assert _days_from_text("预测下最近四天的气象数据") == 4
+    assert _days_from_text("广州近4天气象数据") == 4
+    assert _days_from_text("广州接下来四日降雨趋势") == 4
+    assert _days_from_text("广州4天天气") == 4

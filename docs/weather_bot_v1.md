@@ -9,6 +9,17 @@
 
 深圳仍是默认地区，但不再是限制。当前版本支持全国城市/地区/经纬度输入。
 
+## 多机器人隔离
+
+推荐生产部署使用两个独立飞书机器人 App：
+
+| 飞书机器人 | 回调入口 | 能力边界 |
+|---|---|---|
+| 全国气象预测机器人 | `/feishu/events/weather` | 只处理天气预测、多日预测、报告和导出链接 |
+| 气象任务发布机器人 | `/feishu/events/task` | 只处理任务发布、提醒、关闭和任务记录 |
+
+旧入口 `/feishu/events` 仍保留用于单机器人兼容模式，会同时处理预测和任务命令。多机器人部署时不要把两个机器人都接到旧入口，否则能力边界会重新混在一起。
+
 ## 任务机器人具体能干什么
 
 任务机器人解决的是“共测组织问题”，不是“天气计算问题”。
@@ -109,7 +120,9 @@ Feishu command / scheduled task / HTTP API
 | `POST` | `/api/tasks/weather/close` | 关闭任务 |
 | `GET` | `/api/tasks/weather/{task_id}` | 按任务 ID 查询任务，优先读内存，再读本地 JSONL |
 | `POST` | `/api/judge/weather/score` | 对单条标准预测做基础评分 |
-| `POST` | `/feishu/events` | 飞书回调 |
+| `POST` | `/feishu/events` | 旧版单机器人飞书回调 |
+| `POST` | `/feishu/events/weather` | 气象预测机器人飞书回调 |
+| `POST` | `/feishu/events/task` | 气象任务发布机器人飞书回调 |
 
 ## 任务 ID
 
@@ -142,7 +155,7 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 @机器人 帮助
 ```
 
-当前规则：如果一句话同时包含“气象任务”和“天气预测”，优先按任务处理。响应里的 `bot_role` 会明确说明由预测机器人还是任务机器人处理。后续可以引入更完整的 Intent Router，在混合意图时主动澄清或拆成两步。
+当前规则：旧入口 `/feishu/events` 如果一句话同时包含“气象任务”和“天气预测”，优先按任务处理。新入口会执行能力隔离：`/feishu/events/weather` 遇到任务命令会返回 `status=redirect`，提示找气象任务发布机器人；`/feishu/events/task` 遇到天气预测命令会返回 `status=redirect`，提示找全国气象预测机器人。重定向响应会带上 `suggested_bot_role`、`suggested_bot_name` 和 `suggested_event_path`。响应里的 `bot_role` 会明确说明由预测机器人还是任务机器人处理。
 
 ## 标准提交
 

@@ -21,6 +21,15 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 | 全国气象预测机器人 | 查询城市、地区或经纬度对应的逐小时气象预测，只负责预测和解释 | `广州明天天气`、`22.8016,113.5252 明天天气` | `weather_submission_v1` JSON、飞书预测卡片，响应中标记 `bot_role=weather_forecast_bot` |
 | 气象任务发布机器人 | 发布共测任务、统一提交口径、提醒提交、关闭窗口、记录状态，不计算天气 | `今日广州气象任务`、`22.8016,113.5252 今日气象任务` | 任务卡片、任务记录、后续评分输入，响应中标记 `bot_role=weather_task_bot` |
 
+生产部署建议使用两个独立飞书机器人 App，并把回调入口分开：
+
+| 飞书机器人 | 回调入口 | 允许能力 |
+|---|---|---|
+| 全国气象预测机器人 | `/feishu/events/weather` | 天气预测、多日预测、网页报告和导出链接 |
+| 气象任务发布机器人 | `/feishu/events/task` | 任务发布、提醒、关闭和任务留痕 |
+
+旧入口 `/feishu/events` 仍保留兼容单机器人模式，会继续按“任务优先、预测其次”的规则处理，但不建议用于多机器人隔离部署。
+
 任务机器人本身不计算天气。它负责“组织比赛/共测流程”：告诉大家测哪里、测哪天、什么时候截止、用什么格式提交，并把任务状态写入飞书多维表格或本地 JSONL。
 
 裁判目前不是第三个完整业务机器人，而是一个最小评分工具：输入标准预测 JSON 和实况摘要，输出温度误差、降水命中、风速误差和综合分。后续可以扩展为独立裁判 Bot、榜单和复盘报告。
@@ -78,7 +87,9 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 | `POST` | `/api/tasks/weather/remind` | 发布提交提醒并记录任务状态 |
 | `POST` | `/api/tasks/weather/close` | 关闭提交窗口，进入等待实况评分状态 |
 | `GET` | `/api/tasks/weather/{task_id}` | 按任务 ID 查询任务 |
-| `POST` | `/feishu/events` | 飞书事件回调入口 |
+| `POST` | `/feishu/events` | 旧版单机器人飞书事件回调入口 |
+| `POST` | `/feishu/events/weather` | 气象预测机器人飞书事件回调入口，只处理预测能力 |
+| `POST` | `/feishu/events/task` | 气象任务发布机器人飞书事件回调入口，只处理任务能力 |
 
 ## 快速启动
 
@@ -202,7 +213,7 @@ WEATHER-CN-COORD-22_8016-113_5252-20260610-DAYAHEAD-001
 @机器人 帮助
 ```
 
-如果一句话同时包含“任务”和“天气预测”，系统优先按任务命令处理。当前响应会通过 `bot_role` 明确返回是预测机器人还是任务机器人处理。配置 `PUBLIC_BASE_URL` 后，预测卡片会带 **卡片内趋势图表**、**打开网页报告**、**下载CSV** 和 **下载JSON** 按钮；网页报告按钮使用飞书 AppLink 在飞书端内打开，适合直接在群里转发。
+如果使用旧入口 `/feishu/events`，一句话同时包含“任务”和“天气预测”时，系统仍优先按任务命令处理。使用新入口时，`/feishu/events/weather` 只处理预测类命令，遇到任务命令会返回 `status=redirect` 并提示找气象任务发布机器人；`/feishu/events/task` 只处理任务类命令，遇到天气预测命令同样返回 `status=redirect` 并提示找全国气象预测机器人。当前响应会通过 `bot_role` 明确返回是预测机器人还是任务机器人处理。配置 `PUBLIC_BASE_URL` 后，预测卡片会带 **卡片内趋势图表**、**打开网页报告**、**下载CSV** 和 **下载JSON** 按钮；网页报告按钮使用飞书 AppLink 在飞书端内打开，适合直接在群里转发。
 
 ## 气象数据工作台
 
@@ -327,6 +338,14 @@ FEISHU_APP_ID=
 FEISHU_APP_SECRET=
 FEISHU_VERIFICATION_TOKEN=
 FEISHU_DEFAULT_CHAT_ID=
+FEISHU_WEATHER_APP_ID=
+FEISHU_WEATHER_APP_SECRET=
+FEISHU_WEATHER_VERIFICATION_TOKEN=
+FEISHU_WEATHER_DEFAULT_CHAT_ID=
+FEISHU_TASK_APP_ID=
+FEISHU_TASK_APP_SECRET=
+FEISHU_TASK_VERIFICATION_TOKEN=
+FEISHU_TASK_DEFAULT_CHAT_ID=
 FEISHU_BITABLE_APP_TOKEN=
 FEISHU_BITABLE_TABLE_ID=
 FEISHU_TASK_BITABLE_TABLE_ID=

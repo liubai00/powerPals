@@ -20,6 +20,7 @@ class WeatherTaskRequest(BaseModel):
     location_code: str | None = None
     location_source: str | None = None
     target_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    days: int = Field(default=1, ge=1, le=16)
 
     @model_validator(mode="after")
     def validate_coordinates(self) -> "WeatherTaskRequest":
@@ -37,6 +38,7 @@ class WeatherTask(BaseModel):
     longitude: float
     location_source: str
     target_date: str
+    forecast_days: int = 1
     forecast_start: str
     forecast_end: str
     publish_time: str
@@ -51,9 +53,16 @@ class WeatherTask(BaseModel):
 
 
 class WeatherTaskService:
-    def create_dayahead_task(self, target_date: str, location: ResolvedLocation | None = None) -> WeatherTask:
+    def create_dayahead_task(
+        self,
+        target_date: str,
+        location: ResolvedLocation | None = None,
+        days: int = 1,
+    ) -> WeatherTask:
         location = location or BUILTIN_LOCATIONS[REGION_DEFAULT]
         target = date.fromisoformat(target_date)
+        days = min(16, max(1, days))
+        forecast_end = target + timedelta(days=days - 1)
         previous = target - timedelta(days=1)
         return WeatherTask(
             task_id=f"WEATHER-CN-{location_slug(location)}-{target.strftime('%Y%m%d')}-DAYAHEAD-001",
@@ -64,8 +73,9 @@ class WeatherTaskService:
             longitude=location.longitude,
             location_source=location.source,
             target_date=target.isoformat(),
+            forecast_days=days,
             forecast_start=_iso(target, 0, 0),
-            forecast_end=_iso(target, 23, 0),
+            forecast_end=_iso(forecast_end, 23, 0),
             publish_time=_iso(previous, 9, 0),
             data_cutoff_time=_iso(previous, 16, 0),
             reminder_time=_iso(previous, 16, 30),

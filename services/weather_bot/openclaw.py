@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import httpx
 
+from services.weather_bot.llm import LlmClient, explain_weather_with_llm
 from services.weather_bot.models import WeatherSubmission
 
 
 class OpenClawExplainer:
-    def __init__(self, api_url: str | None = None, api_key: str | None = None, timeout: float = 20.0):
+    def __init__(
+        self,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        timeout: float = 20.0,
+        llm_client: LlmClient | None = None,
+    ):
         self.api_url = api_url
         self.api_key = api_key
         self.timeout = timeout
+        self.llm_client = llm_client
 
     async def explain(self, submission: WeatherSubmission) -> dict[str, list[str]]:
         if not self.api_url:
-            return _deterministic_explanation(submission)
+            return await self._fallback_explanation(submission)
 
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         payload = {
@@ -26,13 +34,19 @@ class OpenClawExplainer:
                 response.raise_for_status()
                 body = response.json()
         except httpx.HTTPError:
-            return _deterministic_explanation(submission)
+            return await self._fallback_explanation(submission)
 
-        fallback = _deterministic_explanation(submission)
+        fallback = await self._fallback_explanation(submission)
         return {
             "key_factors": body.get("key_factors") or fallback["key_factors"],
             "risk_notes": body.get("risk_notes") or fallback["risk_notes"],
         }
+
+    async def _fallback_explanation(self, submission: WeatherSubmission) -> dict[str, list[str]]:
+        llm_explanation = await explain_weather_with_llm(self.llm_client, submission)
+        if llm_explanation:
+            return llm_explanation
+        return _deterministic_explanation(submission)
 
 
 def _deterministic_explanation(submission: WeatherSubmission) -> dict[str, list[str]]:

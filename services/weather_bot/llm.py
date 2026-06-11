@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import httpx
+
+from services.weather_bot.config import Settings
+from services.weather_bot.models import WeatherSubmission
+
+
+logger = logging.getLogger(__name__)
+
+
+class LlmClient:
+    def __init__(
+        self,
+        api_base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout: float = 20.0,
+    ):
+        self.api_base_url = api_base_url.rstrip("/") if api_base_url else None
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "LlmClient":
+        return cls(
+            api_base_url=settings.llm_api_base_url,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            timeout=settings.llm_timeout,
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_base_url and self.api_key and self.model)
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = 0.2,
+        max_tokens: int | None = 600,
+    ) -> str | None:
+        if not self.enabled:
+            return None
+
+        payload: dict[str, Any] = {"model": self.model, "messages": messages}
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        body = await self._post_chat_completion(payload)
+        if body is None and ("temperature" in payload or "max_tokens" in payload):
+            payload = {"model": self.model, "messages": messages}
+            body = await self._post_chat_completion(payload)
+        if body is None:
+            return None
+
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return None
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        return content.strip() if isinstance(content, str) and content.strip() else None
+
+    async def _post_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    self._chat_completions_url(),
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+            if response.status_code >= 400:
+                logger.warning("LLM chat HTTP %s: %s", response.status_code, response.text[:500])
+                return None
+            return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("LLM chat failed: %s", exc)
+            return None
+
+    def _chat_completions_url(self) -> str:
+        assert self.api_base_url is not None
+        if self.api_base_url.endswith("/chat/completions"):
+            return self.api_base_url
+        if self.api_base_url.endswith("/v1"):
+            return f"{self.api_base_url}/chat/completions"
+        return f"{self.api_base_url}/v1/chat/completions"
+
+
+async def explain_weather_with_llm(
+    llm_client: LlmClient | None,
+    submission: WeatherSubmission,
+) -> dict[str, list[str]] | None:
+    if llm_client is None or not llm_client.enabled:
+        return None
+
+    summary = submission.aggregated_forecast.summary
+    compact_payload = {
+        "region": submission.region,
+        "target_date": submission.target_date,
+        "providers_used": submission.aggregated_forecast.providers_used,
+        "summary": summary.model_dump(mode="json"),
+        "confidence": submission.confidence,
+    }
+    content = await llm_client.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是 PowerPals 气象预测解释员。只基于用户给出的预测数据生成解释，"
+                    "不要编造新天气数据。只返回 JSON，格式为："
+                    '{"key_factors":["因素1","因素2"],"risk_notes":["风险1","风险2"]}。'
+                ),
+            },
+            {"role": "user", "content": json.dumps(compact_payload, ensure_ascii=False)},
+        ],
+        temperature=0.2,
+        max_tokens=500,
+    )
+    body = _parse_json_object(content)
+    if not body:
+        return None
+    key_factors = _string_list(body.get("key_factors"))
+    risk_notes = _string_list(body.get("risk_notes"))
+    if not key_factors or not risk_notes:
+        return None
+    return {"key_factors": key_factors[:5], "risk_notes": risk_notes[:5]}
+
+
+async def answer_role_question(
+    llm_client: LlmClient | None,
+    *,
+    bot_role: str,
+    user_text: str,
+    fallback: str,
+) -> str:
+    if llm_client is None or not llm_client.enabled:
+        return fallback
+
+    if bot_role == "weather_forecast_bot":
+        role_prompt = (
+            "你是 PowerPals 的全国气象预测机器人。你可以解释天气预测、经纬度/城市查询、"
+            "多日趋势、数据源和飞书卡片。你不能发布气象共测任务；遇到任务发布、提醒、关闭、记录，"
+            "请让用户艾特 AI任务小助手。回答要简洁、中文、适合飞书群聊。"
+        )
+    elif bot_role == "weather_task_bot":
+        role_prompt = (
+            "你是 PowerPals 的气象任务发布机器人。你负责发布、提醒、关闭和记录气象共测任务。"
+            "你不能查询或计算天气预测；遇到天气查询、经纬度天气、多日趋势，请让用户艾特 AI气象预测小助手。"
+            "回答要简洁、中文、适合飞书群聊。"
+        )
+    else:
+        role_prompt = (
+            "你是 PowerPals 飞书机器人助手。请区分气象预测机器人和气象任务发布机器人，"
+            "用简洁中文回答用户。"
+        )
+
+    content = await llm_client.chat(
+        [
+            {"role": "system", "content": role_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.3,
+        max_tokens=500,
+    )
+    return content or fallback
+
+
+async def answer_weather_knowledge_question(
+    llm_client: LlmClient | None,
+    *,
+    user_text: str,
+    fallback: str,
+    search_results: list[dict[str, str]] | None = None,
+) -> str:
+    if llm_client is None or not llm_client.enabled:
+        return fallback
+
+    context = ""
+    if search_results:
+        context = json.dumps(search_results[:4], ensure_ascii=False)
+    content = await llm_client.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是 PowerPals 的全国气象预测机器人。用户现在问的是气象知识、数据来源、"
+                    "更新时间、预测不确定性、术语解释或使用方式，不是在让你生成某个城市的预测卡片。"
+                    "请用简洁中文回答，适合飞书群聊；不要编造实时天气数值；如果需要具体城市预测，"
+                    "再提示用户提供城市或经纬度。若提供了搜索上下文，可结合上下文回答。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"question": user_text, "search_context": context},
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        temperature=0.3,
+        max_tokens=700,
+    )
+    return content or fallback
+
+
+def _parse_json_object(content: str | None) -> dict[str, Any] | None:
+    if not content:
+        return None
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(content[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]

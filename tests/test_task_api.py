@@ -32,6 +32,19 @@ def test_publish_weather_task_endpoint_returns_task_card():
     assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in body["text"]
 
 
+def test_publish_weather_task_endpoint_supports_multi_day_task():
+    client = TestClient(create_app(forecast_service=FakeForecastService()))
+
+    response = client.post("/api/tasks/weather/publish", json={"target_date": "2026-06-10", "days": 3})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task"]["forecast_days"] == 3
+    assert body["task"]["forecast_end"] == "2026-06-12T23:00:00+08:00"
+    assert "预测天数" in body["text"]
+    assert "3 天" in body["text"]
+
+
 def test_publish_weather_task_records_local_task_jsonl(tmp_path):
     task_log = tmp_path / "weather_tasks.jsonl"
     settings = Settings(local_task_jsonl_path=str(task_log))
@@ -105,7 +118,7 @@ def test_get_weather_task_loads_published_coordinate_task_from_local_jsonl_after
     assert body["longitude"] == 113.5252
 
 
-def test_feishu_event_today_weather_task_returns_task_card():
+def test_feishu_event_today_weather_task_without_region_asks_for_region():
     client = TestClient(create_app(forecast_service=FakeForecastService()))
 
     response = client.post(
@@ -115,6 +128,7 @@ def test_feishu_event_today_weather_task_returns_task_card():
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "handled"
-    assert body["task"]["status"] == "published"
-    assert body["card"]["card"]["header"]["title"]["content"] == "广东省深圳市气象预测任务"
+    assert body["status"] == "needs_region"
+    assert body["bot_role"] == "weather_task_bot"
+    assert body["mode"] == "clarification"
+    assert "缺少城市或区域" in body["text"]
