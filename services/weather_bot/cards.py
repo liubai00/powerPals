@@ -38,6 +38,55 @@ def build_text_summary(submission: WeatherSubmission) -> str:
     )
 
 
+def _weather_emoji(text: str | None) -> str:
+    t = text or ""
+    if "雷" in t:
+        return "⛈️"
+    if "雪" in t:
+        return "❄️"
+    if "雨" in t:
+        return "🌧️"
+    if "雾" in t or "霾" in t:
+        return "🌫️"
+    if "阴" in t:
+        return "☁️"
+    if "多云" in t:
+        return "⛅"
+    if "晴" in t:
+        return "☀️"
+    return "🌤️"
+
+
+def _fmt_metric(value: object) -> str:
+    if value is None:
+        return "—"
+    try:
+        return str(int(round(float(value))))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _daily_forecast_columns(submissions: list) -> dict:
+    columns = []
+    for sub in submissions[:7]:
+        s = sub.aggregated_forecast.summary
+        emoji = _weather_emoji(getattr(s, "main_weather", None))
+        md = (
+            f"**{sub.target_date[5:]}**\n"
+            f"{emoji} {getattr(s, 'main_weather', None) or '—'}\n"
+            f"🌡️ **{_fmt_metric(s.max_temperature)}°** / {_fmt_metric(s.min_temperature)}°\n"
+            f"💧 {_fmt_metric(s.rain_probability)}%"
+        )
+        columns.append({
+            "tag": "column",
+            "width": "weighted",
+            "weight": 1,
+            "vertical_align": "top",
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": md}}],
+        })
+    return {"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "default", "columns": columns}
+
+
 def build_feishu_card(
     submission: WeatherSubmission,
     report_url: str | None = None,
@@ -73,14 +122,19 @@ def build_feishu_card(
             },
         },
         {"tag": "hr"},
+    ]
+    if len(chart_items) > 1:
+        elements.append(_daily_forecast_columns(chart_items))
+        elements.append({"tag": "hr"})
+    elements.append(
         {
             "tag": "div",
             "text": {
                 "tag": "lark_md",
                 "content": _forecast_detail_content(submission, selected_metrics),
             },
-        },
-    ]
+        }
+    )
     chart_elements = _hourly_chart_elements(chart_items, selected_metrics)
     elements.extend(chart_elements or _weather_chart_elements(chart_items, selected_metrics))
     actions = []
@@ -112,7 +166,8 @@ def build_feishu_card(
             }
         )
     if actions:
-        elements.extend([{"tag": "hr"}, {"tag": "action", "actions": actions}])
+        _btn_layout = "trisection" if len(actions) == 3 else "bisected" if len(actions) == 2 else "flow"
+        elements.extend([{"tag": "hr"}, {"tag": "action", "layout": _btn_layout, "actions": actions}])
     if include_submission_note:
         content = build_text_summary(submission)
         elements.extend(
@@ -130,7 +185,7 @@ def build_feishu_card(
             "config": {"wide_screen_mode": True},
             "header": {
                 "template": "blue",
-                "title": {"tag": "plain_text", "content": f"{submission.region}气象预测"},
+                "title": {"tag": "plain_text", "content": f"⛅ {submission.region}气象预测"},
             },
             "elements": elements,
         },

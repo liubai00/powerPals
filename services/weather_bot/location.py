@@ -249,6 +249,55 @@ for location in list(BUILTIN_LOCATIONS.values()):
     BUILTIN_LOCATIONS.setdefault(location.name, location)
 
 
+# Register provincial capital city names using the capital coordinates that are
+# already present in PROVINCE_LEVEL_LOCATIONS (no new coordinate data introduced).
+for _aliases, _name, _code, _lat, _lon, _province, _city in PROVINCE_LEVEL_LOCATIONS:
+    if not _city.endswith("市") or _city == _name:
+        continue
+    _full = _name + _city
+    _bare = _city[:-1]
+    _city_loc = ResolvedLocation(
+        name=_full,
+        code=_code[:2] + "0100",
+        latitude=_lat,
+        longitude=_lon,
+        source="builtin",
+        province=_name,
+        city=_city,
+    )
+    for _alias in (_bare, _city, _full):
+        BUILTIN_LOCATIONS.setdefault(_alias, _city_loc)
+
+
+# Other frequently-queried non-capital cities.
+MAJOR_CITY_LOCATIONS: tuple[tuple[tuple[str, ...], str, str, float, float, str, str], ...] = (
+    (("苏州", "苏州市"), "江苏省苏州市", "320500", 31.2989, 120.5853, "江苏省", "苏州市"),
+    (("无锡", "无锡市"), "江苏省无锡市", "320200", 31.4912, 120.3119, "江苏省", "无锡市"),
+    (("青岛", "青岛市"), "山东省青岛市", "370200", 36.0671, 120.3826, "山东省", "青岛市"),
+    (("厦门", "厦门市"), "福建省厦门市", "350200", 24.4798, 118.0894, "福建省", "厦门市"),
+    (("大连", "大连市"), "辽宁省大连市", "210200", 38.9140, 121.6147, "辽宁省", "大连市"),
+    (("宁波", "宁波市"), "浙江省宁波市", "330200", 29.8683, 121.5440, "浙江省", "宁波市"),
+    (("温州", "温州市"), "浙江省温州市", "330300", 27.9938, 120.6994, "浙江省", "温州市"),
+    (("东莞", "东莞市"), "广东省东莞市", "441900", 23.0207, 113.7518, "广东省", "东莞市"),
+    (("佛山", "佛山市"), "广东省佛山市", "440600", 23.0218, 113.1219, "广东省", "佛山市"),
+    (("珠海", "珠海市"), "广东省珠海市", "440400", 22.2710, 113.5768, "广东省", "珠海市"),
+    (("中山", "中山市"), "广东省中山市", "442000", 22.5170, 113.3927, "广东省", "中山市"),
+    (("惠州", "惠州市"), "广东省惠州市", "441300", 23.1115, 114.4161, "广东省", "惠州市"),
+)
+for _aliases, _name, _code, _lat, _lon, _province, _city in MAJOR_CITY_LOCATIONS:
+    _loc = ResolvedLocation(
+        name=_name,
+        code=_code,
+        latitude=_lat,
+        longitude=_lon,
+        source="builtin",
+        province=_province,
+        city=_city,
+    )
+    for _alias in (*_aliases, _name):
+        BUILTIN_LOCATIONS.setdefault(_alias, _loc)
+
+
 class LocationResolver:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings()

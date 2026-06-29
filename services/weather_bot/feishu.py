@@ -102,6 +102,36 @@ class FeishuClient:
                 raise RuntimeError(f"Feishu send message failed: {body}")
             return body
 
+    async def reply_interactive_card(self, message_id: str, card: dict[str, Any], in_thread: bool = False) -> str:
+        body = await self.reply_message(message_id, "interactive", card["card"], in_thread)
+        return body.get("data", {}).get("message_id", "")
+
+    async def reply_text_message(self, message_id: str, text: str, in_thread: bool = False) -> str:
+        body = await self.reply_message(message_id, "text", {"text": text}, in_thread)
+        return body.get("data", {}).get("message_id", "")
+
+    async def reply_message(self, message_id: str, msg_type: str, content: dict[str, Any], in_thread: bool = False) -> dict[str, Any]:
+        for attempt in range(2):
+            token = await self.tenant_access_token()
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"msg_type": msg_type, "content": json_dumps(content), "reply_in_thread": in_thread},
+                )
+            if response.status_code >= 400:
+                if attempt == 0 and _is_invalid_access_token(response):
+                    self._clear_tenant_access_token()
+                    continue
+                raise RuntimeError(f"Feishu reply message HTTP {response.status_code}: {response.text}")
+            body = response.json()
+            if body.get("code", 0) == 99991663 and attempt == 0:
+                self._clear_tenant_access_token()
+                continue
+            if body.get("code", 0) != 0:
+                raise RuntimeError(f"Feishu reply message failed: {body}")
+            return body
+
         raise RuntimeError("Feishu send message failed after token refresh")
 
     async def write_bitable_record(self, submission: WeatherSubmission, card_message_id: str | None = None) -> None:

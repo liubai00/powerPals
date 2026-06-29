@@ -49,8 +49,8 @@ FEISHU_WEATHER_BOT = "weather"
 FEISHU_TASK_BOT = "task"
 WEATHER_FORECAST_BOT_ROLE = "weather_forecast_bot"
 WEATHER_TASK_BOT_ROLE = "weather_task_bot"
-WEATHER_BOT_ALIASES = ["AI气象预测小助手", "气象预测小助手", "气象小助手", "全国气象预测机器人"]
-TASK_BOT_ALIASES = ["AI任务小助手", "任务小助手", "气象任务发布机器人"]
+WEATHER_BOT_ALIASES = ["云云", "AI气象预测小助手", "气象预测小助手", "气象小助手", "全国气象预测机器人"]
+TASK_BOT_ALIASES = ["点点", "AI任务小助手", "任务小助手", "气象任务发布机器人"]
 WEATHER_TASK_ID_RE = re.compile(r"WEATHER-CN-(.+)-(\d{4})(\d{2})(\d{2})-DAYAHEAD-001")
 DEFAULT_REGION = "广东省深圳市"
 LOCATION_ALIASES: tuple[tuple[str, str], ...] = (
@@ -145,7 +145,7 @@ DAY_COUNT_WORDS = {
 }
 DAY_COUNT_TOKEN_RE = r"(十六|十五|十四|十三|十二|十一|十|[一二两三四五六七八九]|\d+)"
 REGION_WITH_SUFFIX_RE = re.compile(
-    r"([\u4e00-\u9fff]{2,12}?(?:特别行政区|自治区|自治州|地区|省|市|盟|州|县|区))(?=(?:未来|今天|明天|后天|天气|气象|预测|预报|降雨|降水|信息|任务|的|\s|$))"
+    r"([\u4e00-\u9fff]{2,12}?(?:特别行政区|自治区|自治州|地区|省|市|盟|州|县|区))(?=(?:最近|未来|接下来|近期|这几天|今天|明天|后天|天气|气象|预测|预报|降雨|降水|信息|任务|的|[一二两三四五六七八九十\d]+[天日]|\s|$))"
 )
 REGION_QUERY_PREFIXES = (
     "帮我查询一下",
@@ -188,6 +188,48 @@ TASK_BARE_REGION_BLOCKLIST = {
 }
 PLACE_SUFFIX_CONTINUATION_CHARS = "省市区县州盟"
 FORECAST_REPORT_CACHE_TTL_SECONDS = 3600
+
+
+def _weather_loading_shell() -> str:
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>云云 · 正在生成预测…</title>
+<style>
+  html, body { margin: 0; height: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: linear-gradient(135deg, #38bdf8 0%, #0ea5e9 45%, #0f766e 100%); color: #fff; }
+  #load { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; text-align: center; padding: 24px; }
+  .spin { width: 46px; height: 46px; border: 4px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .t { font-size: 18px; font-weight: 600; }
+  .s { font-size: 13px; color: rgba(255,255,255,.85); max-width: 300px; line-height: 1.7; }
+  iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; transition: opacity .35s ease; background: #eef3f9; }
+</style>
+</head>
+<body>
+<div id="load">
+  <div class="spin"></div>
+  <div class="t">⛅ 云云正在生成预测…</div>
+  <div class="s">正在汇总多家气象数据源，首次生成约需数秒，请稍候。生成后自动展示，一小时内再次打开即秒开。</div>
+</div>
+<iframe id="rpt" title="气象预测报告"></iframe>
+<script>
+  (function () {
+    var u = new URL(window.location.href);
+    u.searchParams.set("_fragment", "1");
+    var f = document.getElementById("rpt");
+    f.addEventListener("load", function () {
+      var l = document.getElementById("load");
+      if (l) { l.style.display = "none"; }
+      f.style.opacity = "1";
+    });
+    f.src = u.toString();
+  })();
+</script>
+</body>
+</html>"""
 COMPARISON_QUERY_KEYWORDS = ("对比", "比较", "相比", "差异", "哪个更", "哪边更")
 MAX_COMPARISON_REGIONS = 4
 WEATHER_KNOWLEDGE_KEYWORDS = (
@@ -552,6 +594,7 @@ def create_app(
         longitude: float | None = None,
         location_code: str | None = None,
         location_source: str | None = None,
+        _fragment: int = 0,
     ) -> HTMLResponse:
         request = _apply_favorite_alias(
             ForecastRequest(
@@ -565,6 +608,10 @@ def create_app(
             ),
             location_book,
         )
+        if not _fragment:
+            _cached_entry = forecast_report_cache.get(_forecast_report_cache_key(request))
+            if _cached_entry is None or time.monotonic() - _cached_entry[0] > FORECAST_REPORT_CACHE_TTL_SECONDS:
+                return HTMLResponse(content=_weather_loading_shell())
         submissions, errors = await _collect_cached_forecasts(request)
         if not submissions:
             raise HTTPException(status_code=502, detail="No usable provider forecasts")
@@ -1176,10 +1223,10 @@ def _bot_role_for_allowed_bot(allowed_bot: str) -> str:
 
 def _progress_text(bot_role: str) -> str:
     if bot_role == WEATHER_FORECAST_BOT_ROLE:
-        return "收到，我正在查询气象数据并生成预测卡片。"
+        return "⛅ 收到~ 云云正在汇总多家气象数据，马上给你生成预测卡片，请稍候。"
     if bot_role == WEATHER_TASK_BOT_ROLE:
-        return "收到，我正在处理气象共测任务。"
-    return "收到，我正在处理。"
+        return "📋 收到~ 点点正在处理这条气象共测任务，请稍候。"
+    return "收到~ 正在处理，请稍候。"
 
 
 def _feishu_event_type(payload: dict[str, Any]) -> str:
@@ -1198,6 +1245,14 @@ def _event_message_id(event: dict[str, Any]) -> str | None:
     if not message_id:
         message_id = event.get("message_id")
     return str(message_id) if message_id else None
+
+
+def _event_thread_id(event: dict[str, Any]) -> str | None:
+    message = event.get("message", {})
+    if not isinstance(message, dict):
+        return None
+    thread_id = message.get("thread_id")
+    return str(thread_id) if thread_id else None
 
 
 def _seen_message(seen: dict[str, float], allowed_bot: str, message_id: str, ttl_seconds: int = 600) -> bool:
@@ -1284,13 +1339,13 @@ def _string_values(value: Any) -> list[str]:
 
 def _redirect_to_bot_command(current_bot_role: str, suggested_bot_role: str) -> dict[str, str]:
     if current_bot_role == WEATHER_TASK_BOT_ROLE:
-        suggested_bot_name = "全国气象预测机器人"
+        suggested_bot_name = "气象小助手云云"
         suggested_event_path = "/feishu/events/weather"
-        text = "这个问题请找全国气象预测机器人处理。我负责发布、提醒、关闭和记录气象共测任务。"
+        text = "这个问题交给气象小助手「云云」更合适哦~ 我是点点，负责气象任务的发布、提醒、关闭和记录。"
     else:
-        suggested_bot_name = "气象任务发布机器人"
+        suggested_bot_name = "任务小助手点点"
         suggested_event_path = "/feishu/events/task"
-        text = "这个任务请找气象任务发布机器人处理。我负责天气预测、报告和导出。"
+        text = "这个任务交给任务小助手「点点」就好~ 我是云云，负责天气预测、报告和数据导出。"
     return {
         "status": "redirect",
         "bot_role": current_bot_role,
@@ -1340,10 +1395,18 @@ async def _send_feishu_event_response(
         message_id = ""
         card = result.get("card")
         text = result.get("text")
+        incoming_message_id = _event_message_id(event)
+        thread_id = _event_thread_id(event)
         if isinstance(card, dict):
-            message_id = await feishu_client.send_interactive_card(chat_id, card)
+            if incoming_message_id and thread_id:
+                message_id = await feishu_client.reply_interactive_card(incoming_message_id, card, in_thread=True)
+            else:
+                message_id = await feishu_client.send_interactive_card(chat_id, card)
         elif isinstance(text, str) and text:
-            message_id = await feishu_client.send_text_message(chat_id, text)
+            if incoming_message_id and thread_id:
+                message_id = await feishu_client.reply_text_message(incoming_message_id, text, in_thread=True)
+            else:
+                message_id = await feishu_client.send_text_message(chat_id, text)
         if message_id:
             result["event_reply_message_id"] = message_id
     except Exception as exc:  # noqa: BLE001 - ack the event even when message delivery fails
@@ -1573,29 +1636,29 @@ def _region_clarification_text(days: int, command_type: str) -> str:
     day_text = f"{days}天" if days > 1 else "明天/指定日期"
     if command_type == "task":
         return (
-            f"我已经识别到你想发布{day_text}的气象任务，但还缺少城市或区域。\n"
-            "请告诉我城市、地区或经纬度，例如：发布广州最近四天气象任务。"
+            f"📋 点点收到啦~ 你想发布{day_text}的气象共测任务，不过还差一个地点。\n"
+            "告诉我城市 / 区县 / 经纬度就行，例如：发布广州未来四天气象任务。"
         )
     return (
-        f"我已经识别到你想查询{day_text}的气象数据，但还缺少城市或区域。\n"
-        "请告诉我城市、地区或经纬度，例如：广州最近四天气象数据。"
+        f"⛅ 云云收到啦~ 你想看{day_text}的天气，不过还差一个地点。\n"
+        "告诉我城市 / 区县 / 经纬度就行，例如：武汉未来三天天气，或 22.80,113.52 明天天气。"
     )
 
 
 def _unsupported_weather_metric_text(metrics: list[str]) -> str:
     metric_text = "、".join(metrics)
     return (
-        f"你问到的{metric_text}目前还没有真正接入数据模型。\n"
-        "现在已接入并可生成图表的气象要素是：温度、降水概率、风速、云量。\n"
-        "如果要接入这些字段，需要从数据源请求字段、扩展 ForecastPoint、聚合摘要、卡片和网页报告。"
+        f"抱歉，你问的「{metric_text}」云云暂时还没接入哦。\n"
+        "目前能查、能出图的气象要素有：🌡️ 温度、🌧️ 降水概率、💨 风速、☁️ 云量。\n"
+        "你可以换这些要素再问我一次~"
     )
 
 
 def _too_many_comparison_regions_text(regions: list[str]) -> str:
     return (
-        f"我识别到了 {len(regions)} 个地区：{'、'.join(regions)}。\n"
-        f"当前飞书卡片一次最多支持 {MAX_COMPARISON_REGIONS} 个地区对比，避免卡片过长和图表过密。\n"
-        "请先选择其中 2-4 个地区，或者拆成多次对比。"
+        f"你一次问了 {len(regions)} 个地区：{'、'.join(regions)}~\n"
+        f"为了卡片清晰好读，云云一次最多对比 {MAX_COMPARISON_REGIONS} 个地区。\n"
+        "先挑其中 2-4 个，或者分几次对比吧。"
     )
 
 
@@ -1646,7 +1709,7 @@ def _comparison_regions_from_text(text: str) -> list[str]:
         return regions
     if any(separator in text for separator in ("和", "与", "跟", "及", "、", "，", ",")):
         return regions
-    return regions
+    return []
 
 
 def _regions_from_text(text: str) -> list[str]:
@@ -1867,17 +1930,19 @@ async def _resolve_task_location(location_resolver: LocationResolver, request: W
 
 def _help_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
     weather_help = [
-        "全国气象预测机器人：负责城市、地区、经纬度天气预测，不发布共测任务。",
-        "@机器人 广州明天天气",
-        "@机器人 北京气象预测 2026-06-10",
-        "@机器人 广州未来三天天气",
-        "@机器人 22.8016,113.5252 明天天气",
+        "⛅ 我是云云，PowerPals 的气象预测小助手~ 负责全国城市 / 区县 / 经纬度的天气预测（不发布共测任务）。",
+        "你可以这样问我：",
+        "• @云云 广州明天天气",
+        "• @云云 武汉未来三天天气",
+        "• @云云 北京气象预测 2026-06-10",
+        "• @云云 22.8016,113.5252 明天天气",
     ]
     task_help = [
-        "气象任务发布机器人：负责发布、提醒、关闭和记录气象共测任务，不计算天气。",
-        "@机器人 今日广州气象任务",
-        "@机器人 22.8016,113.5252 今日气象任务",
-        "@机器人 帮助",
+        "📋 我是点点，PowerPals 的气象任务小助手~ 负责发布、提醒、关闭和记录气象共测任务（不算天气）。",
+        "你可以这样用我：",
+        "• @点点 今日广州气象任务",
+        "• @点点 22.8016,113.5252 今日气象任务",
+        "• @点点 帮助",
     ]
     if allowed_bot == FEISHU_WEATHER_BOT:
         return "\n".join(weather_help)
