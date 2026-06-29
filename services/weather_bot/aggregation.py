@@ -16,6 +16,9 @@ METRIC_WEIGHTS: dict[str, dict[str, float]] = {
     "wind_speed": {"qweather": 0.4, "open_meteo": 0.35, "caiyun": 0.25},
     "cloud_cover": {"qweather": 0.4, "open_meteo": 0.35, "caiyun": 0.25},
     "precipitation_probability": {"caiyun": 0.45, "qweather": 0.35, "open_meteo": 0.2},
+    "apparent_temperature": {"open_meteo": 1.0},
+    "wind_direction": {"open_meteo": 1.0},
+    "uv_index": {"open_meteo": 1.0},
 }
 
 
@@ -39,17 +42,36 @@ def aggregate_provider_forecasts(provider_results: list[ProviderForecast]) -> Ag
                 precipitation_probability=_weighted_metric(provider_points, "precipitation_probability"),
                 wind_speed=_weighted_metric(provider_points, "wind_speed"),
                 cloud_cover=_weighted_metric(provider_points, "cloud_cover"),
+                apparent_temperature=_weighted_metric(provider_points, "apparent_temperature"),
+                wind_direction=_weighted_metric(provider_points, "wind_direction"),
+                uv_index=_weighted_metric(provider_points, "uv_index"),
             )
         )
 
     if not aggregated_points:
         raise ValueError("No usable provider forecasts")
 
+    sunrise = sunset = None
+    for result in usable:
+        daily = result.daily or {}
+        if not sunrise and daily.get("sunrise"):
+            sunrise = _hhmm(daily.get("sunrise"))
+        if not sunset and daily.get("sunset"):
+            sunset = _hhmm(daily.get("sunset"))
+
     return AggregatedForecast(
         providers_used=[result.provider for result in usable],
         points=aggregated_points,
-        summary=_build_summary(aggregated_points),
+        summary=_build_summary(aggregated_points, sunrise, sunset),
     )
+
+
+def _hhmm(value: object) -> str | None:
+    if not value or not isinstance(value, str):
+        return None
+    if "T" in value and len(value) >= 16:
+        return value[11:16]
+    return value
 
 
 def _weighted_metric(provider_points: list[tuple[str, ForecastPoint]], metric: str) -> float | None:
@@ -69,11 +91,18 @@ def _weighted_metric(provider_points: list[tuple[str, ForecastPoint]], metric: s
     return round(sum(value * weight for value, weight in weighted_values) / total_weight, 2)
 
 
-def _build_summary(points: list[ForecastPoint]) -> ForecastSummary:
+def _build_summary(points: list[ForecastPoint], sunrise: str | None = None, sunset: str | None = None) -> ForecastSummary:
     temperatures = [point.temperature for point in points if point.temperature is not None]
     rains = [point.precipitation_probability for point in points if point.precipitation_probability is not None]
     winds = [point.wind_speed for point in points if point.wind_speed is not None]
     clouds = [point.cloud_cover for point in points if point.cloud_cover is not None]
+    feels = [point.apparent_temperature for point in points if point.apparent_temperature is not None]
+    uvs = [point.uv_index for point in points if point.uv_index is not None]
+    wind_dir_pairs = [
+        (point.wind_speed, point.wind_direction)
+        for point in points
+        if point.wind_speed is not None and point.wind_direction is not None
+    ]
 
     rain_probability = round(max(rains), 2) if rains else None
     cloud_cover = round(mean(clouds), 2) if clouds else None
@@ -87,6 +116,11 @@ def _build_summary(points: list[ForecastPoint]) -> ForecastSummary:
         cloud_cover=cloud_cover,
         main_weather=_describe_weather(rain_probability, cloud_cover),
         high_risk_period=_find_high_risk_period(points),
+        feels_like=round(max(feels), 2) if feels else None,
+        wind_direction=max(wind_dir_pairs)[1] if wind_dir_pairs else None,
+        uv_index=round(max(uvs), 2) if uvs else None,
+        sunrise=sunrise,
+        sunset=sunset,
     )
 
 

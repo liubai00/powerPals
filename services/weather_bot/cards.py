@@ -282,6 +282,30 @@ def feishu_webview_url(url: str, mode: str = "window") -> str:
     return f"https://applink.feishu.cn/client/web_url/open?{query}"
 
 
+def _compass(degrees: float | None) -> str:
+    if degrees is None:
+        return "—"
+    names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+    return names[int((float(degrees) % 360) / 45 + 0.5) % 8] + "风"
+
+
+def _uv_level(uv: float | None) -> str:
+    if uv is None:
+        return "—"
+    value = float(uv)
+    if value < 3:
+        label = "弱"
+    elif value < 6:
+        label = "中等"
+    elif value < 8:
+        label = "强"
+    elif value < 11:
+        label = "很强"
+    else:
+        label = "极强"
+    return "%d（%s）" % (round(value), label)
+
+
 def _forecast_detail_content(submission: WeatherSubmission, metrics: list[str] | None = None) -> str:
     summary = submission.aggregated_forecast.summary
     selected = set(normalize_weather_metrics(metrics))
@@ -289,16 +313,26 @@ def _forecast_detail_content(submission: WeatherSubmission, metrics: list[str] |
     lines = []
     if "temperature" in selected:
         lines.extend([f"- 最高温：{summary.max_temperature}℃", f"- 最低温：{summary.min_temperature}℃"])
+        if summary.feels_like is not None:
+            lines.append(f"- 体感最高：{summary.feels_like}℃")
     if "rain" in selected:
         lines.append(f"- 降水概率：{summary.rain_probability}%")
     if "wind" in selected:
         lines.append(f"- 风速：{summary.wind_speed} m/s")
+        if summary.wind_direction is not None:
+            lines.append(f"- 风向：{_compass(summary.wind_direction)}")
     if "cloud" in selected:
         lines.append(f"- 云量：{summary.cloud_cover}%")
     if selected & {"rain", "cloud"}:
         lines.append(f"- 主要天气：{summary.main_weather}")
     if selected & {"rain", "wind"} or selected == all_metrics:
         lines.append(f"- 高风险时段：{summary.high_risk_period}")
+    extras = []
+    if summary.uv_index is not None:
+        extras.append(f"- 紫外线：{_uv_level(summary.uv_index)}")
+    if summary.sunrise and summary.sunset:
+        extras.append(f"- 日出 / 日落：{summary.sunrise} / {summary.sunset}")
+    lines.extend(extras)
     lines.extend(
         [
             "",

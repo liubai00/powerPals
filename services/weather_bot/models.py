@@ -42,6 +42,9 @@ class ForecastPoint(BaseModel):
     precipitation_probability: float | None = None
     wind_speed: float | None = None
     cloud_cover: float | None = None
+    apparent_temperature: float | None = None
+    wind_direction: float | None = None
+    uv_index: float | None = None
 
 
 class ProviderForecast(BaseModel):
@@ -50,6 +53,7 @@ class ProviderForecast(BaseModel):
     points: list[ForecastPoint] = Field(default_factory=list)
     error_message: str | None = None
     raw: dict[str, Any] | None = None
+    daily: dict[str, Any] = Field(default_factory=dict)
 
 
 class ForecastSummary(BaseModel):
@@ -60,6 +64,11 @@ class ForecastSummary(BaseModel):
     cloud_cover: float | None = None
     main_weather: str
     high_risk_period: str
+    feels_like: float | None = None
+    wind_direction: float | None = None
+    uv_index: float | None = None
+    sunrise: str | None = None
+    sunset: str | None = None
 
 
 class AggregatedForecast(BaseModel):

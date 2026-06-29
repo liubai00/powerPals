@@ -22,7 +22,8 @@ class OpenMeteoProvider:
         params = {
             "latitude": latitude,
             "longitude": longitude,
-            "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,cloud_cover",
+            "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,cloud_cover,apparent_temperature,wind_direction_10m,uv_index",
+            "daily": "sunrise,sunset",
             "timezone": "Asia/Shanghai",
             "start_date": target.isoformat(),
             "end_date": target.isoformat(),
@@ -31,7 +32,10 @@ class OpenMeteoProvider:
             response = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
             response.raise_for_status()
             body = response.json()
-        return ProviderForecast(provider=self.name, status="ok", points=_open_meteo_points(body), raw=body)
+        _daily = body.get("daily", {})
+        _daily = _daily if isinstance(_daily, dict) else {}
+        daily_values = {"sunrise": (_daily.get("sunrise") or [None])[0], "sunset": (_daily.get("sunset") or [None])[0]}
+        return ProviderForecast(provider=self.name, status="ok", points=_open_meteo_points(body), raw=body, daily=daily_values)
 
 
 class QWeatherProvider:
@@ -109,6 +113,9 @@ def _open_meteo_points(body: dict[str, Any]) -> list[ForecastPoint]:
             precipitation_probability=_value(hourly, "precipitation_probability", index),
             wind_speed=_value(hourly, "wind_speed_10m", index),
             cloud_cover=_value(hourly, "cloud_cover", index),
+            apparent_temperature=_value(hourly, "apparent_temperature", index),
+            wind_direction=_value(hourly, "wind_direction_10m", index),
+            uv_index=_value(hourly, "uv_index", index),
         )
         for index, timestamp in enumerate(times)
     ]
