@@ -126,15 +126,10 @@ def build_feishu_card(
     if len(chart_items) > 1:
         elements.append(_daily_forecast_columns(chart_items))
         elements.append({"tag": "hr"})
-    elements.append(
-        {
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": _forecast_detail_content(submission, selected_metrics),
-            },
-        }
-    )
+    elements.append(_summary_fields_element(submission, selected_metrics))
+    _explanation = _explanation_block(submission)
+    if _explanation:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _explanation}})
     chart_elements = _hourly_chart_elements(chart_items, selected_metrics)
     elements.extend(chart_elements or _weather_chart_elements(chart_items, selected_metrics))
     actions = []
@@ -344,6 +339,54 @@ def _forecast_detail_content(submission: WeatherSubmission, metrics: list[str] |
         ]
     )
     return "\n".join(lines)
+
+
+def _summary_fields_element(submission: WeatherSubmission, metrics: list[str] | None = None) -> dict:
+    summary = submission.aggregated_forecast.summary
+    selected = set(normalize_weather_metrics(metrics))
+    all_metrics = set(SUPPORTED_WEATHER_METRIC_ORDER)
+    fields: list[dict] = []
+
+    def add(label: str, value: str, short: bool = True) -> None:
+        fields.append({"is_short": short, "text": {"tag": "lark_md", "content": f"{label}\n**{value}**"}})
+
+    if "temperature" in selected:
+        add("🌡️ 气温", f"{_fmt_metric(summary.max_temperature)}° / {_fmt_metric(summary.min_temperature)}°")
+        if summary.feels_like is not None:
+            add("🤒 体感最高", f"{summary.feels_like}℃")
+    if "rain" in selected:
+        add("🌧️ 降水概率", f"{_fmt_metric(summary.rain_probability)}%")
+    if "wind" in selected:
+        wind = f"{_fmt_metric(summary.wind_speed)} m/s"
+        if summary.wind_direction is not None:
+            wind += f" · {_compass(summary.wind_direction)}"
+        add("💨 风", wind)
+    if "cloud" in selected:
+        add("☁️ 云量", f"{_fmt_metric(summary.cloud_cover)}%")
+    if summary.uv_index is not None:
+        add("🔆 紫外线", _uv_level(summary.uv_index))
+    if summary.sunrise and summary.sunset:
+        add("🌅 日出 / 日落", f"{summary.sunrise} / {summary.sunset}")
+    if selected & {"rain", "cloud"}:
+        add("🌥️ 主要天气", summary.main_weather)
+    if selected & {"rain", "wind"} or selected == all_metrics:
+        add("⚠️ 高风险时段", summary.high_risk_period, short=False)
+
+    if not fields:
+        return {"tag": "div", "text": {"tag": "lark_md", "content": "暂无指标数据"}}
+    return {"tag": "div", "fields": fields}
+
+
+def _explanation_block(submission: WeatherSubmission) -> str:
+    return "\n".join(
+        [
+            "**主要影响因素：**",
+            *_numbered_lines(submission.key_factors),
+            "",
+            "**风险提示：**",
+            *_bullet_lines(submission.risk_notes),
+        ]
+    )
 
 
 def _numbered_lines(items: list[str]) -> list[str]:

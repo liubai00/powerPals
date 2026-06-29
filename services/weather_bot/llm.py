@@ -140,6 +140,18 @@ async def extract_location_with_llm(
     return candidate
 
 
+async def _bounded_chat(client, messages, *, temperature=0.2, max_tokens=300, timeout=9.0):
+    """Call client.chat with a hard wall-clock bound so the weather card is never
+    held hostage by a slow LLM; returns None on timeout/any error (-> rule-based fallback)."""
+    try:
+        return await asyncio.wait_for(
+            client.chat(messages, temperature=temperature, max_tokens=max_tokens),
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 - explanation is best-effort
+        return None
+
+
 async def explain_weather_with_llm(
     llm_client: LlmClient | None,
     submission: WeatherSubmission,
@@ -155,7 +167,7 @@ async def explain_weather_with_llm(
         "summary": summary.model_dump(mode="json"),
         "confidence": submission.confidence,
     }
-    content = await llm_client.chat(
+    content = await _bounded_chat(llm_client,
         [
             {
                 "role": "system",
@@ -168,7 +180,7 @@ async def explain_weather_with_llm(
             {"role": "user", "content": json.dumps(compact_payload, ensure_ascii=False)},
         ],
         temperature=0.2,
-        max_tokens=500,
+        max_tokens=300,
     )
     body = _parse_json_object(content)
     if not body:
