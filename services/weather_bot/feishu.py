@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import time
 from typing import Any
 
 import httpx
@@ -9,42 +11,98 @@ from services.weather_bot.models import WeatherSubmission
 from services.weather_bot.tasks import WeatherTask
 
 
+@dataclass(frozen=True)
+class FeishuBotAccount:
+    app_id: str | None = None
+    app_secret: str | None = None
+    verification_token: str | None = None
+    encrypt_key: str | None = None
+    default_chat_id: str | None = None
+    name: str = ""
+
+
 class FeishuClient:
-    def __init__(self, settings: Settings | None = None):
+    _TOKEN_REFRESH_SKEW_SECONDS = 120
+
+    def __init__(self, settings: Settings | None = None, account: FeishuBotAccount | None = None):
         self.settings = settings or Settings()
+        self.account = account or FeishuBotAccount(
+            app_id=self.settings.feishu_app_id,
+            app_secret=self.settings.feishu_app_secret,
+            verification_token=self.settings.feishu_verification_token,
+            encrypt_key=self.settings.feishu_encrypt_key,
+            default_chat_id=self.settings.feishu_default_chat_id,
+            name="legacy",
+        )
         self._tenant_access_token: str | None = None
+        self._tenant_access_token_expires_at = 0.0
 
     async def tenant_access_token(self) -> str:
-        if self._tenant_access_token:
+        if self._tenant_access_token and time.monotonic() < self._tenant_access_token_expires_at:
             return self._tenant_access_token
-        if not self.settings.feishu_app_id or not self.settings.feishu_app_secret:
+        if not self.account.app_id or not self.account.app_secret:
             raise RuntimeError("Feishu app credentials are not configured")
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
                 "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
                 json={
-                    "app_id": self.settings.feishu_app_id,
-                    "app_secret": self.settings.feishu_app_secret,
+                    "app_id": self.account.app_id,
+                    "app_secret": self.account.app_secret,
                 },
             )
             response.raise_for_status()
             body = response.json()
+        if body.get("code", 0) != 0:
+            raise RuntimeError(f"Feishu tenant access token failed: {body}")
         self._tenant_access_token = body["tenant_access_token"]
+        self._tenant_access_token_expires_at = time.monotonic() + self._token_cache_ttl(body.get("expire"))
         return self._tenant_access_token
 
+    def _clear_tenant_access_token(self) -> None:
+        self._tenant_access_token = None
+        self._tenant_access_token_expires_at = 0.0
+
+    def _token_cache_ttl(self, expire: Any) -> int:
+        try:
+            expire_seconds = int(expire)
+        except (TypeError, ValueError):
+            expire_seconds = 7200
+        return max(60, expire_seconds - self._TOKEN_REFRESH_SKEW_SECONDS)
+
     async def send_interactive_card(self, chat_id: str, card: dict[str, Any]) -> str:
-        token = await self.tenant_access_token()
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                "https://open.feishu.cn/open-apis/im/v1/messages",
-                params={"receive_id_type": "chat_id"},
-                headers={"Authorization": f"Bearer {token}"},
-                json={"receive_id": chat_id, "msg_type": "interactive", "content": json_dumps(card["card"])},
-            )
-            response.raise_for_status()
-            body = response.json()
+        body = await self.send_message(chat_id, "interactive", card["card"])
         return body.get("data", {}).get("message_id", "")
+
+    async def send_text_message(self, chat_id: str, text: str) -> str:
+        body = await self.send_message(chat_id, "text", {"text": text})
+        return body.get("data", {}).get("message_id", "")
+
+    async def send_message(self, chat_id: str, msg_type: str, content: dict[str, Any]) -> dict[str, Any]:
+        for attempt in range(2):
+            token = await self.tenant_access_token()
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    "https://open.feishu.cn/open-apis/im/v1/messages",
+                    params={"receive_id_type": "chat_id"},
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"receive_id": chat_id, "msg_type": msg_type, "content": json_dumps(content)},
+                )
+            if response.status_code >= 400:
+                if attempt == 0 and _is_invalid_access_token(response):
+                    self._clear_tenant_access_token()
+                    continue
+                raise RuntimeError(f"Feishu send message HTTP {response.status_code}: {response.text}")
+
+            body = response.json()
+            if body.get("code", 0) == 99991663 and attempt == 0:
+                self._clear_tenant_access_token()
+                continue
+            if body.get("code", 0) != 0:
+                raise RuntimeError(f"Feishu send message failed: {body}")
+            return body
+
+        raise RuntimeError("Feishu send message failed after token refresh")
 
     async def write_bitable_record(self, submission: WeatherSubmission, card_message_id: str | None = None) -> None:
         if not self.settings.feishu_bitable_app_token or not self.settings.feishu_bitable_table_id:
@@ -79,7 +137,17 @@ class FeishuClient:
 def verify_feishu_token(payload: dict[str, Any], expected_token: str | None) -> bool:
     if not expected_token:
         return True
-    return payload.get("token") == expected_token
+    header = payload.get("header", {})
+    token = header.get("token") if isinstance(header, dict) else None
+    return payload.get("token") == expected_token or token == expected_token
+
+
+def _is_invalid_access_token(response: httpx.Response) -> bool:
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return body.get("code") == 99991663
 
 
 def bitable_fields(submission: WeatherSubmission, card_message_id: str | None = None) -> dict[str, Any]:

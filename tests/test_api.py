@@ -101,3 +101,24 @@ def test_feishu_url_verification_returns_challenge():
 
     assert response.status_code == 200
     assert response.json() == {"challenge": "challenge-code"}
+
+
+def test_feishu_event_accepts_v2_header_verification_token():
+    client = TestClient(
+        create_app(
+            forecast_service=FakeForecastService(),
+            feishu_verification_token="expected-token",
+        )
+    )
+
+    response = client.post(
+        "/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {"token": "expected-token", "event_type": "im.message.receive_v1"},
+            "event": {"message": {"content": '{"text":"帮助"}'}},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "handled"

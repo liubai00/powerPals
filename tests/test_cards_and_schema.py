@@ -1,9 +1,10 @@
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from jsonschema import validate
 
-from services.weather_bot.cards import build_feishu_card, build_text_summary
+from services.weather_bot.cards import build_feishu_card, build_text_summary, build_weather_comparison_card
 from services.weather_bot.models import AggregatedForecast, ForecastPoint, ForecastSummary, WeatherSubmission
 
 
@@ -42,6 +43,18 @@ def make_submission() -> WeatherSubmission:
     )
 
 
+def card_text(card: dict) -> str:
+    texts = []
+    for element in card["card"]["elements"]:
+        text = element.get("text")
+        if isinstance(text, dict):
+            texts.append(text.get("content", ""))
+        for item in element.get("elements", []):
+            if isinstance(item, dict):
+                texts.append(item.get("content", ""))
+    return "\n".join(texts)
+
+
 def test_text_summary_contains_required_fields_and_disclaimer():
     summary = build_text_summary(make_submission())
 
@@ -59,6 +72,118 @@ def test_feishu_card_uses_message_card_shape():
     assert card["card"]["header"]["title"]["content"] == "广东省深圳市气象预测"
 
 
+def test_feishu_card_defaults_to_instant_query_display():
+    card = build_feishu_card(make_submission())
+    text = card_text(card)
+
+    assert "任务 ID" not in text
+    assert "正式提交" not in text
+    assert not [element for element in card["card"]["elements"] if element.get("tag") == "note"]
+
+
+def test_feishu_card_uses_detailed_forecast_body():
+    card = build_feishu_card(make_submission())
+    text = card_text(card)
+
+    assert "- 最高温：32.5℃" in text
+    assert "- 最低温：27.4℃" in text
+    assert "- 降水概率：45.0%" in text
+    assert "主要影响因素" in text
+    assert "1. 副热带高压影响" in text
+    assert "风险提示" in text
+    assert "- 短时强降水可能导致局地误差放大" in text
+
+
+def test_feishu_card_can_focus_on_requested_metric():
+    card = build_feishu_card(make_submission(), metrics=["rain"])
+    text = card_text(card)
+    charts = [element for element in card["card"]["elements"] if element.get("tag") == "chart"]
+
+    assert "- 降水概率：45.0%" in text
+    assert "- 主要天气：多云，局部有阵雨" in text
+    assert "- 最高温" not in text
+    assert "- 风速" not in text
+    assert len(charts) == 1
+    assert charts[0]["chart_spec"]["title"]["text"] == "小时降水概率（%）"
+
+
+def test_feishu_card_shows_range_for_multi_day_predictions():
+    first = make_submission()
+    second = make_submission().model_copy(update={"target_date": "2026-06-11"})
+    third = make_submission().model_copy(update={"target_date": "2026-06-12"})
+
+    card = build_feishu_card(first, chart_submissions=[first, second, third])
+    text = card_text(card)
+
+    assert "预测范围" in text
+    assert "2026-06-10 至 2026-06-12（3天）" in text
+    assert "预测日" not in text
+
+
+def test_weather_comparison_card_uses_native_table_rows():
+    first = make_submission()
+    second = make_submission().model_copy(update={"region": "广东省", "target_date": "2026-06-11"})
+
+    card = build_weather_comparison_card([first, second])
+    elements = card["card"]["elements"]
+    rows = [element for element in elements if element.get("tag") == "column_set"]
+
+    assert card["card"]["header"]["title"]["content"] == "多地区气象对比"
+    assert rows
+    assert rows[0]["background_style"] == "grey"
+    assert rows[0]["columns"][0]["elements"][0]["text"]["content"] == "**日期**"
+    assert "**广东省深圳市**" in str(card)
+    assert "**广东省**" in str(card)
+    assert "| 地区 |" not in str(card)
+
+
+def test_weather_comparison_card_includes_report_and_download_actions():
+    card = build_weather_comparison_card(
+        [make_submission()],
+        report_url=(
+            "https://powerpals.example.com/reports/weather/compare?"
+            "regions=广州,深圳&target_date=2026-06-10&days=3"
+        ),
+        download_url=(
+            "https://powerpals.example.com/api/weather/compare/export?"
+            "regions=广州,深圳&target_date=2026-06-10&days=3"
+        ),
+        json_url=(
+            "https://powerpals.example.com/api/weather/compare/export/json?"
+            "regions=广州,深圳&target_date=2026-06-10&days=3"
+        ),
+    )
+
+    actions = next(element for element in card["card"]["elements"] if element.get("tag") == "action")["actions"]
+    button_urls = {action["text"]["content"]: action["url"] for action in actions}
+    assert button_urls["打开网页报告"].startswith("https://applink.feishu.cn/client/web_url/open")
+    assert button_urls["下载CSV"].startswith("https://powerpals.example.com/api/weather/compare/export?")
+    assert button_urls["下载JSON"].startswith("https://powerpals.example.com/api/weather/compare/export/json?")
+
+
+def test_feishu_task_submission_card_can_show_task_id_without_formal_note():
+    card = build_feishu_card(make_submission(), show_task_id=True)
+    text = card_text(card)
+
+    assert "任务 ID" in text
+    assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in text
+    assert "正式提交" not in text
+    assert not [element for element in card["card"]["elements"] if element.get("tag") == "note"]
+
+
+def test_feishu_card_does_not_repeat_disclaimer_as_standalone_note():
+    submission = make_submission()
+    card = build_feishu_card(submission)
+
+    note_texts = []
+    for element in card["card"]["elements"]:
+        if element.get("tag") != "note":
+            continue
+        note_texts.extend(item.get("content") for item in element.get("elements", []))
+
+    assert submission.disclaimer not in note_texts
+
+
 def test_feishu_card_embeds_chart_and_download_actions():
     card = build_feishu_card(
         make_submission(),
@@ -70,17 +195,26 @@ def test_feishu_card_embeds_chart_and_download_actions():
 
     elements = card["card"]["elements"]
     charts = [element for element in elements if element.get("tag") == "chart"]
-    assert len(charts) >= 2
+    assert len(charts) >= 4
     assert charts[0]["chart_spec"]["type"] == "line"
     assert charts[1]["chart_spec"]["type"] == "bar"
+    assert "小时温度趋势" in charts[0]["chart_spec"]["title"]["text"]
+    assert "小时降水概率" in charts[1]["chart_spec"]["title"]["text"]
+    assert "小时风速趋势" in charts[2]["chart_spec"]["title"]["text"]
+    assert "小时云量" in charts[3]["chart_spec"]["title"]["text"]
     assert "温度趋势" in charts[0]["chart_spec"]["title"]["text"]
     assert "降水概率" in charts[1]["chart_spec"]["title"]["text"]
+    for chart in charts[:4]:
+        assert chart["chart_spec"]["tooltip"]["visible"] is True
+        assert chart["chart_spec"]["label"]["visible"] is False
+        assert chart["chart_spec"]["axes"][0]["label"]["visible"] is False
 
     actions = next(element for element in elements if element.get("tag") == "action")["actions"]
     button_urls = {action["text"]["content"]: action["url"] for action in actions}
     assert button_urls["打开网页报告"].startswith("https://applink.feishu.cn/client/web_url/open")
-    assert "下载CSV" in button_urls
-    assert "下载JSON" in button_urls
+    assert parse_qs(urlparse(button_urls["打开网页报告"]).query)["mode"] == ["window"]
+    assert button_urls["下载CSV"].startswith("https://powerpals.example.com/api/weather/export?")
+    assert button_urls["下载JSON"].startswith("https://powerpals.example.com/api/weather/export/json?")
 
 
 def test_example_submission_matches_json_schema():

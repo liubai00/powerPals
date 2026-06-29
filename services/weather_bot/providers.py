@@ -27,7 +27,7 @@ class OpenMeteoProvider:
             "start_date": target.isoformat(),
             "end_date": target.isoformat(),
         }
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
             response.raise_for_status()
             body = response.json()
@@ -46,7 +46,7 @@ class QWeatherProvider:
 
         latitude, longitude = _coordinates(request)
         params = {"location": f"{longitude},{latitude}", "key": self.api_key}
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.get("https://devapi.qweather.com/v7/weather/24h", params=params)
             response.raise_for_status()
             body = response.json()
@@ -70,7 +70,7 @@ class CaiyunProvider:
             f"{longitude},{latitude}/hourly"
         )
         params = {"hourlysteps": 24}
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
             body = response.json()

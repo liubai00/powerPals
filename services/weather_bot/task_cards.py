@@ -13,6 +13,7 @@ def build_task_text(task: WeatherTask) -> str:
             f"区域：{task.region}",
             f"经纬度：{task.latitude}, {task.longitude}",
             f"预测日期：{task.target_date}",
+            f"预测天数：{task.forecast_days} 天",
             f"预测范围：{task.forecast_start} 至 {task.forecast_end}",
             f"任务发布时间：{task.publish_time}",
             f"数据截止：{task.data_cutoff_time}（D-1 16:00）",
@@ -51,6 +52,8 @@ def build_task_card(task: WeatherTask) -> dict:
                             f"**区域**：{task.region}\n"
                             f"**经纬度**：{task.latitude}, {task.longitude}\n"
                             f"**预测日期**：{task.target_date}\n"
+                            f"**预测天数**：{task.forecast_days} 天\n"
+                            f"**预测范围**：{task.forecast_start} 至 {task.forecast_end}\n"
                             f"**数据截止**：{task.data_cutoff_time}\n"
                             f"**提交截止**：{task.submission_deadline}\n"
                             f"**提交格式**：{task.submission_format_version}"
