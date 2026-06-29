@@ -523,18 +523,40 @@ def _report_scope_html(
     )
 
 
+def _compass_cn(degrees) -> str:
+    if degrees is None:
+        return "—"
+    names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+    return names[int((float(degrees) % 360) / 45 + 0.5) % 8] + "风"
+
+
+def _uv_cn(uv) -> str:
+    if uv is None:
+        return "—"
+    value = float(uv)
+    label = "弱" if value < 3 else "中等" if value < 6 else "强" if value < 8 else "很强" if value < 11 else "极强"
+    return "%d（%s）" % (round(value), label)
+
+
+def _sun_cn(sunrise, sunset) -> str:
+    if sunrise and sunset:
+        return f"{sunrise} / {sunset}"
+    return "—"
+
+
 def _summary_table_header(metrics: list[str]) -> str:
     columns = ["日期", "区域"]
     if "temperature" in metrics:
-        columns.extend(["最高温", "最低温"])
+        columns.extend(["最高温", "最低温", "体感最高"])
     if "rain" in metrics:
         columns.append("降水概率")
     if "wind" in metrics:
-        columns.append("风速")
+        columns.extend(["风速", "风向"])
     if "cloud" in metrics:
         columns.append("云量")
     if any(metric in metrics for metric in ("rain", "cloud")):
         columns.append("主要天气")
+    columns.extend(["紫外线", "日出/日落"])
     if any(metric in metrics for metric in ("rain", "wind")):
         columns.append("高风险时段")
     return "<tr>" + "".join(f"<th>{html.escape(column)}</th>" for column in columns) + "</tr>"
@@ -546,15 +568,16 @@ def _summary_table_rows(submissions: list[WeatherSubmission], metrics: list[str]
         summary = submission.aggregated_forecast.summary
         cells = [html.escape(submission.target_date), html.escape(submission.region)]
         if "temperature" in metrics:
-            cells.extend([_format_value(summary.max_temperature, "℃"), _format_value(summary.min_temperature, "℃")])
+            cells.extend([_format_value(summary.max_temperature, "℃"), _format_value(summary.min_temperature, "℃"), _format_value(summary.feels_like, "℃")])
         if "rain" in metrics:
             cells.append(_format_value(summary.rain_probability, "%"))
         if "wind" in metrics:
-            cells.append(_format_value(summary.wind_speed, " m/s"))
+            cells.extend([_format_value(summary.wind_speed, " m/s"), html.escape(_compass_cn(summary.wind_direction))])
         if "cloud" in metrics:
             cells.append(_format_value(summary.cloud_cover, "%"))
         if any(metric in metrics for metric in ("rain", "cloud")):
             cells.append(html.escape(summary.main_weather))
+        cells.extend([html.escape(_uv_cn(summary.uv_index)), html.escape(_sun_cn(summary.sunrise, summary.sunset))])
         if any(metric in metrics for metric in ("rain", "wind")):
             cells.append(html.escape(summary.high_risk_period))
         rows.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
