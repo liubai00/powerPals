@@ -15,7 +15,7 @@ from services.weather_bot.cards import build_feishu_card, build_weather_comparis
 from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuBotAccount, FeishuClient, verify_feishu_token
 from services.weather_bot.judge import WeatherJudgeRequest, WeatherJudgeResult, score_weather_submission
-from services.weather_bot.llm import LlmClient, answer_role_question, answer_weather_knowledge_question
+from services.weather_bot.llm import LlmClient, answer_role_question, answer_weather_knowledge_question, extract_location_with_llm
 from services.weather_bot.location import BUILTIN_LOCATIONS, FavoriteLocation, LocationBook, LocationResolver, location_slug
 from services.weather_bot.models import ForecastRequest, SubmissionRecord, WeatherSubmission
 from services.weather_bot.service import ForecastService
@@ -370,7 +370,9 @@ def create_app(
         chat_id = _event_chat_id(event)
         if not chat_id:
             return
-        pending_region_clarifications[_pending_region_key(allowed_bot, chat_id)] = {
+        pending_region_clarifications[
+            _pending_region_key(allowed_bot, chat_id, _event_sender_id(event), _event_thread_id(event) or "")
+        ] = {
             "command_type": command_type,
             "target_date": _target_date_from_text(text),
             "days": _days_from_text(text),
@@ -382,7 +384,7 @@ def create_app(
         chat_id = _event_chat_id(event)
         if not chat_id:
             return None
-        key = _pending_region_key(allowed_bot, chat_id)
+        key = _pending_region_key(allowed_bot, chat_id, _event_sender_id(event), _event_thread_id(event) or "")
         pending = pending_region_clarifications.get(key)
         if not pending:
             return None
@@ -394,7 +396,9 @@ def create_app(
     def _clear_pending_region(event: dict[str, Any], allowed_bot: str) -> None:
         chat_id = _event_chat_id(event)
         if chat_id:
-            pending_region_clarifications.pop(_pending_region_key(allowed_bot, chat_id), None)
+            pending_region_clarifications.pop(
+                _pending_region_key(allowed_bot, chat_id, _event_sender_id(event), _event_thread_id(event) or ""), None
+            )
 
     @app.post("/api/weather/forecast", response_model=WeatherSubmission)
     async def forecast(request: ForecastRequest) -> WeatherSubmission:
@@ -872,16 +876,21 @@ def create_app(
                     "text": _too_many_comparison_regions_text(comparison_regions),
                 }
             return await _handle_weather_comparison_command(text, comparison_regions, display_metrics, unsupported_metrics)
+        llm_region_override = None
         if not task_submission_mode and _needs_region_clarification(text):
-            days = _days_from_text(text)
-            return {
-                "status": "needs_region",
-                "bot_role": WEATHER_FORECAST_BOT_ROLE,
-                "mode": "clarification",
-                "days": days,
-                "text": _region_clarification_text(days, "forecast"),
-            }
+            llm_region_override = await extract_location_with_llm(llm_client, text)
+            if not llm_region_override:
+                days = _days_from_text(text)
+                return {
+                    "status": "needs_region",
+                    "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                    "mode": "clarification",
+                    "days": days,
+                    "text": _region_clarification_text(days, "forecast"),
+                }
         request = _request_from_task(task) if task_submission_mode else _request_from_text(text)
+        if llm_region_override:
+            request = request.model_copy(update={"region": llm_region_override})
         request = _apply_favorite_alias(request, location_book)
         report_url = _public_weather_report_url(settings, request, display_metrics)
         download_url = _public_weather_download_url(settings, request)
@@ -1268,8 +1277,18 @@ def _seen_message(seen: dict[str, float], allowed_bot: str, message_id: str, ttl
     return False
 
 
-def _pending_region_key(allowed_bot: str, chat_id: str) -> str:
-    return f"{allowed_bot}:{chat_id}"
+def _event_sender_id(event: dict[str, Any]) -> str:
+    sender = event.get("sender", {}) if isinstance(event, dict) else {}
+    if not isinstance(sender, dict):
+        return ""
+    sid = sender.get("sender_id", {})
+    if isinstance(sid, dict):
+        return str(sid.get("open_id") or sid.get("user_id") or sid.get("union_id") or "")
+    return str(sid or "")
+
+
+def _pending_region_key(allowed_bot: str, chat_id: str, sender_id: str = "", thread_id: str = "") -> str:
+    return f"{allowed_bot}:{chat_id}:{sender_id}:{thread_id}"
 
 
 def _merge_pending_region_text(region_text: str, pending: dict[str, Any]) -> str:

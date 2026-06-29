@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_env: str = "local"
     qweather_api_key: str | None = None
+    qweather_api_host: str | None = None
     caiyun_api_key: str | None = None
     openclaw_api_url: str | None = None
     openclaw_api_key: str | None = None

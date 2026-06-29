@@ -37,17 +37,22 @@ class OpenMeteoProvider:
 class QWeatherProvider:
     name = "qweather"
 
-    def __init__(self, api_key: str | None):
+    def __init__(self, api_key: str | None, api_host: str | None = None):
         self.api_key = api_key
+        self.api_host = (api_host or "devapi.qweather.com").strip().rstrip("/")
 
     async def fetch(self, request: ForecastRequest) -> ProviderForecast:
         if not self.api_key:
             return ProviderForecast(provider=self.name, status="disabled", points=[], error_message="Missing API key")
 
         latitude, longitude = _coordinates(request)
-        params = {"location": f"{longitude},{latitude}", "key": self.api_key}
+        params = {"location": f"{longitude},{latitude}"}
         async with httpx.AsyncClient(timeout=8.0) as client:
-            response = await client.get("https://devapi.qweather.com/v7/weather/24h", params=params)
+            response = await client.get(
+                f"https://{self.api_host}/v7/weather/24h",
+                params=params,
+                headers={"X-QW-Api-Key": self.api_key or ""},
+            )
             response.raise_for_status()
             body = response.json()
         return ProviderForecast(provider=self.name, status="ok", points=_qweather_points(body), raw=body)
@@ -82,7 +87,7 @@ def build_default_providers(settings: Settings | None = None) -> dict[str, objec
     settings = settings or Settings()
     return {
         "open_meteo": OpenMeteoProvider(),
-        "qweather": QWeatherProvider(settings.qweather_api_key),
+        "qweather": QWeatherProvider(settings.qweather_api_key, settings.qweather_api_host),
         "caiyun": CaiyunProvider(settings.caiyun_api_key),
     }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -92,6 +93,51 @@ class LlmClient:
         if self.api_base_url.endswith("/v1"):
             return f"{self.api_base_url}/chat/completions"
         return f"{self.api_base_url}/v1/chat/completions"
+
+
+async def extract_location_with_llm(
+    llm_client: "LlmClient | None",
+    user_text: str,
+    *,
+    timeout: float = 8.0,
+) -> str | None:
+    """Best-effort: pull a Chinese place name out of free-form text via the LLM.
+
+    Bounded by a short timeout so a slow/unreachable LLM degrades to clarification
+    instead of blocking the reply. Returns None when nothing usable is found.
+    """
+    if llm_client is None or not llm_client.enabled:
+        return None
+    try:
+        content = await asyncio.wait_for(
+            llm_client.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是地点识别器。从用户消息里找出他想查询天气的中国地点"
+                            "（城市/区县/乡镇/地标都可以）。只输出该地点的中文名称，"
+                            "尽量补全到区县级，例如「河南省上蔡县」。如果找不到地点，只输出「无」。"
+                            "不要解释，不要标点，不要输出其它任何字。"
+                        ),
+                    },
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.0,
+                max_tokens=24,
+            ),
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 - location extraction is best-effort
+        return None
+    if not content:
+        return None
+    candidate = content.strip().strip("。.，,、；;：: \t\r\n\"'「」『』（）()")
+    if not candidate or candidate in {"无", "没有", "未知", "none", "None", "N/A", "NA"}:
+        return None
+    if len(candidate) > 20 or any(bad in candidate for bad in ("无法", "抱歉", "没有", "不知道")):
+        return None
+    return candidate
 
 
 async def explain_weather_with_llm(

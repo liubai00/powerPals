@@ -338,9 +338,14 @@ class LocationResolver:
         raise ValueError(f"Cannot resolve location: {region}")
 
     async def _resolve_with_qweather(self, region: str) -> ResolvedLocation | None:
-        params = {"location": region, "key": self.settings.qweather_api_key, "range": "cn"}
+        host = (self.settings.qweather_api_host or "geoapi.qweather.com").strip().rstrip("/")
+        params = {"location": region, "range": "cn", "number": 5, "lang": "zh"}
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get("https://geoapi.qweather.com/v2/city/lookup", params=params)
+            response = await client.get(
+                f"https://{host}/geo/v2/city/lookup",
+                params=params,
+                headers={"X-QW-Api-Key": self.settings.qweather_api_key or ""},
+            )
             response.raise_for_status()
             body = response.json()
         locations = body.get("location") or []
