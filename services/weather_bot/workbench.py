@@ -194,7 +194,7 @@ def _report_overview_html(submissions, metrics=None) -> str:
     if wind:
         cards.append(_ov_tcard("💨 风速 m/s", "峰值 %s" % round(max(wind), 1), _mini_sparkline(wind, "#a78bfa")))
     if cloud:
-        cards.append(_ov_tcard("☁️ 云量 %", "均 %s" % round(sum(cloud) / len(cloud)), _mini_sparkline(cloud, "#cbd5e1", "area")))
+        cards.append(_ov_tcard("☁️ 云量 %", "均 %s" % round(sum(cloud) / len(cloud)), _mini_sparkline(cloud, "#94a3b8", "area")))
     sub0 = submissions[0]
     s0 = sub0.aggregated_forecast.summary
     risk = (sub0.risk_notes[0] if getattr(sub0, "risk_notes", None) else None) or s0.high_risk_period or "暂无明显风险"
@@ -389,24 +389,24 @@ def weather_report_html(
       .chart-grid {{ grid-template-columns: 1fr; }}
       h1 {{ font-size: 22px; }}
     }}
-    .overview {{ background: linear-gradient(160deg, #0f1b2d, #16263e); border-radius: 16px; padding: 16px 18px; margin: 16px 0 22px; color: #e7eef7; box-shadow: 0 10px 30px rgba(2,32,71,.18); }}
-    .ov-title {{ font-size: 14px; font-weight: 600; color: #aab8cc; margin-bottom: 12px; }}
+    .overview {{ background: #f2f7fc; border: 1px solid #e7eef6; border-radius: 16px; padding: 16px 18px; margin: 16px 0 22px; color: #0f1f33; box-shadow: 0 8px 24px rgba(2,32,71,.06); }}
+    .ov-title {{ font-size: 14px; font-weight: 600; color: #5b7088; margin-bottom: 12px; }}
     .ov-days {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 10px; margin-bottom: 14px; }}
-    .ov-day {{ background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 10px 6px; text-align: center; }}
-    .ov-dd {{ font-size: 12px; color: #9fb0c6; }}
+    .ov-day {{ background: #ffffff; border: 1px solid #e7eef6; border-radius: 12px; padding: 10px 6px; text-align: center; }}
+    .ov-dd {{ font-size: 12px; color: #5b7088; }}
     .ov-de {{ font-size: 24px; margin: 4px 0; }}
     .ov-dt {{ font-size: 15px; font-weight: 600; }}
     .ov-dt span {{ color: #8aa0bb; font-weight: 400; }}
-    .ov-dr {{ font-size: 12px; color: #6fb0ef; margin-top: 2px; }}
+    .ov-dr {{ font-size: 12px; color: #2b7de9; margin-top: 2px; }}
     .ov-trends {{ display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin-bottom: 14px; }}
-    .ov-tcard {{ background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 10px 12px; }}
-    .ov-th {{ display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: #9fb0c6; margin-bottom: 6px; }}
-    .ov-th b {{ color: #e7eef7; font-size: 13px; }}
+    .ov-tcard {{ background: #ffffff; border: 1px solid #e7eef6; border-radius: 12px; padding: 10px 12px; }}
+    .ov-th {{ display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: #5b7088; margin-bottom: 6px; }}
+    .ov-th b {{ color: #0f1f33; font-size: 13px; }}
     .ov-tips {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
     .ov-tip {{ border-radius: 12px; padding: 10px 12px; font-size: 12.5px; line-height: 1.5; display: flex; flex-direction: column; gap: 2px; }}
     .ov-tip b {{ font-size: 12px; }}
-    .ov-tip.warn {{ background: rgba(180,120,20,.16); border: 1px solid rgba(245,180,80,.25); color: #f4d6a0; }}
-    .ov-tip.power {{ background: rgba(40,110,200,.16); border: 1px solid rgba(90,160,240,.25); color: #b8d4f5; }}
+    .ov-tip.warn {{ background: #fdf3e3; border: 1px solid #f3d6a3; color: #94621a; }}
+    .ov-tip.power {{ background: #e9f1fc; border: 1px solid #c5ddf5; color: #1f5fa5; }}
     @media (max-width: 600px) {{ .ov-trends, .ov-tips {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
