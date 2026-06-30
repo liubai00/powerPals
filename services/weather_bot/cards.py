@@ -130,8 +130,8 @@ def build_feishu_card(
     _explanation = _explanation_block(submission)
     if _explanation:
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _explanation}})
-    chart_elements = _hourly_chart_elements(chart_items, selected_metrics)
-    elements.extend(chart_elements or _weather_chart_elements(chart_items, selected_metrics))
+    chart_elements = _hourly_chart_elements(chart_items, selected_metrics) or _weather_chart_elements(chart_items, selected_metrics)
+    elements.extend(_charts_grid(chart_elements))
     actions = []
     if report_url:
         actions.append(
@@ -448,6 +448,25 @@ def _weather_chart_elements(submissions: list[WeatherSubmission], metrics: list[
             }
         )
     return elements
+
+
+def _charts_grid(chart_elements: list[dict]) -> list[dict]:
+    """Arrange hourly trend charts into a 2-column grid (2x2) instead of stacking."""
+    if not chart_elements:
+        return []
+    if len(chart_elements) == 1:
+        return chart_elements
+    col1 = chart_elements[0::2]
+    col2 = chart_elements[1::2]
+    return [{
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "default",
+        "columns": [
+            {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "top", "elements": col1},
+            {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "top", "elements": col2},
+        ],
+    }]
 
 
 def _hourly_chart_elements(submissions: list[WeatherSubmission], metrics: list[str] | None = None) -> list[dict]:

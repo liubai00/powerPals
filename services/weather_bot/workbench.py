@@ -115,6 +115,100 @@ def hydrology_csv(records: list[dict[str, Any]]) -> str:
     return handle.getvalue()
 
 
+def _report_weather_emoji(text) -> str:
+    t = text or ""
+    if "雷" in t:
+        return "⛈️"
+    if "雪" in t:
+        return "❄️"
+    if "雨" in t:
+        return "🌧️"
+    if "雾" in t or "霾" in t:
+        return "🌫️"
+    if "阴" in t:
+        return "☁️"
+    if "多云" in t:
+        return "⛅"
+    if "晴" in t:
+        return "☀️"
+    return "🌤️"
+
+
+def _n(value) -> str:
+    if value is None:
+        return "—"
+    try:
+        return str(int(round(float(value))))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _mini_sparkline(values, color: str, kind: str = "line") -> str:
+    nums = [float(v) for v in values if v is not None]
+    if not nums:
+        return ""
+    lo, hi = min(nums), max(nums)
+    rng = (hi - lo) or 1.0
+    w, h, n = 240.0, 44.0, len(nums)
+    xs = [6 + i * (w - 12) / max(n - 1, 1) for i in range(n)]
+    ys = [h - 5 - (v - lo) / rng * (h - 13) for v in nums]
+    if kind == "bar":
+        bw = max(2.0, (w - 12) / max(n, 1) * 0.55)
+        body = "".join(
+            '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="1" fill="%s"/>' % (x - bw / 2, y, bw, max(1.0, h - 5 - y), color)
+            for x, y in zip(xs, ys)
+        )
+    elif kind == "area":
+        pts = " ".join("%.1f,%.1f" % (x, y) for x, y in zip(xs, ys))
+        body = '<polygon points="%.1f,%.1f %s %.1f,%.1f" fill="%s" opacity="0.45"/>' % (xs[0], h - 5, pts, xs[-1], h - 5, color)
+    else:
+        pts = " ".join("%.1f,%.1f" % (x, y) for x, y in zip(xs, ys))
+        body = '<polyline points="%s" fill="none" stroke="%s" stroke-width="2.4"/>' % (pts, color)
+    return '<svg viewBox="0 0 240 44" preserveAspectRatio="none" style="width:100%%;height:40px;display:block">' + body + "</svg>"
+
+
+def _ov_tcard(title: str, peak: str, svg: str) -> str:
+    return '<div class="ov-tcard"><div class="ov-th"><span>%s</span><b>%s</b></div>%s</div>' % (title, peak, svg)
+
+
+def _report_overview_html(submissions, metrics=None) -> str:
+    if not submissions:
+        return ""
+    days = []
+    for sub in submissions[:7]:
+        s = sub.aggregated_forecast.summary
+        days.append(
+            '<div class="ov-day"><div class="ov-dd">%s</div><div class="ov-de">%s</div>'
+            '<div class="ov-dt">%s° <span>%s°</span></div><div class="ov-dr">💧 %s%%</div></div>'
+            % (html.escape(sub.target_date[5:]), _report_weather_emoji(s.main_weather), _n(s.max_temperature), _n(s.min_temperature), _n(s.rain_probability))
+        )
+    temp = [v for _, v in _hourly_points(submissions, "temperature")]
+    rain = [v for _, v in _hourly_points(submissions, "precipitation_probability")]
+    wind = [v for _, v in _hourly_points(submissions, "wind_speed")]
+    cloud = [v for _, v in _hourly_points(submissions, "cloud_cover")]
+    cards = []
+    if temp:
+        cards.append(_ov_tcard("🌡️ 温度 ℃", "峰值 %s" % round(max(temp), 1), _mini_sparkline(temp, "#f0863c")))
+    if rain:
+        cards.append(_ov_tcard("🌧️ 降水 %", "峰值 %s" % round(max(rain)), _mini_sparkline(rain, "#3b82f6", "bar")))
+    if wind:
+        cards.append(_ov_tcard("💨 风速 m/s", "峰值 %s" % round(max(wind), 1), _mini_sparkline(wind, "#a78bfa")))
+    if cloud:
+        cards.append(_ov_tcard("☁️ 云量 %", "均 %s" % round(sum(cloud) / len(cloud)), _mini_sparkline(cloud, "#cbd5e1", "area")))
+    sub0 = submissions[0]
+    s0 = sub0.aggregated_forecast.summary
+    risk = (sub0.risk_notes[0] if getattr(sub0, "risk_notes", None) else None) or s0.high_risk_period or "暂无明显风险"
+    return (
+        '<section class="overview"><div class="ov-title">📋 当日概览</div>'
+        '<div class="ov-days">' + "".join(days) + "</div>"
+        '<div class="ov-trends">' + "".join(cards) + "</div>"
+        '<div class="ov-tips">'
+        '<div class="ov-tip warn"><b>⚠️ 风险</b><span>' + html.escape(str(risk)) + "</span></div>"
+        '<div class="ov-tip power"><b>⚡ 电力提示</b><span>高温时段空调负荷偏高，注意错峰用电</span></div>'
+        "</div></section>"
+    )
+
+
 def weather_report_html(
     submissions: list[WeatherSubmission],
     download_query: dict[str, Any],
@@ -232,6 +326,7 @@ def weather_report_html(
     )
     hourly_header = _hourly_table_header(selected_metrics, include_region=comparison_report)
     hourly_rows = _hourly_table_rows(submissions, selected_metrics, include_region=comparison_report)
+    overview_html = "" if comparison_report else _report_overview_html(submissions, selected_metrics)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -294,6 +389,25 @@ def weather_report_html(
       .chart-grid {{ grid-template-columns: 1fr; }}
       h1 {{ font-size: 22px; }}
     }}
+    .overview {{ background: linear-gradient(160deg, #0f1b2d, #16263e); border-radius: 16px; padding: 16px 18px; margin: 16px 0 22px; color: #e7eef7; box-shadow: 0 10px 30px rgba(2,32,71,.18); }}
+    .ov-title {{ font-size: 14px; font-weight: 600; color: #aab8cc; margin-bottom: 12px; }}
+    .ov-days {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 10px; margin-bottom: 14px; }}
+    .ov-day {{ background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 10px 6px; text-align: center; }}
+    .ov-dd {{ font-size: 12px; color: #9fb0c6; }}
+    .ov-de {{ font-size: 24px; margin: 4px 0; }}
+    .ov-dt {{ font-size: 15px; font-weight: 600; }}
+    .ov-dt span {{ color: #8aa0bb; font-weight: 400; }}
+    .ov-dr {{ font-size: 12px; color: #6fb0ef; margin-top: 2px; }}
+    .ov-trends {{ display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin-bottom: 14px; }}
+    .ov-tcard {{ background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 10px 12px; }}
+    .ov-th {{ display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: #9fb0c6; margin-bottom: 6px; }}
+    .ov-th b {{ color: #e7eef7; font-size: 13px; }}
+    .ov-tips {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .ov-tip {{ border-radius: 12px; padding: 10px 12px; font-size: 12.5px; line-height: 1.5; display: flex; flex-direction: column; gap: 2px; }}
+    .ov-tip b {{ font-size: 12px; }}
+    .ov-tip.warn {{ background: rgba(180,120,20,.16); border: 1px solid rgba(245,180,80,.25); color: #f4d6a0; }}
+    .ov-tip.power {{ background: rgba(40,110,200,.16); border: 1px solid rgba(90,160,240,.25); color: #b8d4f5; }}
+    @media (max-width: 600px) {{ .ov-trends, .ov-tips {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
@@ -306,6 +420,7 @@ def weather_report_html(
     </div>
   </header>
   <main class="page-shell">
+    {overview_html}
     <div class="toolbar">
       <button class="button download-button" type="button" data-download-kind="csv" data-download-url="{html.escape(download_url)}" data-filename="{html.escape(csv_filename)}" data-mime="text/csv;charset=utf-8">下载CSV</button>
       <button class="button secondary download-button" type="button" data-download-kind="json" data-download-url="{html.escape(json_url)}" data-filename="{html.escape(json_filename)}" data-mime="application/json;charset=utf-8">下载JSON</button>
