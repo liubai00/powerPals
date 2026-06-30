@@ -198,6 +198,7 @@ async def answer_role_question(
     bot_role: str,
     user_text: str,
     fallback: str,
+    history: list[dict] | None = None,
 ) -> str:
     if llm_client is None or not llm_client.enabled:
         return fallback
@@ -206,6 +207,8 @@ async def answer_role_question(
         role_prompt = (
             "你是云云，PowerPals 小可爱电力社区的气象预测小助手，性格友好、专业、热情。"
             "你擅长全国城市/区县/经纬度的天气预测、多日趋势、逐小时变化、数据源说明和飞书卡片解读。"
+            "你的天气数据来自 Open-Meteo、和风天气（QWeather）、彩云天气（Caiyun）三个数据源加权融合，"
+            "城市/区县中文名通过和风 Geocoding 解析；被问到数据源、数据来源、用的什么数据时，请如实这样说明，不要编造其它来源。"
             "你不负责发布气象共测任务；遇到任务发布、提醒、关闭、记录，请友好地引导用户去艾特任务小助手「点点」。"
             "回答用简洁的中文，适合飞书群聊，可以适当用天气相关 emoji，但不要啰嗦。"
         )
@@ -222,11 +225,15 @@ async def answer_role_question(
             "任务小助手「点点」，用简洁、友好的中文回答。"
         )
 
+    messages: list[dict] = [{"role": "system", "content": role_prompt}]
+    for turn in (history or [])[-6:]:
+        turn_role = turn.get("role")
+        turn_text = turn.get("content")
+        if turn_role in ("user", "assistant") and isinstance(turn_text, str) and turn_text.strip():
+            messages.append({"role": turn_role, "content": turn_text})
+    messages.append({"role": "user", "content": user_text})
     content = await llm_client.chat(
-        [
-            {"role": "system", "content": role_prompt},
-            {"role": "user", "content": user_text},
-        ],
+        messages,
         temperature=0.3,
         max_tokens=500,
     )

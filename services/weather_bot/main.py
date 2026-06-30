@@ -283,6 +283,37 @@ def create_app(
     forecast_report_cache: dict[str, tuple[float, list[WeatherSubmission], list[dict[str, str]]]] = {}
     pending_region_clarifications: dict[str, dict[str, Any]] = {}
 
+# T1 上下文追问记忆: 每个 (bot_role, chat, sender) 保留最近几轮对话
+conversation_turns: dict[str, list[dict[str, Any]]] = {}
+CONVERSATION_TURNS_TTL_SECONDS = 1800
+CONVERSATION_TURNS_MAX = 6
+
+
+def _conversation_key(bot_role: str, chat_id: str | None, sender_id: str) -> str:
+    return f"{bot_role}|{chat_id or ''}|{sender_id}"
+
+
+def _record_conversation_turn(bot_role: str, chat_id: str | None, sender_id: str, user_text: str, bot_text: str) -> None:
+    if not chat_id or not (user_text or bot_text):
+        return
+    key = _conversation_key(bot_role, chat_id, sender_id)
+    now = time.time()
+    turns = [t for t in conversation_turns.get(key, []) if now - t.get("ts", 0) < CONVERSATION_TURNS_TTL_SECONDS]
+    if user_text and user_text.strip():
+        turns.append({"role": "user", "content": user_text.strip()[:400], "ts": now})
+    if bot_text and bot_text.strip():
+        turns.append({"role": "assistant", "content": bot_text.strip()[:400], "ts": now})
+    conversation_turns[key] = turns[-CONVERSATION_TURNS_MAX:]
+
+
+def _recent_conversation_turns(bot_role: str, chat_id: str | None, sender_id: str) -> list[dict[str, str]]:
+    if not chat_id:
+        return []
+    key = _conversation_key(bot_role, chat_id, sender_id)
+    now = time.time()
+    turns = [t for t in conversation_turns.get(key, []) if now - t.get("ts", 0) < CONVERSATION_TURNS_TTL_SECONDS]
+    return [{"role": t["role"], "content": t["content"]} for t in turns]
+
     app = FastAPI(title="PowerPals Weather Data Workbench", version="0.6.0")
 
     def _cache_task(task: WeatherTask) -> WeatherTask:
@@ -993,8 +1024,13 @@ def create_app(
             "text": build_task_text(task),
         }
 
-    async def _handle_general_command(text: str, allowed_bot: str) -> dict[str, Any]:
+    async def _handle_general_command(text: str, allowed_bot: str, event: dict[str, Any] | None = None) -> dict[str, Any]:
         bot_role = _bot_role_for_allowed_bot(allowed_bot)
+        history = (
+            _recent_conversation_turns(bot_role, _event_chat_id(event), _event_sender_id(event))
+            if isinstance(event, dict)
+            else []
+        )
         return {
             "status": "handled",
             "bot_role": bot_role,
@@ -1003,6 +1039,7 @@ def create_app(
                 bot_role=bot_role,
                 user_text=text,
                 fallback=_help_text(allowed_bot),
+                history=history,
             ),
         }
 
@@ -1122,7 +1159,7 @@ def create_app(
                 result = await _handle_weather_command(text)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
-            result = await _handle_general_command(text, allowed_bot)
+            result = await _handle_general_command(text, allowed_bot, event)
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
 
         if allowed_bot == FEISHU_TASK_BOT:
@@ -1141,7 +1178,7 @@ def create_app(
                 result = _redirect_to_bot_command(WEATHER_TASK_BOT_ROLE, WEATHER_FORECAST_BOT_ROLE)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             await _send_progress_message(feishu_client, event, WEATHER_TASK_BOT_ROLE)
-            result = await _handle_general_command(text, allowed_bot)
+            result = await _handle_general_command(text, allowed_bot, event)
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
 
         if _is_task_submission_command(text):
@@ -1165,7 +1202,7 @@ def create_app(
             result = await _handle_weather_command(text)
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
         await _send_progress_message(feishu_client, event, _bot_role_for_allowed_bot(allowed_bot))
-        result = await _handle_general_command(text, allowed_bot)
+        result = await _handle_general_command(text, allowed_bot, event)
         return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
 
     @app.post("/feishu/events")
@@ -1455,6 +1492,15 @@ async def _send_feishu_event_response(
         result.get("event_reply_message_id", ""),
         result.get("event_reply_error", ""),
     )
+    try:
+        _bot_text = result.get("text") if isinstance(result.get("text"), str) else ""
+        if not _bot_text and result.get("card"):
+            _bot_text = "[已发送天气卡片]"
+        _record_conversation_turn(
+            result.get("bot_role") or "", chat_id, _event_sender_id(event), _event_text(event), _bot_text
+        )
+    except Exception:  # noqa: BLE001 - 记忆失败不影响回复
+        pass
     return result
 
 
