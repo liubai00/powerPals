@@ -255,35 +255,7 @@ WEATHER_KNOWLEDGE_KEYWORDS = (
 )
 
 
-def create_app(
-    forecast_service: ForecastService | Any | None = None,
-    feishu_verification_token: str | None = None,
-    settings: Settings | None = None,
-) -> FastAPI:
-    settings = settings or Settings()
-    service = forecast_service or ForecastService(settings=settings)
-    progress_messages_enabled = settings.feishu_progress_message_enabled and forecast_service is None
-    llm_client = LlmClient.from_settings(settings)
-    search_client = TavilySearchClient(settings.tavily_api_key)
-    task_service = WeatherTaskService()
-    location_resolver = LocationResolver(settings)
-    location_book = LocationBook(settings)
-    recorder = JsonlRecorder(settings.local_jsonl_path)
-    task_recorder = JsonlRecorder(settings.local_task_jsonl_path)
-    news_recorder = JsonlRecorder(settings.local_news_jsonl_path)
-    hydrology_recorder = JsonlRecorder(settings.local_hydrology_jsonl_path)
-    legacy_account = _legacy_feishu_account(settings, feishu_verification_token)
-    weather_account = _role_feishu_account(settings, FEISHU_WEATHER_BOT, legacy_account)
-    task_account = _role_feishu_account(settings, FEISHU_TASK_BOT, legacy_account)
-    legacy_feishu = FeishuClient(settings, legacy_account)
-    weather_feishu = FeishuClient(settings, weather_account)
-    task_feishu = FeishuClient(settings, task_account)
-    task_index: dict[str, WeatherTask] = {}
-    processed_message_ids: dict[str, float] = {}
-    forecast_report_cache: dict[str, tuple[float, list[WeatherSubmission], list[dict[str, str]]]] = {}
-    pending_region_clarifications: dict[str, dict[str, Any]] = {}
-
-# T1 上下文追问记忆: 每个 (bot_role, chat, sender) 保留最近几轮对话
+# T1 上下文追问记忆: 每个 (bot_role, chat, sender) 保留最近几轮对话 (真模块级, 在 create_app 之外)
 conversation_turns: dict[str, list[dict[str, Any]]] = {}
 CONVERSATION_TURNS_TTL_SECONDS = 1800
 CONVERSATION_TURNS_MAX = 6
@@ -313,6 +285,35 @@ def _recent_conversation_turns(bot_role: str, chat_id: str | None, sender_id: st
     now = time.time()
     turns = [t for t in conversation_turns.get(key, []) if now - t.get("ts", 0) < CONVERSATION_TURNS_TTL_SECONDS]
     return [{"role": t["role"], "content": t["content"]} for t in turns]
+
+
+def create_app(
+    forecast_service: ForecastService | Any | None = None,
+    feishu_verification_token: str | None = None,
+    settings: Settings | None = None,
+) -> FastAPI:
+    settings = settings or Settings()
+    service = forecast_service or ForecastService(settings=settings)
+    progress_messages_enabled = settings.feishu_progress_message_enabled and forecast_service is None
+    llm_client = LlmClient.from_settings(settings)
+    search_client = TavilySearchClient(settings.tavily_api_key)
+    task_service = WeatherTaskService()
+    location_resolver = LocationResolver(settings)
+    location_book = LocationBook(settings)
+    recorder = JsonlRecorder(settings.local_jsonl_path)
+    task_recorder = JsonlRecorder(settings.local_task_jsonl_path)
+    news_recorder = JsonlRecorder(settings.local_news_jsonl_path)
+    hydrology_recorder = JsonlRecorder(settings.local_hydrology_jsonl_path)
+    legacy_account = _legacy_feishu_account(settings, feishu_verification_token)
+    weather_account = _role_feishu_account(settings, FEISHU_WEATHER_BOT, legacy_account)
+    task_account = _role_feishu_account(settings, FEISHU_TASK_BOT, legacy_account)
+    legacy_feishu = FeishuClient(settings, legacy_account)
+    weather_feishu = FeishuClient(settings, weather_account)
+    task_feishu = FeishuClient(settings, task_account)
+    task_index: dict[str, WeatherTask] = {}
+    processed_message_ids: dict[str, float] = {}
+    forecast_report_cache: dict[str, tuple[float, list[WeatherSubmission], list[dict[str, str]]]] = {}
+    pending_region_clarifications: dict[str, dict[str, Any]] = {}
 
     app = FastAPI(title="PowerPals Weather Data Workbench", version="0.6.0")
 
@@ -1499,7 +1500,7 @@ async def _send_feishu_event_response(
         _record_conversation_turn(
             result.get("bot_role") or "", chat_id, _event_sender_id(event), _event_text(event), _bot_text
         )
-    except Exception:  # noqa: BLE001 - 记忆失败不影响回复
+    except Exception:  # noqa: BLE001
         pass
     return result
 
