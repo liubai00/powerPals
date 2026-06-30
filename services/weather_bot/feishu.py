@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 import time
 from typing import Any
 
@@ -9,6 +10,27 @@ import httpx
 from services.weather_bot.config import Settings
 from services.weather_bot.models import WeatherSubmission
 from services.weather_bot.tasks import WeatherTask
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    attempts: int = 3,
+    backoff: float = 0.6,
+    **kwargs: Any,
+) -> httpx.Response:
+    """瞬时网络/DNS 错误(TransportError, 含 [Errno -2] Name or service not known)自动重试。"""
+    last_exc: Exception | None = None
+    for index in range(attempts):
+        try:
+            return await client.post(url, **kwargs)
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if index < attempts - 1:
+                await asyncio.sleep(backoff * (index + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 @dataclass(frozen=True)
@@ -44,7 +66,7 @@ class FeishuClient:
             raise RuntimeError("Feishu app credentials are not configured")
 
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
+            response = await _post_with_retry(client, 
                 "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
                 json={
                     "app_id": self.account.app_id,
@@ -82,7 +104,7 @@ class FeishuClient:
         for attempt in range(2):
             token = await self.tenant_access_token()
             async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
+                response = await _post_with_retry(client, 
                     "https://open.feishu.cn/open-apis/im/v1/messages",
                     params={"receive_id_type": "chat_id"},
                     headers={"Authorization": f"Bearer {token}"},
@@ -114,7 +136,7 @@ class FeishuClient:
         for attempt in range(2):
             token = await self.tenant_access_token()
             async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
+                response = await _post_with_retry(client, 
                     f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
                     headers={"Authorization": f"Bearer {token}"},
                     json={"msg_type": msg_type, "content": json_dumps(content), "reply_in_thread": in_thread},
@@ -144,7 +166,7 @@ class FeishuClient:
             f"{self.settings.feishu_bitable_app_token}/tables/{self.settings.feishu_bitable_table_id}/records"
         )
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(url, headers={"Authorization": f"Bearer {token}"}, json={"fields": fields})
+            response = await _post_with_retry(client, url, headers={"Authorization": f"Bearer {token}"}, json={"fields": fields})
             response.raise_for_status()
 
     async def write_task_bitable_record(self, task: WeatherTask) -> None:
@@ -156,7 +178,7 @@ class FeishuClient:
             f"{self.settings.feishu_bitable_app_token}/tables/{self.settings.feishu_task_bitable_table_id}/records"
         )
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
+            response = await _post_with_retry(client, 
                 url,
                 headers={"Authorization": f"Bearer {token}"},
                 json={"fields": task_bitable_fields(task)},

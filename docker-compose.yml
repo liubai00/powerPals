@@ -1,6 +1,10 @@
 services:
   weather-bot:
     build: .
+    dns:
+      - 223.5.5.5
+      - 223.6.6.6
+      - 8.8.8.8
     env_file:
       - path: .env
         required: false
@@ -12,6 +16,10 @@ services:
 
   weather-scheduler:
     build: .
+    dns:
+      - 223.5.5.5
+      - 223.6.6.6
+      - 8.8.8.8
     command: ["python", "-m", "services.weather_bot.scheduler"]
     env_file:
       - path: .env
@@ -22,6 +30,10 @@ services:
 
   weather-feishu-ws:
     build: .
+    dns:
+      - 223.5.5.5
+      - 223.6.6.6
+      - 8.8.8.8
     command: ["python", "-m", "services.weather_bot.feishu_ws"]
     environment:
       FEISHU_WS_BOT_ROLE: weather
@@ -35,6 +47,10 @@ services:
 
   task-feishu-ws:
     build: .
+    dns:
+      - 223.5.5.5
+      - 223.6.6.6
+      - 8.8.8.8
     command: ["python", "-m", "services.weather_bot.feishu_ws"]
     environment:
       FEISHU_WS_BOT_ROLE: task
