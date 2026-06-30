@@ -450,14 +450,54 @@ def _weather_chart_elements(submissions: list[WeatherSubmission], metrics: list[
     return elements
 
 
+_CHART_LABELS = {
+    "temperature": "🌡️ 温度 ℃",
+    "rain_probability": "🌧️ 降水概率 %",
+    "wind_speed": "💨 风速 m/s",
+    "cloud_cover": "☁️ 云量 %",
+}
+
+
+def _chart_label_text(element: dict) -> str:
+    spec = element.get("chart_spec", {}) if isinstance(element, dict) else {}
+    yfield = spec.get("yField")
+    if yfield in _CHART_LABELS:
+        return _CHART_LABELS[yfield]
+    title = ""
+    raw = spec.get("title")
+    if isinstance(raw, dict):
+        title = str(raw.get("text") or "")
+    if "温" in title:
+        return "🌡️ 温度 ℃"
+    if "降水" in title or "雨" in title:
+        return "🌧️ 降水概率 %"
+    if "风" in title:
+        return "💨 风速 m/s"
+    if "云" in title:
+        return "☁️ 云量 %"
+    return title or "趋势"
+
+
+def _labeled_chart(element: dict) -> list[dict]:
+    label = _chart_label_text(element)
+    spec = element.get("chart_spec") if isinstance(element, dict) else None
+    if isinstance(spec, dict):
+        spec.pop("title", None)  # 图内标题在窄列里不渲染, 用上方独立标题替代
+    return [
+        {"tag": "div", "text": {"tag": "lark_md", "content": f"**{label}**"}},
+        element,
+    ]
+
+
 def _charts_grid(chart_elements: list[dict]) -> list[dict]:
-    """Arrange hourly trend charts into a 2-column grid (2x2) instead of stacking."""
+    """Arrange trend charts into a 2-column grid (2x2); each chart gets a label header."""
     if not chart_elements:
         return []
+    labeled = [_labeled_chart(element) for element in chart_elements]
     if len(chart_elements) == 1:
-        return chart_elements
-    col1 = chart_elements[0::2]
-    col2 = chart_elements[1::2]
+        return labeled[0]
+    col1 = [item for pair in labeled[0::2] for item in pair]
+    col2 = [item for pair in labeled[1::2] for item in pair]
     return [{
         "tag": "column_set",
         "flex_mode": "none",
