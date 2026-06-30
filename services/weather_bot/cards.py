@@ -105,27 +105,26 @@ def build_feishu_card(
         if len(date_labels) > 1
         else submission.target_date
     )
-    metadata_lines = [
-        f"**区域**：{submission.region}",
-        f"**预测范围**：{date_label}" if len(date_labels) > 1 else f"**预测日**：{date_label}",
-        f"**数据截止**：{submission.data_cutoff_time}",
-        f"**数据来源**：{' / '.join(submission.aggregated_forecast.providers_used)}",
-    ]
+    header_lines = []
     if show_task_id:
-        metadata_lines.insert(0, f"**任务 ID**：{submission.task_id}")
+        header_lines.append(f"**任务 ID**：{submission.task_id}")
+    header_lines.append(f"**📍 区域**：{submission.region}")
+    header_lines.append(
+        f"**🗓️ 预测范围**：{date_label}" if len(date_labels) > 1 else f"**🗓️ 预测日**：{date_label}"
+    )
+    meta_note = (
+        f"数据截止 {submission.data_cutoff_time}　·　来源 "
+        f"{' / '.join(submission.aggregated_forecast.providers_used)}"
+    )
     elements = [
-        {
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": "\n".join(metadata_lines),
-            },
-        },
+        {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(header_lines)}},
+        {"tag": "note", "elements": [{"tag": "plain_text", "content": meta_note}]},
         {"tag": "hr"},
     ]
     if len(chart_items) > 1:
         elements.append(_daily_forecast_columns(chart_items))
         elements.append({"tag": "hr"})
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "**📊 关键指标**"}})
     elements.append(_summary_fields_element(submission, selected_metrics))
     _explanation = _explanation_block(submission)
     if _explanation:
@@ -161,7 +160,7 @@ def build_feishu_card(
             }
         )
     if actions:
-        _btn_layout = "trisection" if len(actions) == 3 else "bisected" if len(actions) == 2 else "flow"
+        _btn_layout = "trisection" if len(actions) == 3 else "bisection" if len(actions) == 2 else "flow"
         elements.extend([{"tag": "hr"}, {"tag": "action", "layout": _btn_layout, "actions": actions}])
     if include_submission_note:
         content = build_text_summary(submission)
