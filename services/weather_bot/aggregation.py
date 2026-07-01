@@ -27,17 +27,20 @@ def aggregate_provider_forecasts(provider_results: list[ProviderForecast]) -> Ag
     if not usable:
         raise ValueError("No usable provider forecasts")
 
-    points_by_time: dict[str, list[tuple[str, ForecastPoint]]] = defaultdict(list)
+    points_by_hour: dict[str, list[tuple[str, ForecastPoint]]] = defaultdict(list)
+    time_repr: dict[str, str] = {}
     for result in usable:
         for point in result.points:
-            points_by_time[point.time].append((result.provider, point))
+            hour_key = str(point.time)[:13]  # 归一化到小时 YYYY-MM-DDTHH, 合并各源不同的时间戳格式(13:00 vs 13:00:00)
+            points_by_hour[hour_key].append((result.provider, point))
+            time_repr.setdefault(hour_key, point.time)
 
     aggregated_points: list[ForecastPoint] = []
-    for timestamp in sorted(points_by_time):
-        provider_points = points_by_time[timestamp]
+    for hour_key in sorted(points_by_hour):
+        provider_points = points_by_hour[hour_key]
         aggregated_points.append(
             ForecastPoint(
-                time=timestamp,
+                time=time_repr[hour_key],
                 temperature=_weighted_metric(provider_points, "temperature"),
                 precipitation_probability=_weighted_metric(provider_points, "precipitation_probability"),
                 wind_speed=_weighted_metric(provider_points, "wind_speed"),
