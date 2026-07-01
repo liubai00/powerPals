@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -11,6 +12,27 @@ from services.weather_bot.models import ForecastPoint, ForecastRequest, Provider
 
 SHENZHEN_LATITUDE = 22.5431
 SHENZHEN_LONGITUDE = 114.0579
+
+
+async def _get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    attempts: int = 2,
+    backoff: float = 0.5,
+    **kwargs: Any,
+) -> httpx.Response:
+    """数据源抓取: 瞬时网络/DNS/超时错误(httpx.TransportError)自动重试。"""
+    last_exc: Exception | None = None
+    for index in range(attempts):
+        try:
+            return await client.get(url, **kwargs)
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if index < attempts - 1:
+                await asyncio.sleep(backoff * (index + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 class OpenMeteoProvider:
@@ -29,7 +51,7 @@ class OpenMeteoProvider:
             "end_date": target.isoformat(),
         }
         async with httpx.AsyncClient(timeout=8.0) as client:
-            response = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            response = await _get_with_retry(client, "https://api.open-meteo.com/v1/forecast", params=params)
             response.raise_for_status()
             body = response.json()
         _daily = body.get("daily", {})
@@ -52,7 +74,7 @@ class QWeatherProvider:
         latitude, longitude = _coordinates(request)
         params = {"location": f"{longitude},{latitude}"}
         async with httpx.AsyncClient(timeout=8.0) as client:
-            response = await client.get(
+            response = await _get_with_retry(client, 
                 f"https://{self.api_host}/v7/weather/24h",
                 params=params,
                 headers={"X-QW-Api-Key": self.api_key or ""},
@@ -80,7 +102,7 @@ class CaiyunProvider:
         )
         params = {"hourlysteps": 24}
         async with httpx.AsyncClient(timeout=8.0) as client:
-            response = await client.get(url, params=params)
+            response = await _get_with_retry(client, url, params=params)
             response.raise_for_status()
             body = response.json()
         points = [point for point in _caiyun_points(body) if point.time.startswith(target.isoformat())]
