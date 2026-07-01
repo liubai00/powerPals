@@ -728,11 +728,16 @@ def _summary_points(submissions: list[WeatherSubmission], field: str, include_re
 
 def _hourly_points(submissions: list[WeatherSubmission], field: str, include_region: bool = False) -> list[tuple[str, float]]:
     points = []
+    seen_hours: set[str] = set()
     for submission in submissions:
         for point in submission.aggregated_forecast.points:
+            hour_key = "%s|%s" % (submission.region, str(point.time)[:13])
+            if hour_key in seen_hours:
+                continue
             value = getattr(point, field)
             if value is None:
                 continue
+            seen_hours.add(hour_key)
             time_label = _hour_label(point.time)
             label = f"{_short_region_label(submission.region)} {time_label}" if include_region else time_label
             points.append((label, float(value)))
@@ -752,12 +757,18 @@ def _summary_series(submissions: list[WeatherSubmission], field: str) -> list[di
 
 def _hourly_series(submissions: list[WeatherSubmission], field: str) -> list[dict[str, Any]]:
     series_by_region: dict[str, list[tuple[str, float]]] = {}
+    seen_by_region: dict[str, set[str]] = {}
     for submission in submissions:
         region_points = series_by_region.setdefault(submission.region, [])
+        region_seen = seen_by_region.setdefault(submission.region, set())
         for point in submission.aggregated_forecast.points:
+            hour_key = str(point.time)[:13]
+            if hour_key in region_seen:
+                continue
             value = getattr(point, field)
             if value is None:
                 continue
+            region_seen.add(hour_key)
             region_points.append((_hour_label(point.time), float(value)))
     return _chart_series(series_by_region)
 

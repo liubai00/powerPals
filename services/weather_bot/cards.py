@@ -514,10 +514,15 @@ def _hourly_chart_elements(submissions: list[WeatherSubmission], metrics: list[s
     rain_values = []
     wind_values = []
     cloud_values = []
+    seen_hours: set[str] = set()
     for submission in submissions:
         for point in submission.aggregated_forecast.points:
             if _hourly_metric_limit_reached(selected, temperature_values, rain_values, wind_values, cloud_values):
                 break
+            hour_key = "%s|%s" % (submission.region, str(point.time)[:13])  # 归一化到小时去重(合并 provider 时间格式差异 + 跨日重叠)
+            if hour_key in seen_hours:
+                continue
+            seen_hours.add(hour_key)
             label = _hour_label(point.time)
             if "temperature" in selected and point.temperature is not None and len(temperature_values) < 96:
                 temperature_values.append({"time": label, "temperature": point.temperature})
