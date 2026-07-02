@@ -87,6 +87,91 @@ def _daily_forecast_columns(submissions: list) -> dict:
     return {"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "default", "columns": columns}
 
 
+def _severity_rank(summary) -> int:
+    rain = summary.rain_probability or 0
+    wind = summary.wind_speed or 0
+    temp = summary.max_temperature or 0
+    cloud = summary.cloud_cover or 0
+    if (rain >= 70 and wind >= 10) or wind >= 15:
+        return 4
+    if rain >= 50:
+        return 3
+    if temp >= 35:
+        return 2
+    if cloud >= 75:
+        return 1
+    return 0
+
+
+_HEADER_TEMPLATES = {4: "red", 3: "blue", 2: "orange", 1: "grey", 0: "wathet"}
+
+
+def _header_template_for(chart_items) -> str:
+    rank = max(_severity_rank(item.aggregated_forecast.summary) for item in chart_items)
+    return _HEADER_TEMPLATES[rank]
+
+
+def _card_title(submission, chart_items) -> str:
+    emoji = _weather_emoji(getattr(chart_items[0].aggregated_forecast.summary, "main_weather", None))
+    if len(chart_items) > 1:
+        return f"{emoji} {submission.region} · 未来{len(chart_items)}天气象预测"
+    return f"{emoji} {submission.region}气象预测"
+
+
+def _glance_line(item) -> str:
+    from datetime import date as _d
+
+    s = item.aggregated_forecast.summary
+    label = "今日" if item.target_date == _d.today().isoformat() else item.target_date[5:]
+    weather = getattr(s, "main_weather", None) or "—"
+    bits = [f"{_weather_emoji(weather)} {weather}", f"{_fmt_metric(s.max_temperature)}° / {_fmt_metric(s.min_temperature)}°"]
+    if s.rain_probability is not None:
+        bits.append(f"💧{_fmt_metric(s.rain_probability)}%")
+    if s.wind_speed is not None:
+        bits.append(f"💨{_fmt_metric(s.wind_speed)}m/s")
+    return f"**{label}：{'　'.join(bits)}**"
+
+
+def _risk_banner(chart_items) -> str | None:
+    risky = []
+    for item in chart_items:
+        period = getattr(item.aggregated_forecast.summary, "high_risk_period", None)
+        if period and "无明显" not in period:
+            risky.append((item.target_date[5:], period))
+    if not risky:
+        return None
+    day, period = risky[0]
+    label = f"{day} {period}" if len(chart_items) > 1 else period
+    extra = f"（另有 {len(risky) - 1} 天存在风险时段）" if len(risky) > 1 else ""
+    return f"⚠️ **高风险：{label}**{extra}"
+
+
+def _insight_text(chart_items) -> str:
+    summaries = [item.aggregated_forecast.summary for item in chart_items]
+    rains = [s.rain_probability or 0 for s in summaries]
+    temps = [s.max_temperature or 0 for s in summaries]
+    winds = [s.wind_speed or 0 for s in summaries]
+    bits = []
+    if len(summaries) >= 2:
+        if rains[-1] - rains[0] >= 20:
+            bits.append("后期降水明显增多")
+        elif rains[0] - rains[-1] >= 20:
+            bits.append("降水趋于减弱")
+        if temps[-1] - temps[0] >= 3:
+            bits.append("气温逐日抬升")
+        elif temps[0] - temps[-1] >= 3:
+            bits.append("气温逐日回落")
+    if max(temps) >= 35:
+        bits.append("高温时段空调负荷偏高，注意错峰用电")
+    elif max(winds) >= 10:
+        bits.append("风速偏大，关注新能源出力与用电侧波动")
+    if max(rains) >= 60 and "降水" not in "".join(bits):
+        bits.append("降水概率高，出行备伞")
+    if not bits:
+        bits.append("整体平稳，按常规安排即可")
+    return "💡 " + "，".join(bits[:3])
+
+
 def build_feishu_card(
     submission: WeatherSubmission,
     report_url: str | None = None,
@@ -105,19 +190,16 @@ def build_feishu_card(
         if len(date_labels) > 1
         else submission.target_date
     )
-    header_lines = []
+    first_lines = []
     if show_task_id:
-        header_lines.append(f"**任务 ID**：{submission.task_id}")
-    header_lines.append(f"**📍 区域**：{submission.region}")
-    header_lines.append(
-        f"**🗓️ 预测范围**：{date_label}" if len(date_labels) > 1 else f"**🗓️ 预测日**：{date_label}"
-    )
-    meta_note = (
-        f"数据截止 {submission.data_cutoff_time}　·　来源 "
-        f"{' / '.join(submission.aggregated_forecast.providers_used)}"
-    )
+        first_lines.append(f"**任务 ID**：{submission.task_id}")
+    first_lines.append(_glance_line(chart_items[0]))
+    scope_bits = [date_label if len(date_labels) > 1 else f"预测日 {date_label}"]
+    scope_bits.append(f"数据截止 {submission.data_cutoff_time}")
+    scope_bits.append("来源 " + " / ".join(submission.aggregated_forecast.providers_used))
+    meta_note = "　·　".join(scope_bits)
     elements = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(header_lines)}},
+        {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(first_lines)}},
         {"tag": "note", "elements": [{"tag": "plain_text", "content": meta_note}]},
         {"tag": "hr"},
     ]
@@ -126,9 +208,10 @@ def build_feishu_card(
         elements.append({"tag": "hr"})
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "**📊 关键指标**"}})
     elements.append(_summary_fields_element(submission, selected_metrics))
-    _explanation = _explanation_block(submission)
-    if _explanation:
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _explanation}})
+    risk_line = _risk_banner(chart_items)
+    if risk_line:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": risk_line}})
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _insight_text(chart_items)}})
     chart_elements = _hourly_chart_elements(chart_items, selected_metrics) or _weather_chart_elements(chart_items, selected_metrics)
     elements.extend(_charts_grid(chart_elements))
     actions = []
@@ -178,8 +261,8 @@ def build_feishu_card(
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "template": "blue",
-                "title": {"tag": "plain_text", "content": f"⛅ {submission.region}气象预测"},
+                "template": _header_template_for(chart_items),
+                "title": {"tag": "plain_text", "content": _card_title(submission, chart_items)},
             },
             "elements": elements,
         },
@@ -350,15 +433,26 @@ def _summary_fields_element(submission: WeatherSubmission, metrics: list[str] | 
         fields.append({"is_short": short, "text": {"tag": "lark_md", "content": f"{label}\n**{value}**"}})
 
     if "temperature" in selected:
-        add("🌡️ 气温", f"{_fmt_metric(summary.max_temperature)}° / {_fmt_metric(summary.min_temperature)}°")
+        temp_value = f"{_fmt_metric(summary.max_temperature)}° / {_fmt_metric(summary.min_temperature)}°"
+        if (summary.max_temperature or 0) >= 35:
+            temp_value = f"🔴 {temp_value} ↑"
+        add("🌡️ 气温", temp_value)
         if summary.feels_like is not None:
-            add("🤒 体感最高", f"{summary.feels_like}℃")
+            feels_value = f"{summary.feels_like}℃"
+            if summary.feels_like >= 38:
+                feels_value = f"🔴 {feels_value} ↑"
+            add("🤒 体感最高", feels_value)
     if "rain" in selected:
-        add("🌧️ 降水概率", f"{_fmt_metric(summary.rain_probability)}%")
+        rain_value = f"{_fmt_metric(summary.rain_probability)}%"
+        if (summary.rain_probability or 0) >= 60:
+            rain_value = f"🔵 {rain_value} ↑"
+        add("🌧️ 降水概率", rain_value)
     if "wind" in selected:
         wind = f"{_fmt_metric(summary.wind_speed)} m/s"
         if summary.wind_direction is not None:
             wind += f" · {_compass(summary.wind_direction)}"
+        if (summary.wind_speed or 0) >= 10:
+            wind = f"🟠 {wind} ↑"
         add("💨 风", wind)
     if "cloud" in selected:
         add("☁️ 云量", f"{_fmt_metric(summary.cloud_cover)}%")
@@ -368,8 +462,6 @@ def _summary_fields_element(submission: WeatherSubmission, metrics: list[str] | 
         add("🌅 日出 / 日落", f"{summary.sunrise} / {summary.sunset}")
     if selected & {"rain", "cloud"}:
         add("🌥️ 主要天气", summary.main_weather)
-    if selected & {"rain", "wind"} or selected == all_metrics:
-        add("⚠️ 高风险时段", summary.high_risk_period, short=False)
 
     if not fields:
         return {"tag": "div", "text": {"tag": "lark_md", "content": "暂无指标数据"}}
