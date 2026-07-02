@@ -128,8 +128,10 @@ def _build_summary(points: list[ForecastPoint], sunrise: str | None = None, suns
 
 
 def _describe_weather(rain_probability: float | None, cloud_cover: float | None) -> str:
+    if rain_probability is not None and rain_probability >= 80:
+        return "阴有阵雨"
     if rain_probability is not None and rain_probability >= 60:
-        return "有明显降水风险"
+        return "多云有阵雨"
     if cloud_cover is not None and cloud_cover >= 75:
         return "多云到阴"
     if cloud_cover is not None and cloud_cover >= 45:
