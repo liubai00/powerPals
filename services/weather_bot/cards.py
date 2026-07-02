@@ -195,8 +195,11 @@ def build_feishu_card(
         first_lines.append(f"**任务 ID**：{submission.task_id}")
     first_lines.append(_glance_line(chart_items[0]))
     scope_bits = [date_label if len(date_labels) > 1 else f"预测日 {date_label}"]
-    scope_bits.append(f"数据截止 {submission.data_cutoff_time}")
+    scope_bits.append(f"数据截止 {_fmt_cutoff(submission.data_cutoff_time)}")
     scope_bits.append("来源 " + " / ".join(submission.aggregated_forecast.providers_used))
+    _sm = submission.aggregated_forecast.summary
+    if _sm.sunrise and _sm.sunset:
+        scope_bits.append(f"日出 {_sm.sunrise} · 日落 {_sm.sunset}")
     meta_note = "　·　".join(scope_bits)
     elements = [
         {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(first_lines)}},
@@ -207,7 +210,7 @@ def build_feishu_card(
         elements.append(_daily_forecast_columns(chart_items))
         elements.append({"tag": "hr"})
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "**📊 关键指标**"}})
-    elements.append(_summary_fields_element(submission, selected_metrics))
+    elements.extend(_summary_metric_rows(submission, selected_metrics))
     risk_line = _risk_banner(chart_items)
     if risk_line:
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": risk_line}})
@@ -421,6 +424,78 @@ def _forecast_detail_content(submission: WeatherSubmission, metrics: list[str] |
         ]
     )
     return "\n".join(lines)
+
+
+def _fmt_cutoff(value: object) -> str:
+    v = str(value or "")
+    if "T" in v and len(v) >= 16:
+        return v[5:10] + " " + v[11:16]
+    return v
+
+
+def _summary_metric_rows(submission: WeatherSubmission, metrics: list[str] | None = None) -> list[dict]:
+    """关键指标: 与逐日条同构的等宽三列网格(2x3), 比 fields 更整齐。"""
+    summary = submission.aggregated_forecast.summary
+    selected = set(normalize_weather_metrics(metrics))
+    cells: list[tuple[str, str]] = []
+    if "temperature" in selected:
+        temp_value = f"{_fmt_metric(summary.max_temperature)}° / {_fmt_metric(summary.min_temperature)}°"
+        if (summary.max_temperature or 0) >= 35:
+            temp_value = f"🔴 {temp_value} ↑"
+        cells.append(("🌡️ 气温", temp_value))
+        if summary.feels_like is not None:
+            feels_value = f"{summary.feels_like}℃"
+            if summary.feels_like >= 38:
+                feels_value = f"🔴 {feels_value} ↑"
+            cells.append(("🤒 体感最高", feels_value))
+    if "rain" in selected:
+        rain_value = f"{_fmt_metric(summary.rain_probability)}%"
+        if (summary.rain_probability or 0) >= 60:
+            rain_value = f"🔵 {rain_value} ↑"
+        cells.append(("🌧️ 降水概率", rain_value))
+    if "wind" in selected:
+        wind_value = f"{_fmt_metric(summary.wind_speed)} m/s"
+        if summary.wind_direction is not None:
+            wind_value += f" · {_compass(summary.wind_direction)}"
+        if (summary.wind_speed or 0) >= 10:
+            wind_value = f"🟠 {wind_value} ↑"
+        cells.append(("💨 风", wind_value))
+    if "cloud" in selected:
+        cells.append(("☁️ 云量", f"{_fmt_metric(summary.cloud_cover)}%"))
+    if summary.uv_index is not None:
+        cells.append(("🔆 紫外线", _uv_level(summary.uv_index)))
+    if not cells:
+        return [{"tag": "div", "text": {"tag": "lark_md", "content": "暂无指标数据"}}]
+
+    rows: list[dict] = []
+    per_row = 3
+    for start in range(0, len(cells), per_row):
+        chunk = cells[start:start + per_row]
+        columns = [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": f"{label}\n**{value}**"}}],
+            }
+            for label, value in chunk
+        ]
+        while len(columns) < per_row and len(cells) > per_row:
+            columns.append({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "　"}}],
+            })
+        rows.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "columns": columns,
+        })
+    return rows
 
 
 def _summary_fields_element(submission: WeatherSubmission, metrics: list[str] | None = None) -> dict:
