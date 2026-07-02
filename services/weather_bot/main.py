@@ -1562,10 +1562,22 @@ def _is_task_submission_command(text: str) -> bool:
     return _task_id_from_text(text) is not None
 
 
+FORECAST_WINDOW_HINT_RE = re.compile(r"今天|今日|明天|明日|后天|大后天|周末|下周|未来|最近|近期|接下来|这几天")
+
+
+def _has_forecast_window_hint(text: str) -> bool:
+    if FORECAST_WINDOW_HINT_RE.search(text):
+        return True
+    return _days_from_text(text) > 1
+
+
 def _is_weather_command(text: str) -> bool:
     if _is_task_submission_command(text):
         return True
     if has_weather_metric_keyword(text):
+        return True
+    # 意图增强: 「地区 + 时间窗口」即视为天气查询(如"深圳未来三天"), 不再强依赖"天气/气象"字眼
+    if _has_forecast_window_hint(text) and _explicit_region_from_text(text):
         return True
     return any(
         keyword in text
