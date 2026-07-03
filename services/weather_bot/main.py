@@ -1691,15 +1691,19 @@ def _target_date_from_text(text: str) -> str:
     return (date.today() + timedelta(days=1)).isoformat()
 
 
-WEEK_COUNT_RE = re.compile(r"([一两二三123])?\s*个?\s*(?:周|星期|礼拜)(?![末一二三四五六日天年])")
+# 有数量词的「一周/两周」不可能是"周四"这类星期几, 不做排除; 裸"周"(下周/本周)才需防"周X"
+WEEK_COUNT_RE = re.compile(r"([一两二三123])\s*个?\s*(?:周|星期|礼拜)")
+WEEK_BARE_RE = re.compile(r"(?:下|这|本)\s*(?:周|星期|礼拜)(?![末一二三四五六日天年])")
 _WEEK_COUNT_WORDS = {"一": 1, "1": 1, "两": 2, "二": 2, "2": 2, "三": 3, "3": 3}
 
 
 def _days_from_text(text: str) -> int:
     week_match = WEEK_COUNT_RE.search(text)
     if week_match:
-        weeks = _WEEK_COUNT_WORDS.get(week_match.group(1) or "一", 1)
+        weeks = _WEEK_COUNT_WORDS.get(week_match.group(1), 1)
         return min(16, weeks * 7)
+    if WEEK_BARE_RE.search(text):
+        return 7
     prefixed_match = re.search(rf"(?:未来|最近|近|接下来|接着|之后|后面|往后|连续|随后)\s*{DAY_COUNT_TOKEN_RE}\s*(?:天|日)", text)
     if prefixed_match:
         return _normalize_day_count(prefixed_match.group(1))
