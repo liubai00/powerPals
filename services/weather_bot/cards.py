@@ -215,7 +215,11 @@ def build_feishu_card(
     if risk_line:
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": risk_line}})
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _insight_text(chart_items)}})
-    chart_elements = _hourly_chart_elements(chart_items, selected_metrics) or _weather_chart_elements(chart_items, selected_metrics)
+    if len(chart_items) > 4:
+        # 多日(>4天)用日级趋势图, 逐小时挤不下也看不清
+        chart_elements = _weather_chart_elements(chart_items, selected_metrics) or _hourly_chart_elements(chart_items, selected_metrics)
+    else:
+        chart_elements = _hourly_chart_elements(chart_items, selected_metrics) or _weather_chart_elements(chart_items, selected_metrics)
     elements.extend(_charts_grid(chart_elements))
     actions = []
     if report_url:
