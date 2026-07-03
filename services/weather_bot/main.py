@@ -4,6 +4,8 @@ import json
 import logging
 import re
 import time
+
+from services.weather_bot import memory as weather_memory
 from datetime import date, timedelta
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
@@ -263,12 +265,7 @@ WEATHER_KNOWLEDGE_KEYWORDS = (
 )
 
 
-# T1 上下文追问记忆: 每个 (bot_role, chat, sender) 保留最近几轮对话 (真模块级, 在 create_app 之外)
-conversation_turns: dict[str, list[dict[str, Any]]] = {}
-CONVERSATION_TURNS_TTL_SECONDS = 1800
-CONVERSATION_TURNS_MAX = 6
-
-
+# T1/L2 对话记忆: SQLite 落盘(data/memory.db), TTL 7 天, 重启不丢; 失败自动降级为无记忆
 def _conversation_key(bot_role: str, chat_id: str | None, sender_id: str) -> str:
     return f"{bot_role}|{chat_id or ''}|{sender_id}"
 
@@ -277,22 +274,22 @@ def _record_conversation_turn(bot_role: str, chat_id: str | None, sender_id: str
     if not chat_id or not (user_text or bot_text):
         return
     key = _conversation_key(bot_role, chat_id, sender_id)
-    now = time.time()
-    turns = [t for t in conversation_turns.get(key, []) if now - t.get("ts", 0) < CONVERSATION_TURNS_TTL_SECONDS]
-    if user_text and user_text.strip():
-        turns.append({"role": "user", "content": user_text.strip()[:400], "ts": now})
-    if bot_text and bot_text.strip():
-        turns.append({"role": "assistant", "content": bot_text.strip()[:400], "ts": now})
-    conversation_turns[key] = turns[-CONVERSATION_TURNS_MAX:]
+    try:
+        if user_text and user_text.strip():
+            weather_memory.record_turn(key, "user", user_text.strip())
+        if bot_text and bot_text.strip():
+            weather_memory.record_turn(key, "assistant", bot_text.strip())
+    except Exception:  # noqa: BLE001 - 记忆失败不影响主流程
+        pass
 
 
 def _recent_conversation_turns(bot_role: str, chat_id: str | None, sender_id: str) -> list[dict[str, str]]:
     if not chat_id:
         return []
-    key = _conversation_key(bot_role, chat_id, sender_id)
-    now = time.time()
-    turns = [t for t in conversation_turns.get(key, []) if now - t.get("ts", 0) < CONVERSATION_TURNS_TTL_SECONDS]
-    return [{"role": t["role"], "content": t["content"]} for t in turns]
+    try:
+        return weather_memory.recent_turns(_conversation_key(bot_role, chat_id, sender_id))
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def create_app(
@@ -1164,7 +1161,20 @@ def create_app(
                     _clear_pending_region(event, allowed_bot)
                     await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
                 else:
-                    _remember_pending_region(event, allowed_bot, "forecast", text)
+                    _pref = None
+                    try:
+                        _pref = weather_memory.preferred_region(
+                            _bot_role_for_allowed_bot(allowed_bot), _event_sender_id(event)
+                        )
+                    except Exception:  # noqa: BLE001
+                        _pref = None
+                    if _pref and _pref.get("region"):
+                        # L1 画像: 没说城市就按这个人常查的城市
+                        _clear_pending_region(event, allowed_bot)
+                        await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
+                        text = f"{_pref['region']}{text}"
+                    else:
+                        _remember_pending_region(event, allowed_bot, "forecast", text)
                 result = await _handle_weather_command(text)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
@@ -1508,6 +1518,19 @@ async def _send_feishu_event_response(
         _record_conversation_turn(
             result.get("bot_role") or "", chat_id, _event_sender_id(event), _event_text(event), _bot_text
         )
+        _pref_subs = (
+            submissions_to_record
+            if isinstance(submissions_to_record, list)
+            else ([submission_to_record] if isinstance(submission_to_record, WeatherSubmission) else [])
+        )
+        _pref_subs = [s for s in _pref_subs if isinstance(s, WeatherSubmission)]
+        if _pref_subs:
+            weather_memory.remember_query(
+                result.get("bot_role") or "",
+                _event_sender_id(event),
+                getattr(_pref_subs[0], "region", None),
+                max(1, len(_pref_subs)),
+            )
     except Exception:  # noqa: BLE001
         pass
     return result
