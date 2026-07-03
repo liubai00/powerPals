@@ -147,28 +147,32 @@ def _risk_banner(chart_items) -> str | None:
 
 
 def _insight_text(chart_items) -> str:
+    """电力视角解读: 负荷 / 风电 / 光伏 三要素, 最多三条一行。"""
     summaries = [item.aggregated_forecast.summary for item in chart_items]
     rains = [s.rain_probability or 0 for s in summaries]
     temps = [s.max_temperature or 0 for s in summaries]
     winds = [s.wind_speed or 0 for s in summaries]
+    clouds = [s.cloud_cover or 0 for s in summaries]
     bits = []
-    if len(summaries) >= 2:
-        if rains[-1] - rains[0] >= 20:
-            bits.append("后期降水明显增多")
-        elif rains[0] - rains[-1] >= 20:
-            bits.append("降水趋于减弱")
-        if temps[-1] - temps[0] >= 3:
-            bits.append("气温逐日抬升")
-        elif temps[0] - temps[-1] >= 3:
-            bits.append("气温逐日回落")
     if max(temps) >= 35:
-        bits.append("高温时段空调负荷偏高，注意错峰用电")
-    elif max(winds) >= 10:
-        bits.append("风速偏大，关注新能源出力与用电侧波动")
-    if max(rains) >= 60 and "降水" not in "".join(bits):
-        bits.append("降水概率高，出行备伞")
+        bits.append("高温拉动制冷负荷，晚峰供需偏紧")
+    elif max(temps) >= 32:
+        bits.append("气温偏高，制冷负荷有支撑")
+    elif len(temps) >= 2 and temps[0] - temps[-1] >= 5:
+        bits.append("显著降温，负荷结构生变")
+    peak_wind = max(winds)
+    if peak_wind >= 12:
+        bits.append("风资源强，风电出力预计偏高、现货或承压")
+    elif peak_wind >= 8:
+        bits.append("风电出力中等偏上")
+    elif peak_wind <= 4:
+        bits.append("风资源弱，风电出力有限")
+    if max(rains) >= 60 or min(clouds) >= 80:
+        bits.append("阴雨压制光伏出力，午间电价有支撑")
+    elif max(clouds) <= 40:
+        bits.append("晴多云为主，光伏大发压低午间")
     if not bits:
-        bits.append("整体平稳，按常规安排即可")
+        bits.append("气象面平稳，供需扰动有限")
     return "💡 " + "，".join(bits[:3])
 
 
