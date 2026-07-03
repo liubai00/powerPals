@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """每日《电力气象晨报》: 扫描重点电力省份的明日气象, 异常驱动播报到飞书群。cron 09:00 调用。"""
 import asyncio
+import os
 from datetime import date, timedelta
 from services.weather_bot import main as m
 from services.weather_bot.cards import _weather_emoji, _fmt_metric
@@ -116,6 +117,13 @@ async def go() -> None:
         print("ERR 全部省份无数据, 放弃发送")
         return
     card = build_briefing_card(rows, target)
+    if os.getenv("DRY_RUN") == "1":
+        print("DRY-RUN(不发送) 头部:", card["card"]["header"]["template"], card["card"]["header"]["title"]["content"])
+        for element in card["card"]["elements"]:
+            if element.get("tag") == "div":
+                print("---")
+                print(element["text"]["content"])
+        return
     legacy = m._legacy_feishu_account(settings, None)
     acct = m._role_feishu_account(settings, m.FEISHU_WEATHER_BOT, legacy)
     client = m.FeishuClient(settings, acct)
