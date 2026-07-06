@@ -240,6 +240,8 @@ WEATHER_KNOWLEDGE_KEYWORDS = (
     "介绍",
     "讲讲",
     "什么是",
+    "什么意思",
+    "啥意思",
     "为什么",
     "怎么看",
     "含义",
@@ -888,7 +890,7 @@ def create_app(
         }
 
     async def _handle_weather_command(text: str) -> dict[str, Any]:
-        if _is_past_weather_query(text):
+        if _is_past_weather_query(text) and not _is_weather_knowledge_question(text):
             return {
                 "status": "handled",
                 "bot_role": WEATHER_FORECAST_BOT_ROLE,
@@ -1664,9 +1666,13 @@ def _is_weather_command(text: str) -> bool:
         return True
     if has_weather_metric_keyword(text):
         return True
-    # 意图增强: 「地区 + 时间窗口」即视为天气查询(如"深圳未来三天"), 不再强依赖"天气/气象"字眼
-    if _has_forecast_window_hint(text) and _explicit_region_from_text(text):
-        return True
+    # 意图增强: 「时间窗口 + (已知地区 或 强预报窗)」视为天气查询;
+    # 地名不在词表时(如"盘锦未来7天")留给 LLM 兜底抽取
+    if _has_forecast_window_hint(text):
+        if _explicit_region_from_text(text):
+            return True
+        if re.search(r"未来|最近|接下来|这几天", text) or _days_from_text(text) > 1:
+            return True
     return any(
         keyword in text
         for keyword in [
