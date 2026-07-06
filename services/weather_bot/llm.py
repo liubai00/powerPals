@@ -260,6 +260,7 @@ async def answer_weather_knowledge_question(
     user_text: str,
     fallback: str,
     search_results: list[dict[str, str]] | None = None,
+    live_context: str | None = None,
 ) -> str:
     if llm_client is None or not llm_client.enabled:
         return fallback
@@ -281,6 +282,9 @@ async def answer_weather_knowledge_question(
                     "你服务的是电力交易社区；当问题涉及电力（负荷、风电/光伏出力、现货、电价、交易），"
                     "用『气象→电力』传导逻辑分析（温度→负荷，风速→风电出力，云量/降水→光伏出力，强对流→电网风险），"
                     "可给方向性判断与策略思路，但不编造具体电价或出力数字，结尾加：以上为气象侧推演，仅供参考，不构成投资建议。"
+                    "【实时数据优先·最重要】如果下方 live_typhoon_data 有内容，它来自权威气象接口、是最新实时事实，"
+                    "你必须完全以它为准说明台风的当前位置、强度、移动方向和预报路径；不要使用你训练记忆里的旧台风信息，"
+                    "也不要把用户举例中往年历史台风（如某年某台风）的数字当成当前情况；先播报台风最新实况(位置/强度/路径)，再谈电力影响。"
                     "【回答风格·重要】直接点名回应用户提到的具体台风/城市/情景（不要泛化成\"超强台风\"）；"
                     "先给结论再列 3-5 条要点，全文控制在 300 字内、适合飞书群聊快读，不要写分很多大节的长篇论文；"
                     "不能核验的官方历史数据用一句话带过、不要作为开头重点。"
@@ -290,7 +294,7 @@ async def answer_weather_knowledge_question(
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"question": user_text, "search_context": context},
+                    {"question": user_text, "search_context": context, "live_typhoon_data": live_context or ""},
                     ensure_ascii=False,
                 ),
             },

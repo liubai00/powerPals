@@ -23,6 +23,7 @@ from services.weather_bot.models import ForecastRequest, SubmissionRecord, Weath
 from services.weather_bot.service import ForecastService
 from services.weather_bot.search import TavilySearchClient
 from services.weather_bot.storage import JsonlRecorder
+from services.weather_bot.typhoon import TyphoonClient
 from services.weather_bot.task_cards import build_task_card, build_task_text
 from services.weather_bot.tasks import WeatherTask, WeatherTaskRequest, WeatherTaskService
 from services.weather_bot.workbench import (
@@ -337,6 +338,7 @@ def create_app(
     progress_messages_enabled = settings.feishu_progress_message_enabled and forecast_service is None
     llm_client = LlmClient.from_settings(settings)
     search_client = TavilySearchClient(settings.tavily_api_key)
+    typhoon_client = TyphoonClient(settings.qweather_api_key, settings.qweather_api_host)
     task_service = WeatherTaskService()
     location_resolver = LocationResolver(settings)
     location_book = LocationBook(settings)
@@ -895,7 +897,17 @@ def create_app(
         return response
 
     async def _handle_weather_knowledge_command(text: str) -> dict[str, Any]:
-        search_results = await search_client.search(text) if search_client.enabled else []
+        # 用户提到具体台风时, 拉和风实时路径+预报做权威 grounding(以最新数据为准, 不用训练记忆里的旧台风)
+        live_context = None
+        if typhoon_client.enabled:
+            try:
+                live_context = await typhoon_client.brief_for_text(text)
+            except Exception:  # noqa: BLE001 - 台风数据失败不影响回答
+                live_context = None
+        # 有权威实时台风数据时以它为准, 跳过较慢且噪声大的通用搜索; 否则退回联网搜索
+        search_results = []
+        if not live_context and search_client.enabled:
+            search_results = await search_client.search(text)
         compact_results = [
             {"title": item.title, "url": item.url, "content": item.content[:500]}
             for item in search_results
@@ -905,11 +917,13 @@ def create_app(
             "bot_role": WEATHER_FORECAST_BOT_ROLE,
             "mode": "knowledge_answer",
             "search_result_count": len(search_results),
+            "typhoon_grounded": bool(live_context),
             "text": await answer_weather_knowledge_question(
                 llm_client,
                 user_text=text,
                 fallback=_weather_knowledge_fallback(text),
                 search_results=compact_results,
+                live_context=live_context,
             ),
         }
 
