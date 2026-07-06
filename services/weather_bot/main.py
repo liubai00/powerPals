@@ -940,6 +940,17 @@ def create_app(
                     "days": days,
                     "text": _region_clarification_text(days, "forecast"),
                 }
+        elif not task_submission_mode:
+            _regex_region = _explicit_region_from_text(text)
+            if _is_province_only_region(_regex_region) and _has_extra_place_after_province(text, str(_regex_region)):
+                # regex 只抓到省名且其后疑似还有更具体地名(如"辽宁盘锦"), 用 LLM 抽市/县
+                candidate = await extract_location_with_llm(llm_client, text)
+                if candidate and candidate.startswith(str(_regex_region)):
+                    trimmed = candidate[len(str(_regex_region)):].lstrip("省市 ")
+                    if trimmed:
+                        candidate = trimmed
+                if candidate and candidate != _regex_region and not _is_province_only_region(candidate):
+                    llm_region_override = candidate
         request = _request_from_task(task) if task_submission_mode else _request_from_text(text)
         if llm_region_override:
             request = request.model_copy(update={"region": llm_region_override})
@@ -1910,6 +1921,31 @@ def _regions_from_text(text: str) -> list[str]:
         seen.add(region)
         regions.append(region)
     return regions
+
+
+_PROVINCE_ONLY_RE = re.compile(
+    r"^(河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|广西|海南|四川|贵州|云南|西藏|陕西|甘肃|青海|宁夏|新疆|内蒙古|台湾)(省|自治区|壮族自治区|回族自治区|维吾尔自治区)?$"
+)
+_PROVINCE_STOP_AFTER = set("的省市天气未来最近近期接下这几周月日晴雨雪风云温度气象预报预测报怎么样如何啥吗呢和与跟今明后大过去上历史")
+
+
+def _is_province_only_region(region) -> bool:
+    return bool(region and _PROVINCE_ONLY_RE.match(str(region)))
+
+
+def _has_extra_place_after_province(text: str, province: str) -> bool:
+    idx = text.find(province)
+    if idx < 0:
+        return False
+    after = text[idx + len(province):]
+    for prefix in ("维吾尔自治区", "壮族自治区", "回族自治区", "自治区", "省"):
+        if after.startswith(prefix):
+            after = after[len(prefix):]
+            break
+    if not after:
+        return False
+    ch = after[0]
+    return bool(re.match(r"[一-鿿]", ch)) and ch not in _PROVINCE_STOP_AFTER
 
 
 def _explicit_region_from_text(text: str) -> str | None:
