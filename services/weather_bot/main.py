@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 
-from services.weather_bot.cards import build_feishu_card, build_weather_comparison_card
+from services.weather_bot.cards import build_feishu_card, build_text_reply_card, build_weather_comparison_card, is_rich_reply_text
 from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuBotAccount, FeishuClient, verify_feishu_token
 from services.weather_bot.judge import WeatherJudgeRequest, WeatherJudgeResult, score_weather_submission
@@ -1577,7 +1577,15 @@ async def _send_feishu_event_response(
             else:
                 message_id = await feishu_client.send_interactive_card(chat_id, card)
         elif isinstance(text, str) and text:
-            if incoming_message_id and thread_id:
+            # 含 Markdown 的富文本回答(知识/角色分析)走 lark_md 卡片渲染, 避免 ## / ** 原样露出;
+            # 短系统消息(澄清/降级)仍走纯文本
+            if is_rich_reply_text(text):
+                reply_card = build_text_reply_card(text)
+                if incoming_message_id and thread_id:
+                    message_id = await feishu_client.reply_interactive_card(incoming_message_id, reply_card, in_thread=True)
+                else:
+                    message_id = await feishu_client.send_interactive_card(chat_id, reply_card)
+            elif incoming_message_id and thread_id:
                 message_id = await feishu_client.reply_text_message(incoming_message_id, text, in_thread=True)
             else:
                 message_id = await feishu_client.send_text_message(chat_id, text)

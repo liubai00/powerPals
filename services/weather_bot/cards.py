@@ -1,9 +1,40 @@
 from __future__ import annotations
 
+import re
 from urllib.parse import urlencode
 
 from services.weather_bot.models import WeatherSubmission
 from services.weather_bot.weather_metrics import SUPPORTED_WEATHER_METRIC_ORDER, normalize_weather_metrics
+
+
+def to_feishu_lark_md(text: str) -> str:
+    """把 LLM 输出规整成飞书 lark_md 友好格式: Markdown 标题(#/##)转成加粗、收敛多余空行。
+    lark_md 能渲染 **加粗**/换行/`-` 列表, 但不认 # 标题(会原样露出), 故此处兜底转换。"""
+    out_lines = []
+    for line in (text or "").split("\n"):
+        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.*\S)\s*#*\s*$", line)
+        out_lines.append(f"**{heading.group(2).strip()}**" if heading else line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip()
+
+
+def is_rich_reply_text(text: str) -> bool:
+    """含 Markdown 加粗/标题的 LLM 回答需用卡片渲染(纯文本会把 ** 和 ## 符号原样露出)。"""
+    if not text:
+        return False
+    return "**" in text or bool(re.search(r"(?:^|\n)\s{0,3}#{1,6}\s", text))
+
+
+def build_text_reply_card(text: str) -> dict:
+    """把富文本回答包成极简 lark_md 卡片, 让加粗/小标题/列表在飞书里正常渲染。"""
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": to_feishu_lark_md(text)}},
+            ],
+        },
+    }
 
 
 def build_text_summary(submission: WeatherSubmission) -> str:
