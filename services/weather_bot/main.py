@@ -277,6 +277,28 @@ WEATHER_KNOWLEDGE_KEYWORDS = (
 
 
 # T1/L2 对话记忆: SQLite 落盘(data/memory.db), TTL 7 天, 重启不丢; 失败自动降级为无记忆
+def _card_memory_summary(subs) -> str | None:
+    """把刚发出的天气卡片压成一行文本存进对话记忆, 供 LLM 回答后续追问时引用真实数据。"""
+    if not subs:
+        return None
+    first = subs[0]
+    try:
+        s = first.aggregated_forecast.summary
+        parts = [
+            "[天气卡片]%s %s起%d天" % (first.region, first.target_date, max(1, len(subs))),
+            str(getattr(s, "main_weather", "") or ""),
+            "%s~%s℃" % (s.min_temperature, s.max_temperature),
+            "降水%s%%" % s.rain_probability,
+            "风%sm/s" % s.wind_speed,
+        ]
+        if len(subs) > 1:
+            last = subs[-1].aggregated_forecast.summary
+            parts.append("末日%s降水%s%%" % (getattr(last, "main_weather", "") or "", last.rain_probability))
+        return " ".join(str(p) for p in parts if p)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _conversation_key(bot_role: str, chat_id: str | None, sender_id: str) -> str:
     return f"{bot_role}|{chat_id or ''}|{sender_id}"
 
@@ -1540,18 +1562,18 @@ async def _send_feishu_event_response(
         result.get("event_reply_error", ""),
     )
     try:
-        _bot_text = result.get("text") if isinstance(result.get("text"), str) else ""
-        if not _bot_text and result.get("card"):
-            _bot_text = "[已发送天气卡片]"
-        _record_conversation_turn(
-            result.get("bot_role") or "", chat_id, _event_sender_id(event), _event_text(event), _bot_text
-        )
         _pref_subs = (
             submissions_to_record
             if isinstance(submissions_to_record, list)
             else ([submission_to_record] if isinstance(submission_to_record, WeatherSubmission) else [])
         )
         _pref_subs = [s for s in _pref_subs if isinstance(s, WeatherSubmission)]
+        _bot_text = result.get("text") if isinstance(result.get("text"), str) else ""
+        if not _bot_text and result.get("card"):
+            _bot_text = _card_memory_summary(_pref_subs) or "[已发送天气卡片]"
+        _record_conversation_turn(
+            result.get("bot_role") or "", chat_id, _event_sender_id(event), _event_text(event), _bot_text
+        )
         if _pref_subs:
             weather_memory.remember_query(
                 result.get("bot_role") or "",
