@@ -320,7 +320,8 @@ def _recent_conversation_turns(bot_role: str, chat_id: str | None, sender_id: st
     if not chat_id:
         return []
     try:
-        return weather_memory.recent_turns(_conversation_key(bot_role, chat_id, sender_id))
+        # 按整个会话(跨发言人)取上下文: 群里 A 提问、B 说"回答下"也能接住
+        return weather_memory.recent_chat_turns(f"{bot_role}|{chat_id}|")
     except Exception:  # noqa: BLE001
         return []
 

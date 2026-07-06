@@ -74,3 +74,14 @@ def preferred_region(bot_role: str, sender_id: str) -> dict | None:
     if not row:
         return None
     return {"region": row[0], "days": row[1], "hits": row[2]}
+
+
+def recent_chat_turns(key_prefix: str, limit: int = 12) -> list[dict[str, str]]:
+    """按整个会话(跨发言人)取最近对话: 群里 A 提问、B 说"回答下"也能接上下文。"""
+    now = time.time()
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT role, content, ts FROM turns WHERE k LIKE ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
+            (key_prefix + "%", now - TURN_TTL_SECONDS, limit),
+        ).fetchall()
+    return [{"role": role, "content": content} for role, content, _ts in reversed(rows)]
