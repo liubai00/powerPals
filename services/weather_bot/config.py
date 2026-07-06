@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     llm_api_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
-    llm_timeout: float = 20.0
+    llm_timeout: float = 60.0
     tavily_api_key: str | None = None
     feishu_progress_message_enabled: bool = False
     feishu_app_id: str | None = None
