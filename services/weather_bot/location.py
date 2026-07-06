@@ -340,14 +340,18 @@ class LocationResolver:
     async def _resolve_with_qweather(self, region: str) -> ResolvedLocation | None:
         host = (self.settings.qweather_api_host or "geoapi.qweather.com").strip().rstrip("/")
         params = {"location": region, "range": "cn", "number": 5, "lang": "zh"}
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(
-                f"https://{host}/geo/v2/city/lookup",
-                params=params,
-                headers={"X-QW-Api-Key": self.settings.qweather_api_key or ""},
-            )
-            response.raise_for_status()
-            body = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(
+                    f"https://{host}/geo/v2/city/lookup",
+                    params=params,
+                    headers={"X-QW-Api-Key": self.settings.qweather_api_key or ""},
+                )
+                response.raise_for_status()
+                body = response.json()
+        except httpx.HTTPError:
+            # 和风不认识的地名(如"江浙沪")返回 4xx —— 降级为解析失败, 让上层走澄清/兜底
+            return None
         locations = body.get("location") or []
         if not locations:
             return None

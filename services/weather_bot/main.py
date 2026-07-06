@@ -930,7 +930,10 @@ def create_app(
         task_submission_mode = task is not None
         display_metrics = None if task_submission_mode else weather_metrics_from_text(text)
         unsupported_metrics = [] if task_submission_mode else unsupported_weather_metric_labels(text)
-        if not task_submission_mode and _is_weather_knowledge_question(text) and _needs_region_clarification(text):
+        if not task_submission_mode and _is_weather_knowledge_question(text) and (
+            _needs_region_clarification(text) or len(text) >= 30
+        ):
+            # 咨询词 + (无地区 或 长文本) = 分析类问题(如台风情景推演), 走知识 LLM 而非数据卡片
             return await _handle_weather_knowledge_command(text)
         if not task_submission_mode and unsupported_metrics and not display_metrics:
             return {
@@ -1274,17 +1277,47 @@ def create_app(
         result = await _handle_general_command(text, allowed_bot, event)
         return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
 
+    async def _safe_handle_feishu_event(
+        payload: dict[str, Any],
+        account: FeishuBotAccount,
+        feishu_client: FeishuClient,
+        allowed_bot: str,
+    ) -> dict[str, Any]:
+        try:
+            return await _handle_feishu_event(payload, account, feishu_client, allowed_bot)
+        except HTTPException:
+            raise
+        except Exception:  # noqa: BLE001 - 永不沉默: 任何未预料异常都回复用户并 200
+            logger.exception("feishu_event_unhandled_error allowed_bot=%s", allowed_bot)
+            try:
+                event = payload.get("event", {}) if isinstance(payload, dict) else {}
+                chat_id = _event_chat_id(event)
+                if chat_id:
+                    fallback_text = (
+                        "云云处理这条消息时出了点小状况😥 已经记下来修啦~\n"
+                        "可以换个问法再试试：查天气用「城市 + 未来3天」；分析类问题稍后再问我一次。"
+                    )
+                    incoming_message_id = _event_message_id(event)
+                    thread_id = _event_thread_id(event)
+                    if incoming_message_id and thread_id:
+                        await feishu_client.reply_text_message(incoming_message_id, fallback_text, in_thread=True)
+                    else:
+                        await feishu_client.send_text_message(chat_id, fallback_text)
+            except Exception:  # noqa: BLE001
+                pass
+            return {"status": "error_fallback", "bot_role": _bot_role_for_allowed_bot(allowed_bot)}
+
     @app.post("/feishu/events")
     async def feishu_events(payload: dict[str, Any]) -> dict[str, Any]:
-        return await _handle_feishu_event(payload, legacy_account, legacy_feishu, FEISHU_LEGACY_BOT)
+        return await _safe_handle_feishu_event(payload, legacy_account, legacy_feishu, FEISHU_LEGACY_BOT)
 
     @app.post("/feishu/events/weather")
     async def feishu_weather_events(payload: dict[str, Any]) -> dict[str, Any]:
-        return await _handle_feishu_event(payload, weather_account, weather_feishu, FEISHU_WEATHER_BOT)
+        return await _safe_handle_feishu_event(payload, weather_account, weather_feishu, FEISHU_WEATHER_BOT)
 
     @app.post("/feishu/events/task")
     async def feishu_task_events(payload: dict[str, Any]) -> dict[str, Any]:
-        return await _handle_feishu_event(payload, task_account, task_feishu, FEISHU_TASK_BOT)
+        return await _safe_handle_feishu_event(payload, task_account, task_feishu, FEISHU_TASK_BOT)
 
     return app
 
