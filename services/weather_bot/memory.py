@@ -77,11 +77,12 @@ def preferred_region(bot_role: str, sender_id: str) -> dict | None:
 
 
 def recent_chat_turns(key_prefix: str, limit: int = 12) -> list[dict[str, str]]:
-    """按整个会话(跨发言人)取最近对话: 群里 A 提问、B 说"回答下"也能接上下文。"""
+    """按前缀(同话题跨发言人)取最近对话。chat_id/thread_id 含下划线是 LIKE 通配符, 需转义。"""
     now = time.time()
+    escaped = key_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT role, content, ts FROM turns WHERE k LIKE ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
-            (key_prefix + "%", now - TURN_TTL_SECONDS, limit),
+            "SELECT role, content, ts FROM turns WHERE k LIKE ? ESCAPE '\\' AND ts >= ? ORDER BY ts DESC LIMIT ?",
+            (escaped + "%", now - TURN_TTL_SECONDS, limit),
         ).fetchall()
     return [{"role": role, "content": content} for role, content, _ts in reversed(rows)]

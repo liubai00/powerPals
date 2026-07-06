@@ -299,14 +299,14 @@ def _card_memory_summary(subs) -> str | None:
         return None
 
 
-def _conversation_key(bot_role: str, chat_id: str | None, sender_id: str) -> str:
-    return f"{bot_role}|{chat_id or ''}|{sender_id}"
+def _conversation_key(bot_role: str, chat_id: str | None, thread_id: str | None, sender_id: str) -> str:
+    return f"{bot_role}|{chat_id or ''}|{thread_id or 'main'}|{sender_id}"
 
 
-def _record_conversation_turn(bot_role: str, chat_id: str | None, sender_id: str, user_text: str, bot_text: str) -> None:
+def _record_conversation_turn(bot_role: str, chat_id: str | None, thread_id: str | None, sender_id: str, user_text: str, bot_text: str) -> None:
     if not chat_id or not (user_text or bot_text):
         return
-    key = _conversation_key(bot_role, chat_id, sender_id)
+    key = _conversation_key(bot_role, chat_id, thread_id, sender_id)
     try:
         if user_text and user_text.strip():
             weather_memory.record_turn(key, "user", user_text.strip())
@@ -316,12 +316,13 @@ def _record_conversation_turn(bot_role: str, chat_id: str | None, sender_id: str
         pass
 
 
-def _recent_conversation_turns(bot_role: str, chat_id: str | None, sender_id: str) -> list[dict[str, str]]:
+def _recent_conversation_turns(bot_role: str, chat_id: str | None, thread_id: str | None, sender_id: str) -> list[dict[str, str]]:
     if not chat_id:
         return []
     try:
-        # 按整个会话(跨发言人)取上下文: 群里 A 提问、B 说"回答下"也能接住
-        return weather_memory.recent_chat_turns(f"{bot_role}|{chat_id}|")
+        # 按"话题(thread)"维度、跨发言人取上下文: 同一话题里 A 提问、B 说"回答下"能接住,
+        # 不串到别的话题或主群; 主群消息(无 thread)归入 'main' 桶。
+        return weather_memory.recent_chat_turns(f"{bot_role}|{chat_id}|{thread_id or 'main'}|")
     except Exception:  # noqa: BLE001
         return []
 
@@ -1087,7 +1088,7 @@ def create_app(
     async def _handle_general_command(text: str, allowed_bot: str, event: dict[str, Any] | None = None) -> dict[str, Any]:
         bot_role = _bot_role_for_allowed_bot(allowed_bot)
         history = (
-            _recent_conversation_turns(bot_role, _event_chat_id(event), _event_sender_id(event))
+            _recent_conversation_turns(bot_role, _event_chat_id(event), _event_thread_id(event), _event_sender_id(event))
             if isinstance(event, dict)
             else []
         )
@@ -1606,7 +1607,7 @@ async def _send_feishu_event_response(
         if not _bot_text and result.get("card"):
             _bot_text = _card_memory_summary(_pref_subs) or "[已发送天气卡片]"
         _record_conversation_turn(
-            result.get("bot_role") or "", chat_id, _event_sender_id(event), _event_text(event), _bot_text
+            result.get("bot_role") or "", chat_id, _event_thread_id(event), _event_sender_id(event), _event_text(event), _bot_text
         )
         if _pref_subs:
             weather_memory.remember_query(
