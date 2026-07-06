@@ -5,6 +5,7 @@ import os
 from datetime import date, timedelta
 from services.weather_bot import main as m
 from services.weather_bot.cards import _weather_emoji, _fmt_metric
+from services.weather_bot.typhoon import TyphoonClient, format_active_for_briefing
 
 CHAT_TARGETS = [
     ("国峰运营-AI 实验群", "oc_8a6645e28915e2eefe7768e41773ec08"),
@@ -72,7 +73,7 @@ def _row_line(row):
     return f"{label}　{emoji} {temp}　💨{wind:.0f}　💧{rain:.0f}%　｜ {'、'.join(sig) or '平稳'}"
 
 
-def build_briefing_card(rows, target):
+def build_briefing_card(rows, target, typhoon_block=None):
     signals = [x for x in (_focus_signal(r) for r in rows) if x]
     signals.sort(key=lambda x: -x[0])
     seen, focus_lines = set(), []
@@ -83,10 +84,17 @@ def build_briefing_card(rows, target):
         focus_lines.append(line)
     top_sev = signals[0][0] if signals else 0
     template = {4: "red", 3: "orange", 2: "blue", 1: "grey"}.get(top_sev, "wathet")
+    # 有活跃台风时抬升表头警示色(至少 orange), 台风是全社区级信号
+    if typhoon_block and template in ("grey", "wathet", "blue"):
+        template = "orange"
     if not focus_lines:
         focus_lines = ["😌 各主要市场气象面平稳，供需扰动有限"]
     md = target[5:].replace("-", "/")
-    elements = [
+    elements = []
+    if typhoon_block:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": typhoon_block}})
+        elements.append({"tag": "hr"})
+    elements += [
         {"tag": "div", "text": {"tag": "lark_md", "content": "**🎯 今日焦点**\n" + "\n".join(focus_lines[:4])}},
         {"tag": "hr"},
         {"tag": "div", "text": {"tag": "lark_md", "content": "**📍 分省速览（明日）**\n" + "\n".join(_row_line(r) for r in rows)}},
@@ -116,7 +124,15 @@ async def go() -> None:
     if ok == 0:
         print("ERR 全部省份无数据, 放弃发送")
         return
-    card = build_briefing_card(rows, target)
+    typhoon_block = None
+    try:
+        tc = TyphoonClient(settings.qweather_api_key, settings.qweather_api_host)
+        active = await tc.active_storms()
+        typhoon_block = format_active_for_briefing(active)
+        print("ACTIVE typhoons=%d" % len(active))
+    except Exception as exc:  # noqa: BLE001 - 台风段失败不影响晨报主体
+        print("TYPHOON FETCH FAIL %r" % exc)
+    card = build_briefing_card(rows, target, typhoon_block)
     if os.getenv("DRY_RUN") == "1":
         print("DRY-RUN(不发送) 头部:", card["card"]["header"]["template"], card["card"]["header"]["title"]["content"])
         for element in card["card"]["elements"]:
