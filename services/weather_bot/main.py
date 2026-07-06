@@ -888,6 +888,12 @@ def create_app(
         }
 
     async def _handle_weather_command(text: str) -> dict[str, Any]:
+        if _is_past_weather_query(text):
+            return {
+                "status": "handled",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "text": _past_weather_text(),
+            }
         task_id = _task_id_from_text(text)
         task = _task_from_task_id(task_id) if task_id else None
         if task_id and not task:
@@ -1602,6 +1608,37 @@ def _is_task_submission_command(text: str) -> bool:
     return _task_id_from_text(text) is not None
 
 
+PAST_WEATHER_RE = re.compile(
+    r"历史|回顾|实况|复盘|(昨|前)天|上上?\s*(周|星期|礼拜|个?月)|(过去|最后)\s*[一两二三四五六七八九十0-9]*\s*(天|日|周|星期|礼拜|个?月)|去年"
+)
+_CN_MONTH = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+
+
+def _mentions_past_month(text: str) -> bool:
+    from datetime import datetime as _dt
+
+    current_month = _dt.now().month
+    for token in re.findall(r"([0-9]{1,2}|十[一二]?|[一二三四五六七八九])\s*月", text):
+        value = int(token) if token.isdigit() else _CN_MONTH.get(token, 0)
+        if 1 <= value < current_month:
+            return True
+    return False
+
+
+def _is_past_weather_query(text: str) -> bool:
+    return bool(PAST_WEATHER_RE.search(text)) or _mentions_past_month(text)
+
+
+def _past_weather_text() -> str:
+    return (
+        "云云这边只有**预报**数据（今天起未来 1-16 天），历史 / 实况天气暂时查不了🙏\n"
+        "想看历史实况建议查中国气象局或当地气象台官网。\n"
+        "我可以帮你看未来的，比如：\n"
+        "• 盘锦未来7天\n"
+        "• 盘锦明天天气"
+    )
+
+
 FORECAST_WINDOW_HINT_RE = re.compile(r"今天|今日|明天|明日|后天|大后天|周末|下周|未来|最近|近期|接下来|这几天")
 
 
@@ -1724,7 +1761,7 @@ def _target_date_from_text(text: str) -> str:
 
 
 # 有数量词的「一周/两周」不可能是"周四"这类星期几, 不做排除; 裸"周"(下周/本周)才需防"周X"
-WEEK_COUNT_RE = re.compile(r"([一两二三123])\s*个?\s*(?:周|星期|礼拜)")
+WEEK_COUNT_RE = re.compile(r"(?<![最上过前去后])([一两二三123])\s*个?\s*(?:周|星期|礼拜)")
 WEEK_BARE_RE = re.compile(r"(?:下|这|本)\s*(?:周|星期|礼拜)(?![末一二三四五六日天年])")
 _WEEK_COUNT_WORDS = {"一": 1, "1": 1, "两": 2, "二": 2, "2": 2, "三": 3, "3": 3}
 
