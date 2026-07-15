@@ -130,6 +130,29 @@ def _single_absolute_date(text: str, today: date) -> date | None:
     return None
 
 
+def _xun_span(text: str, today: date) -> tuple[date, int] | None:
+    """上旬(1-10) / 中旬(11-20) / 下旬(21-月末)。可带月份"7月下旬", 缺月取当月。"""
+    m = re.search(rf"(?:({_MONNUM})\s*月)?\s*(上|中|下)\s*旬", text)
+    if not m:
+        return None
+    month = _num(m.group(1)) if m.group(1) else today.month
+    if not month:
+        return None
+    year = today.year
+    xun = m.group(2)
+    if xun == "上":
+        start_day, end_day = 1, 10
+    elif xun == "中":
+        start_day, end_day = 11, 20
+    else:
+        start_day, end_day = 21, _month_last_day(year, month)
+    start = _safe_date(year, month, start_day)
+    end = _safe_date(year, month, end_day)
+    if start and end and end >= start:
+        return start, (end - start).days + 1
+    return None
+
+
 def _month_span(text: str, today: date) -> tuple[date, int] | None:
     """整月 → 月首到月末; 裸 N月(无'整月') → 该月1号单日。"""
     explicit_full = bool(re.search(r"整月|一整月|全月|整个月", text))
@@ -214,6 +237,11 @@ def _parse_date_and_span(text: str, today: date) -> tuple[date, int]:
         start = _date_bare_day(d1, today)
         if start and d1 and d2 and d2 >= d1:
             return start, d2 - d1 + 1
+
+    # 1c) 上/中/下旬(先于整月, 否则"7月下旬"里的"7月"会被当整月)
+    xun = _xun_span(text, today)
+    if xun and xun[0] is not None:
+        return xun
 
     # 2) 单绝对日期(先于"N到M天", 避免 ISO/斜杠里的 '-' 被当区间连接符)
     d = _single_absolute_date(text, today)

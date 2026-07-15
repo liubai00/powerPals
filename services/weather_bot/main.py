@@ -2221,6 +2221,9 @@ def _clean_region_candidate(candidate: str) -> str | None:
         return None
     if any(word in region for word in _REFERENCE_WORDS):
         return None
+    # 日期碎片/"各地区"等泛指被"地区"后缀误抓成地名(如"月下旬各地区"), 剔除
+    if any(frag in region for frag in ("上旬", "中旬", "下旬", "各地", "各区", "各市", "各县", "各省")):
+        return None
     return region
 
 
