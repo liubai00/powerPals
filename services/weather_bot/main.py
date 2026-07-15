@@ -5,6 +5,7 @@ import logging
 import re
 import time
 
+from services.weather_bot import dates as weather_dates
 from services.weather_bot import memory as weather_memory
 from datetime import date, timedelta
 from typing import Any, Awaitable, Callable
@@ -951,6 +952,14 @@ def create_app(
         ):
             # 咨询词 + (无地区 或 长文本) = 分析类问题(如台风情景推演), 走知识 LLM 而非数据卡片
             return await _handle_weather_knowledge_command(text)
+        if not task_submission_mode and _date_span_status(text) == "beyond":
+            # 目标日超出"今天起未来16天"预报窗: 明确提示, 不用近端数据冒充远期
+            return {
+                "status": "handled",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "beyond_horizon",
+                "text": _beyond_horizon_text(),
+            }
         if not task_submission_mode and unsupported_metrics and not display_metrics:
             return {
                 "status": "unsupported_metric",
@@ -1701,7 +1710,7 @@ def _is_task_submission_command(text: str) -> bool:
 
 
 PAST_WEATHER_RE = re.compile(
-    r"历史|回顾|实况|复盘|(昨|前)天|上上?\s*(周|星期|礼拜|个?月)|(过去|最后)\s*[一两二三四五六七八九十0-9]*\s*(天|日|周|星期|礼拜|个?月)|去年"
+    r"历史|回顾|实况|复盘|(昨|前)天|上上?\s*(周|星期|礼拜|个?月)|过去\s*[一两二三四五六七八九十0-9]*\s*(天|日|周|星期|礼拜|个?月)|去年"
 )
 _CN_MONTH = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
 
@@ -1718,7 +1727,8 @@ def _mentions_past_month(text: str) -> bool:
 
 
 def _is_past_weather_query(text: str) -> bool:
-    return bool(PAST_WEATHER_RE.search(text)) or _mentions_past_month(text)
+    # 显式历史词(上周/昨天/去年/过去N天) 或 统一日期引擎解析出的目标日早于今天
+    return bool(PAST_WEATHER_RE.search(text)) or _date_span_status(text) == "past"
 
 
 def _past_weather_text() -> str:
@@ -1728,6 +1738,16 @@ def _past_weather_text() -> str:
         "我可以帮你看未来的，比如：\n"
         "• 盘锦未来7天\n"
         "• 盘锦明天天气"
+    )
+
+
+def _beyond_horizon_text() -> str:
+    return (
+        "云云的预报只到**今天起未来 16 天**，你问的日期超出了这个范围，暂时算不了🙏\n"
+        "换到 16 天以内的日期就行，比如：\n"
+        "• 盘锦未来7天\n"
+        "• 盘锦这周末天气\n"
+        "• 盘锦7月20日天气"
     )
 
 
@@ -1848,12 +1868,12 @@ def _request_from_task(task: WeatherTask) -> ForecastRequest:
 
 
 def _target_date_from_text(text: str) -> str:
-    import re
+    return weather_dates.target_date_from_text(text)
 
-    match = re.search(r"\d{4}-\d{2}-\d{2}", text)
-    if match:
-        return match.group(0)
-    return (date.today() + timedelta(days=1)).isoformat()
+
+def _date_span_status(text: str) -> str:
+    """返回统一日期引擎的窗口状态: ok / truncated / past / beyond。"""
+    return weather_dates.parse_date_span(text)[3]
 
 
 # 有数量词的「一周/两周」不可能是"周四"这类星期几, 不做排除; 裸"周"(下周/本周)才需防"周X"
@@ -1863,20 +1883,7 @@ _WEEK_COUNT_WORDS = {"一": 1, "1": 1, "两": 2, "二": 2, "2": 2, "三": 3, "3"
 
 
 def _days_from_text(text: str) -> int:
-    week_match = WEEK_COUNT_RE.search(text)
-    if week_match:
-        weeks = _WEEK_COUNT_WORDS.get(week_match.group(1), 1)
-        return min(16, weeks * 7)
-    if WEEK_BARE_RE.search(text):
-        return 7
-    prefixed_match = re.search(rf"(?:未来|最近|近|接下来|接着|之后|后面|往后|连续|随后)\s*{DAY_COUNT_TOKEN_RE}\s*(?:天|日)", text)
-    if prefixed_match:
-        return _normalize_day_count(prefixed_match.group(1))
-
-    plain_match = re.search(rf"{DAY_COUNT_TOKEN_RE}\s*天", text)
-    if plain_match:
-        return _normalize_day_count(plain_match.group(1))
-    return 1
+    return weather_dates.days_from_text(text)
 
 
 def _normalize_day_count(token: str) -> int:
