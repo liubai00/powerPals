@@ -101,6 +101,11 @@ def _month_end_date(text: str, today: date) -> date | None:
 
 
 def _single_absolute_date(text: str, today: date) -> date | None:
+    # 节日: 国庆→10/1; "十一"仅在带节日语境(十一天气/假期/长假)时算国庆, "未来十一天"仍走天数
+    if "国庆" in text or re.search(r"十一\s*(?:黄金周|长假|假期|天气|出行|期间|放假|档)", text):
+        return _date_with_month(10, 1, today)
+    if "元旦" in text:
+        return _date_with_month(1, 1, today)
     m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
     if m:
         return _safe_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))

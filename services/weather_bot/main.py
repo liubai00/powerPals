@@ -126,6 +126,21 @@ LOCATION_ALIASES: tuple[tuple[str, str], ...] = (
     ("青海", "青海省"),
     ("台湾省", "台湾省"),
     ("台湾", "台湾省"),
+    # 城市雅号/别称 → 标准市名(交给 geocoding 解析), 避免全靠 LLM 抽取、失败静默回退默认城市
+    ("魔都", "上海市"),
+    ("帝都", "北京市"),
+    ("羊城", "广州市"),
+    ("花城", "广州市"),
+    ("鹏城", "深圳市"),
+    ("春城", "昆明市"),
+    ("山城", "重庆市"),
+    ("冰城", "哈尔滨市"),
+    ("蓉城", "成都市"),
+    ("锦城", "成都市"),
+    ("江城", "武汉市"),
+    ("星城", "长沙市"),
+    ("泉城", "济南市"),
+    ("绿城", "郑州市"),
 )
 LOCATION_ALIAS_MAP = dict(LOCATION_ALIASES)
 DAY_COUNT_WORDS = {
@@ -234,7 +249,7 @@ def _weather_loading_shell() -> str:
 </script>
 </body>
 </html>"""
-COMPARISON_QUERY_KEYWORDS = ("对比", "比较", "相比", "差异", "哪个更", "哪边更")
+COMPARISON_QUERY_KEYWORDS = ("对比", "比较", "相比", "差异", "哪个更", "哪边更", "谁更", "谁热", "谁冷", "更热", "更冷", "哪个热", "哪个冷", "哪个凉快")
 MAX_COMPARISON_REGIONS = 4
 WEATHER_KNOWLEDGE_KEYWORDS = (
     "解释",
@@ -2015,7 +2030,7 @@ def _comparison_regions_from_text(text: str) -> list[str]:
         return []
     if any(keyword in text for keyword in COMPARISON_QUERY_KEYWORDS):
         return regions
-    if any(separator in text for separator in ("和", "与", "跟", "及", "、", "，", ",")):
+    if any(separator in text for separator in ("和", "与", "跟", "及", "、", "，", ",", "或", "还是", "vs", "VS", "对比")):
         return regions
     return []
 
