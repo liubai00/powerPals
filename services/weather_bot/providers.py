@@ -74,14 +74,17 @@ class QWeatherProvider:
         latitude, longitude = _coordinates(request)
         params = {"location": f"{longitude},{latitude}"}
         async with httpx.AsyncClient(timeout=8.0) as client:
-            response = await _get_with_retry(client, 
-                f"https://{self.api_host}/v7/weather/24h",
+            # 168h(7天逐时)而非 24h: 按 target_date 过滤对应日, 避免多日/远期请求被"当前24h"数据污染;
+            # 目标日超出和风覆盖窗时过滤为空, 由 open_meteo 承接, 不用近端数据冒充
+            response = await _get_with_retry(client,
+                f"https://{self.api_host}/v7/weather/168h",
                 params=params,
                 headers={"X-QW-Api-Key": self.api_key or ""},
             )
             response.raise_for_status()
             body = response.json()
-        return ProviderForecast(provider=self.name, status="ok", points=_qweather_points(body), raw=body)
+        points = [point for point in _qweather_points(body) if str(point.time).startswith(request.target_date)]
+        return ProviderForecast(provider=self.name, status="ok", points=points, raw=body)
 
 
 class CaiyunProvider:

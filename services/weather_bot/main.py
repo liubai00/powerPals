@@ -1003,6 +1003,16 @@ def create_app(
                         candidate = trimmed
                 if candidate and candidate != _regex_region and not _is_province_only_region(candidate):
                     llm_region_override = candidate
+                else:
+                    # LLM 未能定位到具体市/县(超时/禁用/只回省名): 不要静默退成省会单点数据, 追问具体城市
+                    days = _days_from_text(text)
+                    return {
+                        "status": "needs_region",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "mode": "clarification",
+                        "days": days,
+                        "text": _region_clarification_text(days, "forecast"),
+                    }
         request = _request_from_task(task) if task_submission_mode else _request_from_text(text)
         if llm_region_override:
             request = request.model_copy(update={"region": llm_region_override})
@@ -1014,6 +1024,11 @@ def create_app(
             submissions, errors = await _collect_cached_forecasts(request)
             if task_submission_mode:
                 submissions = [submission.model_copy(update={"task_id": task.task_id}) for submission in submissions]
+            _card_notice = None
+            if not task_submission_mode:
+                _start, _days, _raw_days, _status = weather_dates.parse_date_span(text)
+                if _status == "truncated":
+                    _card_notice = f"⚠️ 云云最多预报未来 16 天，你问的 {_raw_days} 天已为你取前 {request.days} 天。"
             card = (
                 build_feishu_card(
                     submissions[0],
@@ -1023,6 +1038,7 @@ def create_app(
                     chart_submissions=submissions,
                     show_task_id=task_submission_mode,
                     metrics=display_metrics,
+                    notice=_card_notice,
                 )
                 if submissions
                 else None
@@ -1047,6 +1063,9 @@ def create_app(
             if task_submission_mode:
                 response["task_id"] = task.task_id
                 response["_record_submissions"] = submissions
+            elif submissions:
+                # 即时查询也把真实预报挂上供记忆摘要(温度/降水/风), 让"那适合晾衣服吗"能引用真实数值
+                response["_memory_submissions"] = submissions
             return response
         result = await service.forecast(request)
         _store_cached_forecasts(request, [result], [])
@@ -1076,6 +1095,8 @@ def create_app(
         if task_submission_mode:
             response["task_id"] = task.task_id
             response["_record_submission"] = result
+        else:
+            response["_memory_submissions"] = [result]
         return {
             **response,
         }
@@ -1547,6 +1568,7 @@ async def _send_feishu_event_response(
 ) -> dict[str, Any]:
     submission_to_record = result.pop("_record_submission", None)
     submissions_to_record = result.pop("_record_submissions", None)
+    memory_submissions = result.pop("_memory_submissions", None)  # 即时查询: 仅供记忆, 不写 Bitable
     chat_id = _event_chat_id(event)
     if not chat_id or result.get("status") == "ignored":
         if isinstance(submission_to_record, WeatherSubmission) and record_submission:
@@ -1631,6 +1653,8 @@ async def _send_feishu_event_response(
         _pref_subs = (
             submissions_to_record
             if isinstance(submissions_to_record, list)
+            else memory_submissions
+            if isinstance(memory_submissions, list)
             else ([submission_to_record] if isinstance(submission_to_record, WeatherSubmission) else [])
         )
         _pref_subs = [s for s in _pref_subs if isinstance(s, WeatherSubmission)]

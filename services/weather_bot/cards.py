@@ -216,6 +216,7 @@ def build_feishu_card(
     show_task_id: bool = False,
     include_submission_note: bool = False,
     metrics: list[str] | None = None,
+    notice: str | None = None,
 ) -> dict:
     chart_items = chart_submissions or [submission]
     selected_metrics = normalize_weather_metrics(metrics)
@@ -236,7 +237,10 @@ def build_feishu_card(
     if _sm.sunrise and _sm.sunset:
         scope_bits.append(f"日出 {_sm.sunrise} · 日落 {_sm.sunset}")
     meta_note = "　·　".join(scope_bits)
-    elements = [
+    elements = []
+    if notice:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": notice}})
+    elements += [
         {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(first_lines)}},
         {"tag": "note", "elements": [{"tag": "plain_text", "content": meta_note}]},
         {"tag": "hr"},
