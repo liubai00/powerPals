@@ -337,9 +337,13 @@ def _recent_conversation_turns(bot_role: str, chat_id: str | None, thread_id: st
     if not chat_id:
         return []
     try:
-        # 按"话题(thread)"维度、跨发言人取上下文: 同一话题里 A 提问、B 说"回答下"能接住,
-        # 不串到别的话题或主群; 主群消息(无 thread)归入 'main' 桶。
-        return weather_memory.recent_chat_turns(f"{bot_role}|{chat_id}|{thread_id or 'main'}|")
+        if thread_id:
+            # 话题(thread)内跨发言人: A 提问、B 说"回答下"能接住, 不串到别的话题
+            prefix = f"{bot_role}|{chat_id}|{thread_id}|"
+        else:
+            # 无话题的普通群消息: 按发言人各自隔离, A 问盘锦、B 问上海互不串味
+            prefix = f"{bot_role}|{chat_id}|main|{sender_id}"
+        return weather_memory.recent_chat_turns(prefix)
     except Exception:  # noqa: BLE001
         return []
 
@@ -1259,7 +1263,12 @@ def create_app(
             logger.warning("feishu_event_duplicate allowed_bot=%s message_id=%s", allowed_bot, message_id)
             return {"status": "ignored", "reason": "duplicate_message", "bot_role": _bot_role_for_allowed_bot(allowed_bot)}
 
-        if allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_TASK_BOT} and not _is_addressed_to_bot(text, event, allowed_bot):
+        if (
+            allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_TASK_BOT}
+            and not _is_addressed_to_bot(text, event, allowed_bot)
+            # 气象 bot「云云」: 明确天气查询(自带城市/经纬度/台风/对比)免@也自动回; 其余仍需@
+            and not (allowed_bot == FEISHU_WEATHER_BOT and _is_clear_weather_query(text))
+        ):
             return {"status": "ignored", "bot_role": _bot_role_for_allowed_bot(allowed_bot)}
 
         if _is_help_command(text):
@@ -1526,6 +1535,19 @@ def _is_direct_chat(event: dict[str, Any]) -> bool:
     if not chat_type:
         chat_type = event.get("chat_type")
     return str(chat_type).lower() in {"p2p", "private", "single", "direct"}
+
+
+def _is_clear_weather_query(text: str) -> bool:
+    """群里未被@时, 仅"自带地点/经纬度/台风/多地对比"的明确天气查询才免@自动回;
+    无城市的"会下雨吗"、跟进短语、闲聊等一律不触发, 避免在群里插话刷屏。"""
+    if not _is_weather_command(text):
+        return False
+    return bool(
+        _explicit_region_from_text(text)
+        or _coordinates_from_text(text)
+        or mentions_typhoon(text)
+        or len(_comparison_regions_from_text(text)) >= 2
+    )
 
 
 def _bot_aliases(allowed_bot: str) -> list[str]:
