@@ -2042,12 +2042,19 @@ def _has_extra_place_after_province(text: str, province: str) -> bool:
 
 def _explicit_region_from_text(text: str) -> str | None:
     search_text = _location_search_text(text)
-    known_regions = sorted(BUILTIN_LOCATIONS.keys(), key=len, reverse=True)
-    for region in known_regions:
-        if _region_matches_text(search_text, region):
-            return region
-
+    # 带行政后缀(区/县/市/新区)的候选, 比裸 builtin 键更具体
     suffixed_region = _suffixed_region_from_text(search_text)
+    builtin_region = None
+    for region in sorted(BUILTIN_LOCATIONS.keys(), key=len, reverse=True):
+        if _region_matches_text(search_text, region):
+            builtin_region = region
+            break
+
+    # 后缀候选更长(更具体)时优先, 修复"上海浦东新区"命中 builtin 键"上海"就整市返回、区县被吞
+    if suffixed_region and (builtin_region is None or len(suffixed_region) > len(builtin_region)):
+        return LOCATION_ALIAS_MAP.get(suffixed_region, suffixed_region)
+    if builtin_region:
+        return builtin_region
     if suffixed_region:
         return LOCATION_ALIAS_MAP.get(suffixed_region, suffixed_region)
 
