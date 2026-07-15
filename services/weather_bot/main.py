@@ -24,7 +24,7 @@ from services.weather_bot.models import ForecastRequest, SubmissionRecord, Weath
 from services.weather_bot.service import ForecastService
 from services.weather_bot.search import TavilySearchClient
 from services.weather_bot.storage import JsonlRecorder
-from services.weather_bot.typhoon import TyphoonClient
+from services.weather_bot.typhoon import TyphoonClient, mentions_typhoon
 from services.weather_bot.task_cards import build_task_card, build_task_text
 from services.weather_bot.tasks import WeatherTask, WeatherTaskRequest, WeatherTaskService
 from services.weather_bot.workbench import (
@@ -935,6 +935,9 @@ def create_app(
                 "bot_role": WEATHER_FORECAST_BOT_ROLE,
                 "text": _past_weather_text(),
             }
+        # 台风问句直接走知识处理器: 拉和风实时路径做权威 grounding, 不当成城市卡片查询
+        if typhoon_client.enabled and mentions_typhoon(text):
+            return await _handle_weather_knowledge_command(text)
         task_id = _task_id_from_text(text)
         task = _task_from_task_id(task_id) if task_id else None
         if task_id and not task:
@@ -1071,6 +1074,10 @@ def create_app(
         _store_cached_forecasts(request, [result], [])
         if task_submission_mode:
             result = result.model_copy(update={"task_id": task.task_id})
+        _single_notice = None
+        if not task_submission_mode and unsupported_metrics and display_metrics:
+            # 混合指标: 展示了支持的, 但别静默吞掉不支持的, 明确告知
+            _single_notice = f"ℹ️ {'、'.join(unsupported_metrics)} 云云暂未接入，本卡片未包含。"
         card = build_feishu_card(
             result,
             report_url=report_url,
@@ -1078,6 +1085,7 @@ def create_app(
             json_url=json_url,
             show_task_id=task_submission_mode,
             metrics=display_metrics,
+            notice=_single_notice,
         )
         response = {
             "status": "handled",
@@ -1789,6 +1797,12 @@ def _is_weather_command(text: str) -> bool:
         return True
     if has_weather_metric_keyword(text):
         return True
+    # 台风问句(无天气词也算): 走天气命令→知识处理器做实时 grounding, 不落闲聊 LLM
+    if mentions_typhoon(text):
+        return True
+    # 多地对比意图(如"对比广州和深圳"/"广州和深圳哪个更热"): 无天气词也识别为天气查询
+    if len(_comparison_regions_from_text(text)) >= 2:
+        return True
     # 意图增强: 「时间窗口 + (已知地区 或 强预报窗)」视为天气查询;
     # 地名不在词表时(如"盘锦未来7天")留给 LLM 兜底抽取
     if _has_forecast_window_hint(text):
@@ -2112,6 +2126,16 @@ def _suffixed_region_from_text(text: str) -> str | None:
     return None
 
 
+# 宏观大区不是可解析城市, 命中改走澄清而非硬 geocode(否则错点或抛错→通用报错)
+_MACRO_REGIONS = frozenset({
+    "华南", "华北", "华东", "华中", "西南", "西北", "东北", "华南地区", "华北地区", "华东地区",
+    "华中地区", "西南地区", "西北地区", "东北地区", "江浙沪", "长三角", "珠三角", "京津冀", "东部",
+    "西部", "南方", "北方", "全国",
+})
+# 指代短语不是地名(如"刚才那个城市"), 别当城市 geocode; 让其落到带 history 的对话 LLM 去解析指代
+_REFERENCE_WORDS = ("那个", "这个", "刚才", "刚说", "上面", "前面", "同一个", "上述", "那边", "那里", "这里")
+
+
 def _clean_region_candidate(candidate: str) -> str | None:
     region = candidate.strip(" ，,。；;：:")
     changed = True
@@ -2121,7 +2145,13 @@ def _clean_region_candidate(candidate: str) -> str | None:
             if region.startswith(prefix):
                 region = region[len(prefix) :].strip(" ，,。；;：:")
                 changed = True
-    return region or None
+    if not region:
+        return None
+    if region in _MACRO_REGIONS:
+        return None
+    if any(word in region for word in _REFERENCE_WORDS):
+        return None
+    return region
 
 
 def _coordinates_from_text(text: str) -> tuple[float, float] | None:

@@ -8,7 +8,10 @@ SUPPORTED_WEATHER_METRIC_ORDER: tuple[str, ...] = ("temperature", "rain", "wind"
 SUPPORTED_WEATHER_METRICS: dict[str, dict[str, object]] = {
     "temperature": {
         "label": "温度",
-        "aliases": ("温度", "气温", "最高温", "最低温", "冷热", "热不热", "冷不冷"),
+        # 体感随温度在卡片展示, 故"体感"归入温度; "更热/热吗/凉快"等口语也触发温度(不用裸"热/冷"避免误匹配)
+        "aliases": ("温度", "气温", "最高温", "最低温", "冷热", "热不热", "冷不冷",
+                    "更热", "更冷", "凉快", "闷热", "炎热", "多热", "多冷", "热吗", "冷吗", "热一点", "冷一点",
+                    "体感", "体感温度"),
     },
     "rain": {
         "label": "降水",
@@ -16,7 +19,8 @@ SUPPORTED_WEATHER_METRICS: dict[str, dict[str, object]] = {
     },
     "wind": {
         "label": "风速",
-        "aliases": ("风速", "风力", "大风", "强风", "风大"),
+        # 风向随风速在卡片展示, 故"风向"归入风
+        "aliases": ("风速", "风力", "大风", "强风", "风大", "风向"),
     },
     "cloud": {
         "label": "云量",
@@ -29,10 +33,8 @@ UNSUPPORTED_WEATHER_METRICS: dict[str, dict[str, object]] = {
     "pressure": {"label": "气压", "aliases": ("气压", "大气压", "海平面气压")},
     "air_quality": {"label": "空气质量/AQI", "aliases": ("空气质量", "AQI", "aqi", "PM2.5", "pm2.5", "PM10", "臭氧", "O3", "o3")},
     "visibility": {"label": "能见度", "aliases": ("能见度",)},
-    "uv_index": {"label": "紫外线", "aliases": ("紫外线", "UV", "uv")},
-    "feels_like": {"label": "体感温度", "aliases": ("体感", "体感温度")},
+    # 紫外线(整卡已展示)/体感(→温度)/风向(→风) 已改为受支持, 不再误报"未接入"
     "precipitation_amount": {"label": "降水量/雨量", "aliases": ("雨量", "降雨量", "降水量", "多少毫米", "mm", "毫米")},
-    "wind_direction": {"label": "风向", "aliases": ("风向", "东风", "南风", "西风", "北风")},
     "weather_warning": {"label": "气象预警", "aliases": ("预警", "警报", "气象警报", "气象预警")},
     "solar_radiation": {"label": "日照/辐射", "aliases": ("日照", "辐射", "太阳辐射")},
     "dew_point": {"label": "露点", "aliases": ("露点",)},
