@@ -78,7 +78,12 @@ def run_feishu_ws_bot(role: str | None = None, settings: Settings | None = None)
         .build()
     )
     logger.info("Starting Feishu WebSocket bot role=%s endpoint=%s", bot.role, bot.endpoint_path)
-    ws.Client(bot.app_id, bot.app_secret, event_handler=event_handler).start()
+    ws.Client(
+        bot.app_id,
+        bot.app_secret,
+        event_handler=event_handler,
+        log_level=lark.LogLevel.WARNING,
+    ).start()
 
 
 def _ws_bot_config(settings: Settings, role: str) -> WsBotConfig:

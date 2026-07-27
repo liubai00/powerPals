@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 
+import services.weather_bot.feishu_ws as feishu_ws
 from services.weather_bot.config import Settings
-from services.weather_bot.feishu_ws import _sdk_event_payload, _ws_bot_config
+from services.weather_bot.feishu_ws import _sdk_event_payload, _ws_bot_config, run_feishu_ws_bot
 
 
 def test_weather_ws_bot_uses_role_specific_or_legacy_credentials():
@@ -48,3 +49,25 @@ def test_sdk_event_payload_adds_verification_token():
 
     assert payload["header"]["token"] == "weather-token"
     assert payload["event"]["message"]["message_id"] == "om_1"
+
+
+def test_ws_client_suppresses_sdk_info_logs_that_include_connection_credentials(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, app_id, app_secret, **kwargs):
+            captured.update(app_id=app_id, app_secret=app_secret, **kwargs)
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(feishu_ws.ws, "Client", FakeClient)
+    settings = Settings(
+        feishu_weather_app_id="weather-app",
+        feishu_weather_app_secret="weather-secret",
+    )
+
+    run_feishu_ws_bot(role="weather", settings=settings)
+
+    assert captured["log_level"] == feishu_ws.lark.LogLevel.WARNING
+    assert captured["started"] is True
