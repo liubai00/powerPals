@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 from services.weather_bot import memory as weather_memory
 from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuClient
-from services.weather_bot.main import _event_thread_id, create_app
+from services.weather_bot.main import (
+    _event_thread_id,
+    _is_power_briefing_command,
+    create_app,
+)
 from services.weather_bot.models import (
     AggregatedForecast,
     ForecastPoint,
@@ -324,6 +328,45 @@ def test_task_query_remind_and_close_use_last_task_in_same_conversation(
     assert closed["mode"] == "task_close"
     assert closed["task"]["status"] == "closed"
     assert service.requests == []
+
+
+def test_manual_power_briefing_command_returns_card_without_region_clarification(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        result = _post(
+            client,
+            _event(
+                "请生成今天的电力气象决策晨报 2.0，展示今日和明日的 Top 5 气象风险、"
+                "连续风险时段、较今日变化、置信度，以及负荷、光伏和地面风资源代理排行。",
+                message_id="briefing-m1",
+            ),
+        )
+
+    assert result["status"] == "handled"
+    assert result["mode"] == "power_briefing"
+    assert result["coverage"] == "11/11"
+    assert result["card"]["card"]["header"]["title"]["content"].startswith("⚡ 电力气象决策晨报 2.0")
+    assert len(service.requests) == 22
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("生成今天的电力气象决策晨报 2.0", True),
+        ("今天的电力气象晨报", True),
+        ("预览晨报2.0", True),
+        ("电力气象晨报应该包含什么", False),
+        ("晨报有哪些业务指标", False),
+    ],
+)
+def test_power_briefing_intent_requires_a_generation_request(text: str, expected: bool) -> None:
+    assert _is_power_briefing_command(text) is expected
 
 
 def test_chinese_window_day_is_not_parsed_as_calendar_day() -> None:

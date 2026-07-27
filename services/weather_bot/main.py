@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -1023,6 +1024,50 @@ def create_app(
             ),
         }
 
+    async def _handle_power_briefing_command() -> dict[str, Any]:
+        from services.weather_bot.power_briefing import (
+            MARKET_POINTS,
+            _fetch,
+            build_briefing_card,
+            format_active_for_briefing,
+        )
+
+        start_date = date.today().isoformat()
+        rows = list(
+            await asyncio.gather(
+                *[_fetch(service, market, city, start_date) for market, city in MARKET_POINTS]
+            )
+        )
+        tomorrow_date = (date.today() + timedelta(days=1)).isoformat()
+        covered = sum(
+            1 for row in rows if (row.get("submissions") or {}).get(tomorrow_date) is not None
+        )
+        coverage = f"{covered}/{len(rows)}"
+        if covered == 0:
+            return {
+                "status": "briefing_unavailable",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "power_briefing",
+                "coverage": coverage,
+                "text": "本次没有取得可用的明日市场气象数据，晨报未生成。请稍后重试。",
+            }
+
+        typhoon_block = None
+        if typhoon_client.enabled:
+            try:
+                typhoon_block = format_active_for_briefing(await typhoon_client.active_storms())
+            except Exception:  # noqa: BLE001 - 台风段失败不影响晨报主体
+                logger.exception("manual_power_briefing_typhoon_failed")
+
+        return {
+            "status": "handled",
+            "bot_role": WEATHER_FORECAST_BOT_ROLE,
+            "mode": "power_briefing",
+            "coverage": coverage,
+            "date_range": [start_date, tomorrow_date],
+            "card": build_briefing_card(rows, start_date, typhoon_block=typhoon_block),
+        }
+
     async def _handle_weather_command(text: str) -> dict[str, Any]:
         if _is_past_weather_query(text) and not _is_weather_knowledge_question(text):
             return {
@@ -1413,6 +1458,20 @@ def create_app(
             _clear_pending_region(event, allowed_bot)
             result = {"status": "handled", "bot_role": _bot_role_for_allowed_bot(allowed_bot), "text": _help_text(allowed_bot)}
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
+
+        if _is_power_briefing_command(text):
+            _clear_pending_region(event, allowed_bot)
+            if allowed_bot == FEISHU_TASK_BOT:
+                result = _redirect_to_bot_command(WEATHER_TASK_BOT_ROLE, WEATHER_FORECAST_BOT_ROLE)
+            else:
+                await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
+                result = await _handle_power_briefing_command()
+            return await _send_feishu_event_response(
+                feishu_client,
+                event,
+                result,
+                _record_task_submission,
+            )
 
         pending_result = await _handle_pending_region_reply(text, event, allowed_bot, feishu_client)
         if pending_result:
@@ -2244,6 +2303,21 @@ def _is_task_command(text: str) -> bool:
     )
 
 
+def _is_power_briefing_command(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    has_briefing_name = (
+        "电力气象决策晨报" in compact
+        or "电力气象晨报" in compact
+        or "晨报2.0" in compact
+    )
+    has_generate_action = any(
+        keyword in compact
+        for keyword in ("生成", "出一份", "出个", "预览", "查看", "给我", "测试")
+    )
+    concise_daily_request = bool(re.fullmatch(r"(?:今天|今日|明天)?(?:的)?(?:电力气象)?晨报(?:2\.0)?", compact))
+    return has_briefing_name and (has_generate_action or concise_daily_request)
+
+
 def _task_action_from_text(text: str) -> str | None:
     if any(keyword in text for keyword in ("关闭", "结束", "终止", "截止任务")):
         return "close"
@@ -2739,12 +2813,14 @@ def _help_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
         "3. **逐小时** — 小时级变化，适合排出行、看电力负荷",
         "4. **风险解读** — 降雨 / 降温 / 大风的时段和影响范围",
         "5. **数据源** — 预报来源、口径和不确定性说明",
+        "6. **生成晨报** — 今日 + 明日电力气象决策晨报 2.0",
         "",
         "💬 **你可以这样问我**",
         "• @云云 广州明天天气",
         "• @云云 武汉未来三天天气",
         "• @云云 北京气象预测 2026-06-10",
         "• @云云 22.8016,113.5252 明天天气",
+        "• @云云 生成今天的电力气象决策晨报 2.0",
     ]
     task_help = [
         "📋 大家好，我是点点，PowerPals 的气象任务小助手~",
