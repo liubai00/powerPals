@@ -49,7 +49,7 @@ def run_feishu_ws_bot(role: str | None = None, settings: Settings | None = None)
         response = httpx.post(
             f"{internal_base_url}{bot.endpoint_path}",
             json=payload,
-            timeout=120.0,
+            timeout=max(30.0, settings.feishu_internal_timeout_seconds),
         )
         if response.status_code >= 400:
             logger.warning(

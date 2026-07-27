@@ -22,6 +22,7 @@ from services.weather_bot.models import (
     ForecastSummary,
     WeatherSubmission,
 )
+from services.weather_bot.power_briefing import MARKET_POINTS
 
 
 class CapturingForecastService:
@@ -74,6 +75,9 @@ def _settings() -> Settings:
         feishu_verification_token=None,
         feishu_encrypt_key=None,
         llm_api_key=None,
+        power_briefing_cache_db=str(
+            Path("data") / ".test-memory" / f"briefing-{uuid4().hex}.db"
+        ),
     )
 
 
@@ -273,6 +277,21 @@ def test_duplicate_event_is_deduplicated_across_app_restart(monkeypatch, isolate
     assert result["status"] == "ignored"
 
 
+def test_event_processing_lease_covers_nationwide_briefing_window(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(weather_memory.time, "time", lambda: clock["now"])
+
+    assert weather_memory.claim_event("weather", "long-briefing")
+    clock["now"] += 600
+    assert not weather_memory.claim_event("weather", "long-briefing")
+    clock["now"] += 301
+    assert weather_memory.claim_event("weather", "long-briefing")
+
+
 def test_failed_event_can_be_retried_with_same_event_id(monkeypatch, isolated_db_path) -> None:
     _patch_isolated_memory(monkeypatch, isolated_db_path)
     service = CapturingForecastService()
@@ -350,9 +369,11 @@ def test_manual_power_briefing_command_returns_card_without_region_clarification
 
     assert result["status"] == "handled"
     assert result["mode"] == "power_briefing"
-    assert result["coverage"] == "11/11"
+    assert result["coverage"]["provincial_areas"] == {"covered": 31, "total": 31}
+    assert result["coverage"]["markets"]["covered"] == 33
+    assert result["coverage"]["points"] == {"covered": 75, "total": 75, "missing": 0}
     assert result["card"]["card"]["header"]["title"]["content"].startswith("⚡ 电力气象决策晨报 2.0")
-    assert len(service.requests) == 22
+    assert len(service.requests) == len(MARKET_POINTS) * 2
 
 
 @pytest.mark.parametrize(
@@ -367,6 +388,205 @@ def test_manual_power_briefing_command_returns_card_without_region_clarification
 )
 def test_power_briefing_intent_requires_a_generation_request(text: str, expected: bool) -> None:
     assert _is_power_briefing_command(text) is expected
+
+
+def test_expand_all_markets_uses_cached_snapshot_and_isolates_conversation(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        generated = _post(
+            client,
+            _event(
+                "生成今天的电力气象决策晨报 2.0",
+                message_id="briefing-generate",
+                chat_id="chat-a",
+                sender_id="user-a",
+                thread_id="thread-a",
+            ),
+        )
+        requests_after_generation = len(service.requests)
+        expanded = _post(
+            client,
+            _event(
+                "展开全部市场",
+                message_id="briefing-expand",
+                chat_id="chat-a",
+                sender_id="user-a",
+                thread_id="thread-a",
+            ),
+        )
+        other_user = _post(
+            client,
+            _event(
+                "展开全部市场",
+                message_id="briefing-other-user",
+                chat_id="chat-a",
+                sender_id="user-b",
+                thread_id="thread-a",
+            ),
+        )
+        other_chat = _post(
+            client,
+            _event(
+                "展开全部市场",
+                message_id="briefing-other-chat",
+                chat_id="chat-b",
+                sender_id="user-a",
+                thread_id="thread-a",
+            ),
+        )
+        other_thread = _post(
+            client,
+            _event(
+                "展开全部市场",
+                message_id="briefing-other-thread",
+                chat_id="chat-a",
+                sender_id="user-a",
+                thread_id="thread-b",
+            ),
+        )
+
+    assert generated["cache_hit"] is False
+    assert expanded["status"] == "handled"
+    assert expanded["mode"] == "power_briefing_expand"
+    assert expanded["cache_hit"] is True
+    assert "全部明细" in expanded["card"]["card"]["header"]["title"]["content"]
+    assert len(service.requests) == requests_after_generation
+    assert other_user["status"] == "needs_briefing_context"
+    assert other_chat["status"] == "needs_briefing_context"
+    assert other_thread["status"] == "needs_briefing_context"
+
+
+def test_top_level_briefing_can_expand_from_reply_thread_without_cross_user_leak(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        generated = _post(
+            client,
+            _event(
+                "生成今天的电力气象决策晨报 2.0",
+                message_id="briefing-top-level",
+                chat_id="chat-a",
+                sender_id="user-a",
+            ),
+        )
+        requests_after_generation = len(service.requests)
+        expanded = _post(
+            client,
+            _event(
+                "展开全部分析区",
+                message_id="briefing-thread-expand",
+                chat_id="chat-a",
+                sender_id="user-a",
+                root_id=generated["event_reply_message_id"],
+            ),
+        )
+        other_user = _post(
+            client,
+            _event(
+                "展开全部分析区",
+                message_id="briefing-thread-other-user",
+                chat_id="chat-a",
+                sender_id="user-b",
+                root_id=generated["event_reply_message_id"],
+            ),
+        )
+
+    assert expanded["status"] == "handled"
+    assert expanded["mode"] == "power_briefing_expand"
+    assert len(service.requests) == requests_after_generation
+    assert other_user["status"] == "needs_briefing_context"
+
+
+def test_scheduled_briefing_thread_pointer_allows_any_replying_user_to_expand(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    from scripts import daily_power_briefing
+
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        generated = _post(
+            client,
+            _event(
+                "生成今天的电力气象决策晨报 2.0",
+                message_id="scheduled-seed",
+                chat_id="scheduled-chat",
+                sender_id="operator",
+                chat_type="group",
+            ),
+        )
+        remember = getattr(
+            daily_power_briefing,
+            "_remember_scheduled_briefing_thread",
+            None,
+        )
+        assert callable(remember)
+        remember(
+            "scheduled-chat",
+            "scheduled-card-message",
+            generated["briefing_cache_key"],
+            generated["generated_at"],
+        )
+        requests_after_generation = len(service.requests)
+        expanded = _post(
+            client,
+            _event(
+                "展开全部分析区",
+                message_id="scheduled-expand",
+                chat_id="scheduled-chat",
+                sender_id="reader",
+                chat_type="group",
+                root_id="scheduled-card-message",
+            ),
+        )
+        unrelated_thread = _post(
+            client,
+            _event(
+                "展开全部分析区",
+                message_id="scheduled-unrelated",
+                chat_id="scheduled-chat",
+                sender_id="reader",
+                chat_type="group",
+                root_id="another-message",
+            ),
+        )
+
+    assert expanded["status"] == "handled"
+    assert expanded["mode"] == "power_briefing_expand"
+    assert len(service.requests) == requests_after_generation
+    assert unrelated_thread["status"] == "needs_briefing_context"
+
+
+def test_expand_all_markets_without_prior_briefing_does_not_fetch(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        result = _post(
+            client,
+            _event("查看全部市场", message_id="briefing-no-context"),
+        )
+
+    assert result["status"] == "needs_briefing_context"
+    assert service.requests == []
 
 
 def test_chinese_window_day_is_not_parsed_as_calendar_day() -> None:

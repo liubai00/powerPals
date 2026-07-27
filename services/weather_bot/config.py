@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     llm_timeout: float = 60.0
     tavily_api_key: str | None = None
     feishu_progress_message_enabled: bool = False
+    feishu_internal_timeout_seconds: float = 600.0
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
     feishu_verification_token: str | None = None
@@ -40,6 +41,8 @@ class Settings(BaseSettings):
     local_locations_path: str = "data/locations.json"
     local_news_jsonl_path: str = "data/news_items.jsonl"
     local_hydrology_jsonl_path: str = "data/hydrology_records.jsonl"
+    power_briefing_cache_db: str = "data/power_briefing_cache.db"
+    power_briefing_cache_ttl_seconds: int = 86400
     public_base_url: str | None = None
     default_weather_region: str = "广东省深圳市"
     default_weather_latitude: float | None = None

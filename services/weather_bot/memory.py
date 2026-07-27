@@ -17,7 +17,9 @@ TURN_TTL_SECONDS = 7 * 24 * 3600
 TURN_MAX_PER_KEY = 12
 STATE_TTL_SECONDS = 7 * 24 * 3600
 EVENT_TTL_SECONDS = 7 * 24 * 3600
-EVENT_PROCESSING_TIMEOUT_SECONDS = 120
+# 全国晨报的单次生成/等待上限是 600 秒。事件处理租期必须覆盖该窗口，
+# 否则飞书重投同一 event_id 时可能产生第二个回复处理者。
+EVENT_PROCESSING_TIMEOUT_SECONDS = 15 * 60
 
 
 def _conn() -> sqlite3.Connection:

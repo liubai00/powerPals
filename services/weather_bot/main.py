@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -8,7 +7,7 @@ import time
 
 from services.weather_bot import dates as weather_dates
 from services.weather_bot import memory as weather_memory
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
 
@@ -1024,48 +1023,80 @@ def create_app(
             ),
         }
 
-    async def _handle_power_briefing_command() -> dict[str, Any]:
+    async def _handle_power_briefing_command(
+        text: str,
+        event: dict[str, Any],
+    ) -> dict[str, Any]:
+        from services.weather_bot.briefing_cache import BriefingCache
         from services.weather_bot.power_briefing import (
-            MARKET_POINTS,
-            _fetch,
-            build_briefing_card,
-            format_active_for_briefing,
+            SHANGHAI_TZ,
+            get_or_generate_briefing,
         )
 
-        start_date = date.today().isoformat()
-        rows = list(
-            await asyncio.gather(
-                *[_fetch(service, market, city, start_date) for market, city in MARKET_POINTS]
+        cache = BriefingCache(
+            settings.power_briefing_cache_db,
+            ttl_seconds=settings.power_briefing_cache_ttl_seconds,
+        )
+        if _is_power_briefing_expand_command(text):
+            state = _load_conversation_state(event, WEATHER_FORECAST_BOT_ROLE) or {}
+            if not state.get("last_power_briefing_cache_key"):
+                state = (
+                    _load_shared_briefing_thread_state(
+                        event,
+                        WEATHER_FORECAST_BOT_ROLE,
+                    )
+                    or state
+                )
+            cache_key = state.get("last_power_briefing_cache_key")
+            snapshot = cache.load_fresh(str(cache_key)) if cache_key else None
+            if snapshot is None:
+                return {
+                    "status": "needs_briefing_context",
+                    "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                    "mode": "power_briefing_expand",
+                    "text": "当前会话没有可展开的有效晨报快照。请先发送“生成今天的电力气象决策晨报 2.0”。",
+                }
+            return {
+                "status": "handled",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "power_briefing_expand",
+                "coverage": snapshot["coverage"],
+                "cache_hit": True,
+                "briefing_cache_key": snapshot["cache_key"],
+                "generated_at": snapshot["generated_at"],
+                "expires_at": snapshot["expires_at"],
+                "card": snapshot["detail_card"],
+            }
+
+        start_date = datetime.now(SHANGHAI_TZ).date().isoformat()
+        tomorrow_date = (date.fromisoformat(start_date) + timedelta(days=1)).isoformat()
+        try:
+            snapshot, cache_hit = await get_or_generate_briefing(
+                service,
+                typhoon_client,
+                start_date,
+                cache=cache,
             )
-        )
-        tomorrow_date = (date.today() + timedelta(days=1)).isoformat()
-        covered = sum(
-            1 for row in rows if (row.get("submissions") or {}).get(tomorrow_date) is not None
-        )
-        coverage = f"{covered}/{len(rows)}"
-        if covered == 0:
+        except Exception:  # noqa: BLE001 - 手动晨报失败返回可重试提示
+            logger.exception("manual_power_briefing_failed")
             return {
                 "status": "briefing_unavailable",
                 "bot_role": WEATHER_FORECAST_BOT_ROLE,
                 "mode": "power_briefing",
-                "coverage": coverage,
-                "text": "本次没有取得可用的明日市场气象数据，晨报未生成。请稍后重试。",
+                "text": "本次没有取得足够的全国代表点气象数据，晨报未生成。请稍后重试。",
             }
-
-        typhoon_block = None
-        if typhoon_client.enabled:
-            try:
-                typhoon_block = format_active_for_briefing(await typhoon_client.active_storms())
-            except Exception:  # noqa: BLE001 - 台风段失败不影响晨报主体
-                logger.exception("manual_power_briefing_typhoon_failed")
-
         return {
             "status": "handled",
             "bot_role": WEATHER_FORECAST_BOT_ROLE,
             "mode": "power_briefing",
-            "coverage": coverage,
+            "coverage": snapshot["coverage"],
+            "statistics": snapshot["statistics"],
+            "cache_hit": cache_hit,
+            "briefing_cache_key": snapshot["cache_key"],
+            "generated_at": snapshot["generated_at"],
+            "expires_at": snapshot["expires_at"],
             "date_range": [start_date, tomorrow_date],
-            "card": build_briefing_card(rows, start_date, typhoon_block=typhoon_block),
+            "card": snapshot["summary_card"],
         }
 
     async def _handle_weather_command(text: str) -> dict[str, Any]:
@@ -1465,7 +1496,7 @@ def create_app(
                 result = _redirect_to_bot_command(WEATHER_TASK_BOT_ROLE, WEATHER_FORECAST_BOT_ROLE)
             else:
                 await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
-                result = await _handle_power_briefing_command()
+                result = await _handle_power_briefing_command(text, event)
             return await _send_feishu_event_response(
                 feishu_client,
                 event,
@@ -1781,6 +1812,27 @@ def _load_conversation_state(event: dict[str, Any], bot_role: str) -> dict[str, 
         return None
 
 
+def _load_shared_briefing_thread_state(
+    event: dict[str, Any],
+    bot_role: str,
+) -> dict[str, Any] | None:
+    chat_id = _event_chat_id(event)
+    thread_id = _event_thread_id(event)
+    if not chat_id or not thread_id:
+        return None
+    key = _conversation_key(
+        bot_role,
+        chat_id,
+        thread_id,
+        "*",
+        _event_chat_type(event),
+    )
+    try:
+        return weather_memory.load_conversation_state(key)
+    except Exception:  # noqa: BLE001 - memory is best effort
+        return None
+
+
 def _clear_conversation_state(event: dict[str, Any], bot_role: str) -> None:
     key = _conversation_state_key(event, bot_role)
     if not key:
@@ -2010,6 +2062,27 @@ async def _send_feishu_event_response(
             _bot_text,
             _event_chat_type(event),
         )
+        briefing_cache_key = result.get("briefing_cache_key")
+        if (
+            isinstance(briefing_cache_key, str)
+            and briefing_cache_key
+            and result.get("status") == "handled"
+        ):
+            state_key = _conversation_state_key(event, WEATHER_FORECAST_BOT_ROLE)
+            if state_key:
+                state = weather_memory.load_conversation_state(state_key) or {"state_version": 1}
+                state["last_power_briefing_cache_key"] = briefing_cache_key
+                state["last_power_briefing_generated_at"] = result.get("generated_at")
+                weather_memory.save_conversation_state(state_key, state)
+                if message_id and not _event_thread_id(event):
+                    reply_thread_key = _conversation_key(
+                        WEATHER_FORECAST_BOT_ROLE,
+                        chat_id,
+                        message_id,
+                        _event_sender_id(event),
+                        _event_chat_type(event),
+                    )
+                    weather_memory.save_conversation_state(reply_thread_key, state)
         if _pref_subs:
             state_key = _conversation_state_key(event, WEATHER_FORECAST_BOT_ROLE)
             if state_key:
@@ -2305,6 +2378,8 @@ def _is_task_command(text: str) -> bool:
 
 def _is_power_briefing_command(text: str) -> bool:
     compact = re.sub(r"\s+", "", text).lower()
+    if _is_power_briefing_expand_command(compact):
+        return True
     has_briefing_name = (
         "电力气象决策晨报" in compact
         or "电力气象晨报" in compact
@@ -2316,6 +2391,21 @@ def _is_power_briefing_command(text: str) -> bool:
     )
     concise_daily_request = bool(re.fullmatch(r"(?:今天|今日|明天)?(?:的)?(?:电力气象)?晨报(?:2\.0)?", compact))
     return has_briefing_name and (has_generate_action or concise_daily_request)
+
+
+def _is_power_briefing_expand_command(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    return any(
+        keyword in compact
+        for keyword in (
+            "展开全部分析区",
+            "查看全部分析区",
+            "展开全部市场",
+            "查看全部市场",
+            "晨报全部详情",
+            "晨报完整明细",
+        )
+    )
 
 
 def _task_action_from_text(text: str) -> str | None:
@@ -2813,7 +2903,7 @@ def _help_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
         "3. **逐小时** — 小时级变化，适合排出行、看电力负荷",
         "4. **风险解读** — 降雨 / 降温 / 大风的时段和影响范围",
         "5. **数据源** — 预报来源、口径和不确定性说明",
-        "6. **生成晨报** — 今日 + 明日电力气象决策晨报 2.0",
+        "6. **生成晨报** — 全国 31 个省级地区、33 个分析区、75 个代表点的今日 + 明日扫描",
         "",
         "💬 **你可以这样问我**",
         "• @云云 广州明天天气",
@@ -2821,6 +2911,7 @@ def _help_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
         "• @云云 北京气象预测 2026-06-10",
         "• @云云 22.8016,113.5252 明天天气",
         "• @云云 生成今天的电力气象决策晨报 2.0",
+        "• @云云 展开全部分析区",
     ]
     task_help = [
         "📋 大家好，我是点点，PowerPals 的气象任务小助手~",
