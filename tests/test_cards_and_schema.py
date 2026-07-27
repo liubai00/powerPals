@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, urlparse
 from jsonschema import validate
 
 from services.weather_bot.cards import build_feishu_card, build_text_summary, build_weather_comparison_card
-from services.weather_bot.models import AggregatedForecast, ForecastPoint, ForecastSummary, WeatherSubmission
+from services.weather_bot.models import AggregatedForecast, ForecastPoint, ForecastSummary, ScopeProfile, WeatherSubmission
 
 
 def make_submission() -> WeatherSubmission:
@@ -70,6 +70,27 @@ def test_feishu_card_uses_message_card_shape():
     assert card["msg_type"] == "interactive"
     assert "card" in card
     assert card["card"]["header"]["title"]["content"] == "广东省深圳市气象预测"
+
+
+def test_feishu_card_labels_province_forecast_as_representative_point():
+    submission = make_submission().model_copy(
+        update={
+            "region": "辽宁省",
+            "scope": ScopeProfile(
+                region="辽宁省",
+                target_date="2026-06-10",
+                location={
+                    "name": "辽宁省",
+                    "representation": "province_representative_point",
+                    "representative_city": "沈阳市",
+                },
+            ),
+        }
+    )
+
+    card = build_feishu_card(submission)
+
+    assert card["card"]["header"]["title"]["content"].endswith("辽宁省（沈阳代表点）气象预测")
 
 
 def test_feishu_card_defaults_to_instant_query_display():

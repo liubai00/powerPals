@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +57,15 @@ class ResolvedLocation(BaseModel):
     country: str = "中国"
     province: str | None = None
     city: str | None = None
+    representation: str = "point"
+    representative_city: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        if self.representation == "province_representative_point" and self.representative_city:
+            city = self.representative_city.removesuffix("市")
+            return f"{self.name}（{city}代表点）"
+        return self.name
 
 
 class FavoriteLocation(BaseModel):
@@ -232,6 +243,109 @@ PROVINCE_LEVEL_LOCATIONS: tuple[tuple[tuple[str, ...], str, str, float, float, s
     (("澳门特别行政区", "澳门"), "澳门特别行政区", "820000", 22.1987, 113.5439, "澳门特别行政区", "澳门"),
 )
 
+
+@dataclass(frozen=True)
+class RegionInterpretation:
+    """Separate a location entity from province-wide scope wording."""
+
+    raw: str
+    entity: str
+    scope: str | None = None
+
+
+_PROVINCE_ALIAS_TO_CANONICAL = {
+    alias: name
+    for aliases, name, _code, _lat, _lon, _province, _city in PROVINCE_LEVEL_LOCATIONS
+    for alias in aliases
+}
+_PROVINCE_SCOPE_SUFFIXES = frozenset(
+    {
+        "地区",
+        "整个地区",
+        "全部地区",
+        "所有地区",
+        "全省",
+        "全区",
+        "全市",
+        "省内",
+        "区内",
+        "市内",
+        "省全境",
+        "区全境",
+        "市全境",
+        "全境",
+        "境内",
+        "全省范围",
+        "全区范围",
+        "全市范围",
+        "全部区域",
+        "整个区域",
+        "辖区",
+        "辖区内",
+    }
+)
+_PROVINCE_SCOPE_PREFIXES = ("整个", "全部", "所有", "全")
+_ADMIN_SUFFIXES = (
+    "特别行政区",
+    "维吾尔自治区",
+    "壮族自治区",
+    "回族自治区",
+    "自治区",
+    "自治州",
+    "地区",
+    "新区",
+    "省",
+    "市",
+    "县",
+    "区",
+    "盟",
+    "州",
+)
+
+
+def interpret_region_scope(value: str) -> RegionInterpretation:
+    """Canonicalize only pure province + scope phrases, preserving real subregions."""
+
+    raw = value.strip()
+    compact = re.sub(r"\s+", "", raw).strip("，,。；;：:")
+    aliases = sorted(_PROVINCE_ALIAS_TO_CANONICAL, key=len, reverse=True)
+    for alias in aliases:
+        canonical = _PROVINCE_ALIAS_TO_CANONICAL[alias]
+        if compact == alias:
+            return RegionInterpretation(raw=raw, entity=canonical)
+        if compact.startswith(alias):
+            suffix = compact[len(alias) :]
+            if suffix in _PROVINCE_SCOPE_SUFFIXES:
+                return RegionInterpretation(raw=raw, entity=canonical, scope=suffix)
+        for prefix in _PROVINCE_SCOPE_PREFIXES:
+            marker = f"{prefix}{alias}"
+            if not compact.startswith(marker):
+                continue
+            suffix = compact[len(marker) :]
+            if not suffix or suffix in _PROVINCE_SCOPE_SUFFIXES:
+                scope = f"{prefix}{suffix}" if suffix else prefix
+                return RegionInterpretation(raw=raw, entity=canonical, scope=scope)
+    return RegionInterpretation(raw=raw, entity=compact)
+
+
+def starts_with_province_scope_modifier(value: str) -> bool:
+    compact = re.sub(r"\s+", "", value).lstrip("的，,。；;：:")
+    return compact.startswith("内") or any(
+        compact.startswith(scope) for scope in sorted(_PROVINCE_SCOPE_SUFFIXES, key=len, reverse=True)
+    )
+
+
+def province_from_region(value: str) -> str | None:
+    interpreted = interpret_region_scope(value)
+    if interpreted.scope is not None:
+        return interpreted.entity
+    compact = re.sub(r"\s+", "", value)
+    for alias in sorted(_PROVINCE_ALIAS_TO_CANONICAL, key=len, reverse=True):
+        if compact.startswith(alias):
+            return _PROVINCE_ALIAS_TO_CANONICAL[alias]
+    return None
+
+
 for aliases, name, code, latitude, longitude, province, city in PROVINCE_LEVEL_LOCATIONS:
     location = ResolvedLocation(
         name=name,
@@ -241,6 +355,8 @@ for aliases, name, code, latitude, longitude, province, city in PROVINCE_LEVEL_L
         source="builtin",
         province=province,
         city=city,
+        representation="province_representative_point",
+        representative_city=city,
     )
     for alias in aliases:
         BUILTIN_LOCATIONS.setdefault(alias, location)
@@ -313,7 +429,8 @@ class LocationResolver:
                 source=request.location_source or "coordinates",
             )
 
-        region = request.region.strip()
+        interpreted = interpret_region_scope(request.region)
+        region = interpreted.entity
         builtin = BUILTIN_LOCATIONS.get(region)
         if builtin:
             return builtin
@@ -355,8 +472,10 @@ class LocationResolver:
         locations = body.get("location") or []
         if not locations:
             return None
-        item = locations[0]
-        province = item.get("adm1")
+        item = _best_qweather_result(locations, region)
+        if not item:
+            return None
+        province = _normalize_china_admin(item.get("adm1"))
         city = item.get("adm2") or item.get("name")
         return ResolvedLocation(
             name=_display_name(province, city, item.get("name")),
@@ -420,6 +539,8 @@ class LocationResolver:
         if not results:
             return None
         item = _best_open_meteo_result(results, region)
+        if not item:
+            return None
         admin = _normalize_china_admin(item.get("admin1"))
         name = item.get("name") or region
         return ResolvedLocation(
@@ -456,6 +577,8 @@ def location_payload(location: ResolvedLocation) -> dict[str, Any]:
         "country": location.country,
         "province": location.province,
         "city": location.city,
+        "representation": location.representation,
+        "representative_city": location.representative_city,
     }
 
 
@@ -469,23 +592,52 @@ def _coordinate_token(value: float) -> str:
     return f"{value:.4f}".replace(".", "_").replace("-", "M")
 
 
+def _best_qweather_result(results: list[dict[str, Any]], region: str) -> dict[str, Any] | None:
+    expected_province = province_from_region(region)
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for item in results:
+        if item.get("lat") is None or item.get("lon") is None:
+            continue
+        province = _normalize_china_admin(item.get("adm1"))
+        if expected_province and province != expected_province:
+            continue
+        name_score = max(
+            _place_name_match_score(region, item.get("name")),
+            _place_name_match_score(region, item.get("adm2")),
+        )
+        if name_score <= 0:
+            continue
+        score = name_score
+        if expected_province and province == expected_province:
+            score += 30
+        if item.get("country") in {None, "", "中国", "China"}:
+            score += 5
+        ranked.append((score, item))
+    if not ranked:
+        return None
+    score, item = max(ranked, key=lambda pair: pair[0])
+    return item if score >= 55 else None
+
+
 def _best_nominatim_result(results: list[dict[str, Any]], region: str) -> dict[str, Any] | None:
     candidates = [item for item in results if item.get("lat") is not None and item.get("lon") is not None]
     if not candidates:
         return None
+    expected_province = province_from_region(region)
 
-    def score(item: dict[str, Any]) -> float:
+    def score(item: dict[str, Any]) -> float | None:
         name = str(item.get("name") or "")
         display_name = str(item.get("display_name") or "")
         addresstype = str(item.get("addresstype") or "")
         place_type = str(item.get("type") or "")
-        normalized_name = name.rstrip("省市区县")
-        normalized_region = region.rstrip("省市区县")
-        value = 0.0
-        if normalized_name == normalized_region:
-            value += 40
-        elif name.startswith(region) or region.startswith(normalized_name):
-            value += 22
+        province = _nominatim_province(display_name)
+        if expected_province and province != expected_province:
+            return None
+        value = _place_name_match_score(region, name)
+        if value <= 0:
+            return None
+        if expected_province and province == expected_province:
+            value += 30
         if place_type == "administrative":
             value += 20
         if addresstype in {"city", "town", "county", "state", "municipality"}:
@@ -498,7 +650,11 @@ def _best_nominatim_result(results: list[dict[str, Any]], region: str) -> dict[s
             value += max(0, 30 - place_rank)
         return value
 
-    return max(candidates, key=score)
+    ranked = [(value, item) for item in candidates if (value := score(item)) is not None]
+    if not ranked:
+        return None
+    value, item = max(ranked, key=lambda pair: pair[0])
+    return item if value >= 55 else None
 
 
 def _open_meteo_search_terms(region: str) -> list[str]:
@@ -514,22 +670,27 @@ def _is_bare_chinese_place_name(region: str) -> bool:
     return all("\u4e00" <= char <= "\u9fff" for char in region)
 
 
-def _best_open_meteo_result(results: list[dict[str, Any]], region: str) -> dict[str, Any]:
-    def score(item: dict[str, Any]) -> float:
+def _best_open_meteo_result(results: list[dict[str, Any]], region: str) -> dict[str, Any] | None:
+    expected_province = province_from_region(region)
+
+    def score(item: dict[str, Any]) -> float | None:
         name = str(item.get("name") or "")
         query = str(item.get("_query") or "")
         feature_code = str(item.get("feature_code") or "")
         country_code = str(item.get("country_code") or "")
-        normalized_name = name.rstrip("省市区县")
-        normalized_region = region.rstrip("省市区县")
-        value = 0.0
+        province = _normalize_china_admin(item.get("admin1"))
+        if country_code and country_code != "CN":
+            return None
+        if expected_province and province != expected_province:
+            return None
+        value = _place_name_match_score(region, name)
+        if value <= 0:
+            return None
+        if expected_province and province == expected_province:
+            value += 30
         if country_code == "CN":
             value += 30
-        if normalized_name == normalized_region:
-            value += 40
-        elif name.startswith(region) or region.startswith(normalized_name):
-            value += 18
-        if query != region and normalized_name == normalized_region:
+        if query != region and _place_name_match_score(region, query) >= 60:
             value += 22
         if feature_code in {"PPLA", "PPLA2", "PPLA3", "PPLC"}:
             value += 25
@@ -540,7 +701,50 @@ def _best_open_meteo_result(results: list[dict[str, Any]], region: str) -> dict[
         value += min(_safe_float(item.get("population")) / 100000, 30)
         return value
 
-    return max(results, key=score)
+    ranked = [(value, item) for item in results if (value := score(item)) is not None]
+    if not ranked:
+        return None
+    value, item = max(ranked, key=lambda pair: pair[0])
+    return item if value >= 55 else None
+
+
+def _place_name_match_score(region: str, candidate: Any) -> float:
+    if not isinstance(candidate, str) or not candidate.strip():
+        return 0.0
+    requested = _specific_place_token(region)
+    offered = _strip_admin_suffix(candidate)
+    if not requested or not offered:
+        return 0.0
+    if requested == offered:
+        return 70.0
+    if requested in offered or offered in requested:
+        return 45.0
+    return 0.0
+
+
+def _specific_place_token(value: str) -> str:
+    compact = re.sub(r"\s+", "", value).strip("，,。；;：:")
+    interpreted = interpret_region_scope(compact)
+    if interpreted.scope is not None:
+        compact = interpreted.entity
+    for alias in sorted(_PROVINCE_ALIAS_TO_CANONICAL, key=len, reverse=True):
+        if compact.startswith(alias) and len(compact) > len(alias):
+            compact = compact[len(alias) :]
+            break
+    return _strip_admin_suffix(compact)
+
+
+def _strip_admin_suffix(value: str) -> str:
+    result = re.sub(r"\s+", "", value)
+    changed = True
+    while changed:
+        changed = False
+        for suffix in _ADMIN_SUFFIXES:
+            if result.endswith(suffix) and len(result) > len(suffix):
+                result = result[: -len(suffix)]
+                changed = True
+                break
+    return result
 
 
 def _nominatim_province(display_name: Any) -> str | None:

@@ -144,9 +144,19 @@ def _header_template_for(chart_items) -> str:
 
 def _card_title(submission, chart_items) -> str:
     emoji = _weather_emoji(getattr(chart_items[0].aggregated_forecast.summary, "main_weather", None))
+    region = _submission_region_label(submission)
     if len(chart_items) > 1:
-        return f"{emoji} {submission.region} · 未来{len(chart_items)}天气象预测"
-    return f"{emoji} {submission.region}气象预测"
+        return f"{emoji} {region} · 未来{len(chart_items)}天气象预测"
+    return f"{emoji} {region}气象预测"
+
+
+def _submission_region_label(submission) -> str:
+    location = getattr(getattr(submission, "scope", None), "location", None) or {}
+    if location.get("representation") == "province_representative_point":
+        representative_city = str(location.get("representative_city") or "").removesuffix("市")
+        if representative_city:
+            return f"{submission.region}（{representative_city}代表点）"
+    return submission.region
 
 
 def _glance_line(item) -> str:

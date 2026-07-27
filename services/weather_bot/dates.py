@@ -124,6 +124,9 @@ def _single_absolute_date(text: str, today: date) -> date | None:
         return _date_bare_day(1, today)
     if re.search(r"月中", text):
         return _date_bare_day(15, today)
+    # “未来/接下来四日”里的“四日”是窗口长度，不是本月 4 日。
+    if re.search(rf"(?:未来|最近|接下来)\s*{_DAYNUM}\s*[天日]", text):
+        return None
     m = re.search(rf"(?<![\d月/-])({_DAYNUM})\s*[日号](?!\s*(?:到|至|-|~))", text)
     if m:
         return _date_bare_day(_num(m.group(1)), today)
@@ -246,7 +249,9 @@ def _parse_date_and_span(text: str, today: date) -> tuple[date, int]:
     # 2) 单绝对日期(先于"N到M天", 避免 ISO/斜杠里的 '-' 被当区间连接符)
     d = _single_absolute_date(text, today)
     if d is not None:
-        return d, 1
+        # 允许“2026-08-10 开始未来3天”同时指定起始日与窗口。
+        explicit_window = _window_days_from_text(text)
+        return d, explicit_window or 1
 
     # 2b) 整月/N月
     span = _month_span(text, today)

@@ -1,16 +1,24 @@
+import httpx
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from services.weather_bot.config import Settings
+from services.weather_bot.main import create_app
 from services.weather_bot.location import (
     LocationResolver,
+    PROVINCE_LEVEL_LOCATIONS,
     ResolvedLocation,
     _best_nominatim_result,
     _best_open_meteo_result,
+    _best_qweather_result,
     _nominatim_province,
     _normalize_china_admin,
     _open_meteo_search_terms,
+    interpret_region_scope,
 )
-from services.weather_bot.models import ForecastRequest
+from services.weather_bot.models import ForecastPoint, ForecastRequest, ProviderForecast
+from services.weather_bot.service import ForecastService
 
 
 async def test_location_resolver_keeps_shenzhen_as_default():
@@ -49,6 +57,158 @@ async def test_location_resolver_supports_province_level_aliases():
     assert location.latitude == 41.8057
     assert location.longitude == 123.4315
     assert location.city == "沈阳市"
+
+
+def test_forecast_api_regression_for_liaoning_whole_region_request():
+    class FakeProvider:
+        name = "open_meteo"
+
+        async def fetch(self, request):
+            return ProviderForecast(
+                provider=self.name,
+                status="ok",
+                points=[
+                    ForecastPoint(
+                        time=f"{request.target_date}T12:00:00+08:00",
+                        temperature=28.0,
+                        precipitation_probability=20.0,
+                        wind_speed=3.0,
+                        cloud_cover=40.0,
+                    )
+                ],
+            )
+
+    resolver = LocationResolver(Settings(qweather_api_key=""))
+    service = ForecastService(providers={"open_meteo": FakeProvider()}, location_resolver=resolver)
+    client = TestClient(create_app(forecast_service=service))
+
+    response = client.post(
+        "/api/weather/forecast",
+        json={
+            "region": "辽宁整个地区",
+            "target_date": "2026-07-28",
+            "days": 1,
+            "providers": ["open_meteo"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scope"]["region"] == "辽宁省"
+    assert body["scope"]["location"]["source"] == "builtin"
+    assert body["scope"]["location"]["representation"] == "province_representative_point"
+    assert body["scope"]["location"]["representative_city"] == "沈阳市"
+
+
+@pytest.mark.parametrize(
+    "region",
+    ["辽宁整个地区", "辽宁地区", "整个辽宁地区", "辽宁全省", "辽宁省全境", "辽宁省内"],
+)
+async def test_location_resolver_normalizes_province_scope_before_external_geocoding(monkeypatch, region):
+    async def fail_external(self, value):
+        raise AssertionError(f"province scope leaked to external geocoder: {value}")
+
+    monkeypatch.setattr(LocationResolver, "_resolve_with_nominatim", fail_external)
+    monkeypatch.setattr(LocationResolver, "_resolve_with_open_meteo", fail_external)
+
+    location = await LocationResolver().resolve(ForecastRequest(region=region, target_date="2026-06-10"))
+
+    assert location.name == "辽宁省"
+    assert location.code == "210000"
+    assert location.city == "沈阳市"
+
+
+async def test_qweather_candidate_selection_rejects_wrong_province(monkeypatch):
+    payload = {
+        "code": "200",
+        "location": [
+            {
+                "name": "阿里地区",
+                "id": "101140701",
+                "lat": "32.50319",
+                "lon": "80.10550",
+                "adm1": "西藏自治区",
+                "adm2": "阿里地区",
+                "country": "中国",
+            },
+            {
+                "name": "盘锦市",
+                "id": "101071301",
+                "lat": "41.11996",
+                "lon": "122.07078",
+                "adm1": "辽宁省",
+                "adm2": "盘锦市",
+                "country": "中国",
+            },
+        ],
+    }
+    original_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        async def handler(request):
+            return httpx.Response(200, json=payload, request=request)
+
+        return original_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr("services.weather_bot.location.httpx.AsyncClient", fake_client)
+    resolver = LocationResolver(Settings(qweather_api_key="test-key"))
+
+    location = await resolver._resolve_with_qweather("辽宁盘锦")
+
+    assert location is not None
+    assert location.name == "辽宁省盘锦市"
+    assert location.province == "辽宁省"
+
+
+def test_qweather_candidate_selection_returns_none_when_all_candidates_are_unrelated():
+    result = _best_qweather_result(
+        [
+            {
+                "name": "阿里地区",
+                "lat": "32.50319",
+                "lon": "80.10550",
+                "adm1": "西藏自治区",
+                "adm2": "阿里地区",
+                "country": "中国",
+            }
+        ],
+        "辽宁盘锦",
+    )
+
+    assert result is None
+
+
+PROVINCE_SCOPE_CASES = [
+    (f"{aliases[-1]}{scope}", canonical)
+    for aliases, canonical, _code, _lat, _lon, _province, _city in PROVINCE_LEVEL_LOCATIONS
+    for scope in ("整个地区", "地区", "全省", "省全境", "省内")
+]
+
+
+@pytest.mark.parametrize(("region", "expected"), PROVINCE_SCOPE_CASES)
+def test_all_province_level_aliases_separate_scope_modifier(region, expected):
+    interpreted = interpret_region_scope(region)
+
+    assert interpreted.entity == expected
+    assert interpreted.scope is not None
+
+
+@pytest.mark.parametrize(
+    "region",
+    [
+        "上海浦东新区",
+        "深圳南山区",
+        "西藏阿里地区",
+        "新疆塔城地区",
+        "黑龙江大兴安岭地区",
+        "辽宁盘锦",
+    ],
+)
+def test_scope_normalizer_preserves_real_subregions(region):
+    interpreted = interpret_region_scope(region)
+
+    assert interpreted.entity == region
+    assert interpreted.scope is None
 
 
 async def test_location_resolver_supports_explicit_coordinates():

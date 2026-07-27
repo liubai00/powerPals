@@ -1,8 +1,12 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from services.weather_bot.config import Settings
 from services.weather_bot.main import (
     _days_from_text,
+    _explicit_region_from_text,
+    _has_extra_place_after_province,
+    _location_candidate_supported_by_text,
     _needs_region_clarification,
     _needs_task_region_clarification,
     _region_from_text,
@@ -106,6 +110,95 @@ def test_weather_command_extracts_province_region_and_days():
 
     assert request.region == "辽宁"
     assert request.days == 3
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("@云云 辽宁整个地区未来7天天气情况", "辽宁省"),
+        ("辽宁地区未来7天天气", "辽宁省"),
+        ("整个辽宁地区未来7天天气", "辽宁省"),
+        ("辽宁全省未来7天天气", "辽宁省"),
+        ("辽宁省全境未来7天天气", "辽宁省"),
+        ("辽宁省内未来7天天气", "辽宁省"),
+    ],
+)
+def test_weather_command_separates_province_from_scope_modifier(text, expected):
+    request = _request_from_text(text)
+
+    assert request.region == expected
+    assert request.days == 7
+
+
+def test_feishu_weather_event_regression_for_liaoning_whole_region():
+    service = CapturingForecastService()
+    client = TestClient(
+        create_app(
+            forecast_service=service,
+            settings=Settings(feishu_weather_verification_token=None),
+        )
+    )
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "event": {
+                "message": {
+                    "chat_type": "p2p",
+                    "content": '{"text":"@云云 辽宁整个地区未来7天天气情况"}',
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "handled"
+    assert body["days"] == 7
+    assert {request.region for request in service.seen_requests} == {"辽宁省"}
+    assert "辽宁省" in str(body["card"])
+    assert "阿里地区" not in str(body)
+
+
+@pytest.mark.parametrize("text", ["辽宁整个地区未来7天天气", "辽宁全省天气", "辽宁省全境天气", "辽宁省内天气"])
+def test_province_scope_modifier_is_not_treated_as_a_more_specific_place(text):
+    province = _explicit_region_from_text(text)
+
+    assert province == "辽宁省"
+    assert _has_extra_place_after_province(text, province) is False
+
+
+def test_real_subregion_after_province_is_still_more_specific():
+    assert _has_extra_place_after_province("辽宁盘锦未来7天天气", "辽宁") is True
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    ["辽宁省抚顺市", "抚顺市", "辽宁抚顺"],
+)
+def test_llm_location_candidate_must_be_grounded_in_user_text(candidate):
+    assert _location_candidate_supported_by_text(candidate, "辽宁省全境未来7天天气") is False
+
+
+def test_llm_location_candidate_accepts_specific_place_from_user_text():
+    assert _location_candidate_supported_by_text("辽宁省盘锦市", "辽宁盘锦未来7天天气") is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "上海浦东新区未来7天天气",
+        "深圳南山区未来7天天气",
+        "西藏阿里地区未来7天天气",
+        "新疆塔城地区未来7天天气",
+        "黑龙江大兴安岭地区未来7天天气",
+        "辽宁盘锦未来7天天气",
+    ],
+)
+def test_weather_parser_preserves_real_subregions(text):
+    region = _explicit_region_from_text(text)
+
+    assert region not in {"上海市", "广东省", "西藏自治区", "新疆维吾尔自治区", "黑龙江省", "辽宁省"}
 
 
 def test_weather_command_prefers_city_suffix_over_bare_province_alias():

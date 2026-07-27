@@ -19,7 +19,15 @@ from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuBotAccount, FeishuClient, verify_feishu_token
 from services.weather_bot.judge import WeatherJudgeRequest, WeatherJudgeResult, score_weather_submission
 from services.weather_bot.llm import LlmClient, answer_role_question, answer_weather_knowledge_question, extract_location_with_llm
-from services.weather_bot.location import BUILTIN_LOCATIONS, FavoriteLocation, LocationBook, LocationResolver, location_slug
+from services.weather_bot.location import (
+    BUILTIN_LOCATIONS,
+    FavoriteLocation,
+    LocationBook,
+    LocationResolver,
+    interpret_region_scope,
+    location_slug,
+    starts_with_province_scope_modifier,
+)
 from services.weather_bot.models import ForecastRequest, SubmissionRecord, WeatherSubmission
 from services.weather_bot.service import ForecastService
 from services.weather_bot.search import TavilySearchClient
@@ -349,14 +357,28 @@ def _card_memory_summary(subs) -> str | None:
         return None
 
 
-def _conversation_key(bot_role: str, chat_id: str | None, thread_id: str | None, sender_id: str) -> str:
-    return f"{bot_role}|{chat_id or ''}|{thread_id or 'main'}|{sender_id}"
+def _conversation_key(
+    bot_role: str,
+    chat_id: str | None,
+    thread_id: str | None,
+    sender_id: str,
+    chat_type: str = "",
+) -> str:
+    return f"{bot_role}|{chat_type or 'unknown'}|{chat_id or ''}|{thread_id or 'main'}|{sender_id}"
 
 
-def _record_conversation_turn(bot_role: str, chat_id: str | None, thread_id: str | None, sender_id: str, user_text: str, bot_text: str) -> None:
+def _record_conversation_turn(
+    bot_role: str,
+    chat_id: str | None,
+    thread_id: str | None,
+    sender_id: str,
+    user_text: str,
+    bot_text: str,
+    chat_type: str = "",
+) -> None:
     if not chat_id or not (user_text or bot_text):
         return
-    key = _conversation_key(bot_role, chat_id, thread_id, sender_id)
+    key = _conversation_key(bot_role, chat_id, thread_id, sender_id, chat_type)
     try:
         if user_text and user_text.strip():
             weather_memory.record_turn(key, "user", user_text.strip())
@@ -366,17 +388,19 @@ def _record_conversation_turn(bot_role: str, chat_id: str | None, thread_id: str
         pass
 
 
-def _recent_conversation_turns(bot_role: str, chat_id: str | None, thread_id: str | None, sender_id: str) -> list[dict[str, str]]:
+def _recent_conversation_turns(
+    bot_role: str,
+    chat_id: str | None,
+    thread_id: str | None,
+    sender_id: str,
+    chat_type: str = "",
+) -> list[dict[str, str]]:
     if not chat_id:
         return []
     try:
-        if thread_id:
-            # 话题(thread)内跨发言人: A 提问、B 说"回答下"能接住, 不串到别的话题
-            prefix = f"{bot_role}|{chat_id}|{thread_id}|"
-        else:
-            # 无话题的普通群消息: 按发言人各自隔离, A 问盘锦、B 问上海互不串味
-            prefix = f"{bot_role}|{chat_id}|main|{sender_id}"
-        return weather_memory.recent_chat_turns(prefix)
+        # bot / chat type / chat / thread / sender 五维严格隔离。群内协作不应以串用户上下文为代价。
+        key = _conversation_key(bot_role, chat_id, thread_id, sender_id, chat_type)
+        return weather_memory.recent_turns(key)
     except Exception:  # noqa: BLE001
         return []
 
@@ -406,7 +430,7 @@ def create_app(
     weather_feishu = FeishuClient(settings, weather_account)
     task_feishu = FeishuClient(settings, task_account)
     task_index: dict[str, WeatherTask] = {}
-    processed_message_ids: dict[str, float] = {}
+    fallback_processed_message_ids: dict[str, float] = {}
     forecast_report_cache: dict[str, tuple[float, list[WeatherSubmission], list[dict[str, str]]]] = {}
     pending_region_clarifications: dict[str, dict[str, Any]] = {}
 
@@ -498,7 +522,13 @@ def create_app(
         if not chat_id:
             return
         pending_region_clarifications[
-            _pending_region_key(allowed_bot, chat_id, _event_sender_id(event), _event_thread_id(event) or "")
+            _pending_region_key(
+                allowed_bot,
+                chat_id,
+                _event_sender_id(event),
+                _event_thread_id(event) or "",
+                _event_chat_type(event),
+            )
         ] = {
             "command_type": command_type,
             "target_date": _target_date_from_text(text),
@@ -511,7 +541,13 @@ def create_app(
         chat_id = _event_chat_id(event)
         if not chat_id:
             return None
-        key = _pending_region_key(allowed_bot, chat_id, _event_sender_id(event), _event_thread_id(event) or "")
+        key = _pending_region_key(
+            allowed_bot,
+            chat_id,
+            _event_sender_id(event),
+            _event_thread_id(event) or "",
+            _event_chat_type(event),
+        )
         pending = pending_region_clarifications.get(key)
         if not pending:
             return None
@@ -524,7 +560,14 @@ def create_app(
         chat_id = _event_chat_id(event)
         if chat_id:
             pending_region_clarifications.pop(
-                _pending_region_key(allowed_bot, chat_id, _event_sender_id(event), _event_thread_id(event) or ""), None
+                _pending_region_key(
+                    allowed_bot,
+                    chat_id,
+                    _event_sender_id(event),
+                    _event_thread_id(event) or "",
+                    _event_chat_type(event),
+                ),
+                None,
             )
 
     @app.post("/api/weather/forecast", response_model=WeatherSubmission)
@@ -1038,6 +1081,9 @@ def create_app(
         llm_region_override = None
         if not task_submission_mode and _needs_region_clarification(text):
             llm_region_override = await extract_location_with_llm(llm_client, text)
+            if llm_region_override and not _location_candidate_supported_by_text(llm_region_override, text):
+                # 未在原文中找到依据的模型地点不得直接进入天气接口。
+                llm_region_override = None
             if not llm_region_override:
                 days = _days_from_text(text)
                 return {
@@ -1052,6 +1098,8 @@ def create_app(
             if _is_province_only_region(_regex_region) and _has_extra_place_after_province(text, str(_regex_region)):
                 # regex 只抓到省名且其后疑似还有更具体地名(如"辽宁盘锦"), 用 LLM 抽市/县
                 candidate = await extract_location_with_llm(llm_client, text)
+                if candidate and not _location_candidate_supported_by_text(candidate, text):
+                    candidate = None
                 if candidate and candidate.startswith(str(_regex_region)):
                     trimmed = candidate[len(str(_regex_region)):].lstrip("省市 ")
                     if trimmed:
@@ -1161,7 +1209,48 @@ def create_app(
             **response,
         }
 
-    async def _handle_task_command(text: str, feishu_client: FeishuClient) -> dict[str, Any]:
+    async def _handle_task_command(
+        text: str,
+        feishu_client: FeishuClient,
+        event: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        action = _task_action_from_text(text)
+        if action in {"query", "remind", "close"}:
+            task_id = _task_id_from_text(text)
+            if not task_id and isinstance(event, dict):
+                state = _load_conversation_state(event, WEATHER_TASK_BOT_ROLE) or {}
+                task_id = str(state.get("last_task_id") or "") or None
+            if not task_id:
+                return {
+                    "status": "needs_task_id",
+                    "bot_role": WEATHER_TASK_BOT_ROLE,
+                    "mode": f"task_{action}",
+                    "text": "请提供气象任务 ID；如果是刚发布的任务，也可以直接回复“查询刚才的任务”。",
+                }
+            task = _task_from_task_id(task_id)
+            if not task:
+                return {
+                    "status": "task_not_found",
+                    "bot_role": WEATHER_TASK_BOT_ROLE,
+                    "mode": f"task_{action}",
+                    "text": f"没有找到任务 ID：{task_id}。请确认 ID 是否正确。",
+                }
+            if action == "remind":
+                task = _cache_task(task_service.remind(task))
+            elif action == "close":
+                task = _cache_task(task_service.close(task))
+            if action in {"remind", "close"}:
+                task_recorder.append(task)
+                await feishu_client.write_task_bitable_record(task)
+            return {
+                "status": "handled",
+                "bot_role": WEATHER_TASK_BOT_ROLE,
+                "mode": f"task_{action}",
+                "task": task.model_dump(mode="json"),
+                "card": build_task_card(task),
+                "text": build_task_text(task),
+            }
+
         if _needs_task_region_clarification(text):
             days = _days_from_text(text)
             return {
@@ -1192,7 +1281,13 @@ def create_app(
     async def _handle_general_command(text: str, allowed_bot: str, event: dict[str, Any] | None = None) -> dict[str, Any]:
         bot_role = _bot_role_for_allowed_bot(allowed_bot)
         history = (
-            _recent_conversation_turns(bot_role, _event_chat_id(event), _event_thread_id(event), _event_sender_id(event))
+            _recent_conversation_turns(
+                bot_role,
+                _event_chat_id(event),
+                _event_thread_id(event),
+                _event_sender_id(event),
+                _event_chat_type(event),
+            )
             if isinstance(event, dict)
             else []
         )
@@ -1232,7 +1327,7 @@ def create_app(
         command_text = _merge_pending_region_text(text, pending)
         if pending.get("command_type") == "task":
             await _send_progress_message(feishu_client, event, WEATHER_TASK_BOT_ROLE)
-            return await _handle_task_command(command_text, feishu_client)
+            return await _handle_task_command(command_text, feishu_client, event)
         await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
         return await _handle_weather_command(command_text)
 
@@ -1283,28 +1378,39 @@ def create_app(
             return {"status": "ignored", "reason": "unsupported_event_type", "event_type": event_type}
 
         event = payload.get("event", {})
-        text = _event_text(event)
+        raw_text = _event_text(event)
         logger.warning(
             "feishu_event_text allowed_bot=%s event_keys=%s message_keys=%s text=%r",
             allowed_bot,
             sorted(event.keys()) if isinstance(event, dict) else [],
             sorted(event.get("message", {}).keys()) if isinstance(event, dict) and isinstance(event.get("message"), dict) else [],
-            text,
+            raw_text,
         )
-        message_id = _event_message_id(event)
-        if message_id and _seen_message(processed_message_ids, allowed_bot, message_id):
-            logger.warning("feishu_event_duplicate allowed_bot=%s message_id=%s", allowed_bot, message_id)
-            return {"status": "ignored", "reason": "duplicate_message", "bot_role": _bot_role_for_allowed_bot(allowed_bot)}
 
         if (
             allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_TASK_BOT}
-            and not _is_addressed_to_bot(text, event, allowed_bot)
+            and not _is_addressed_to_bot(raw_text, event, allowed_bot)
             # 气象 bot「云云」: 明确天气查询(自带城市/经纬度/台风/对比)免@也自动回; 其余仍需@
-            and not (allowed_bot == FEISHU_WEATHER_BOT and _is_clear_weather_query(text))
+            and not (allowed_bot == FEISHU_WEATHER_BOT and _is_clear_weather_query(raw_text))
         ):
             return {"status": "ignored", "bot_role": _bot_role_for_allowed_bot(allowed_bot)}
 
+        text = _normalize_event_text(raw_text, event, allowed_bot)
+        event["_normalized_text"] = text
+        contextual_text, context_action = _contextual_weather_text(text, event)
+        if context_action == "reset":
+            _clear_pending_region(event, allowed_bot)
+            result = {
+                "status": "handled",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "context_reset",
+                "text": "已清除刚才的天气查询上下文。请重新告诉我地点、日期和想看的指标。",
+            }
+            return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
+        text = contextual_text
+
         if _is_help_command(text):
+            _clear_pending_region(event, allowed_bot)
             result = {"status": "handled", "bot_role": _bot_role_for_allowed_bot(allowed_bot), "text": _help_text(allowed_bot)}
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
 
@@ -1325,20 +1431,7 @@ def create_app(
                     _clear_pending_region(event, allowed_bot)
                     await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
                 else:
-                    _pref = None
-                    try:
-                        _pref = weather_memory.preferred_region(
-                            _bot_role_for_allowed_bot(allowed_bot), _event_sender_id(event)
-                        )
-                    except Exception:  # noqa: BLE001
-                        _pref = None
-                    if _pref and _pref.get("region"):
-                        # L1 画像: 没说城市就按这个人常查的城市
-                        _clear_pending_region(event, allowed_bot)
-                        await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
-                        text = f"{_pref['region']}{text}"
-                    else:
-                        _remember_pending_region(event, allowed_bot, "forecast", text)
+                    _remember_pending_region(event, allowed_bot, "forecast", text)
                 result = await _handle_weather_command(text)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
@@ -1350,12 +1443,12 @@ def create_app(
                 result = _redirect_to_bot_command(WEATHER_TASK_BOT_ROLE, WEATHER_FORECAST_BOT_ROLE)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             if _is_task_command(text):
-                if not _needs_task_region_clarification(text):
+                if _task_action_from_text(text) in {"query", "remind", "close"} or not _needs_task_region_clarification(text):
                     _clear_pending_region(event, allowed_bot)
                     await _send_progress_message(feishu_client, event, WEATHER_TASK_BOT_ROLE)
                 else:
                     _remember_pending_region(event, allowed_bot, "task", text)
-                result = await _handle_task_command(text, feishu_client)
+                result = await _handle_task_command(text, feishu_client, event)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             if _is_weather_command(text):
                 result = _redirect_to_bot_command(WEATHER_TASK_BOT_ROLE, WEATHER_FORECAST_BOT_ROLE)
@@ -1369,12 +1462,12 @@ def create_app(
             result = await _handle_weather_command(text)
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
         if _is_task_command(text):
-            if not _needs_task_region_clarification(text):
+            if _task_action_from_text(text) in {"query", "remind", "close"} or not _needs_task_region_clarification(text):
                 _clear_pending_region(event, allowed_bot)
                 await _send_progress_message(feishu_client, event, WEATHER_TASK_BOT_ROLE)
             else:
                 _remember_pending_region(event, allowed_bot, "task", text)
-            result = await _handle_task_command(text, feishu_client)
+            result = await _handle_task_command(text, feishu_client, event)
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
         if _is_weather_command(text):
             if not _needs_region_clarification(text):
@@ -1394,12 +1487,57 @@ def create_app(
         feishu_client: FeishuClient,
         allowed_bot: str,
     ) -> dict[str, Any]:
+        event = payload.get("event", {}) if isinstance(payload, dict) else {}
+        header = payload.get("header", {}) if isinstance(payload, dict) else {}
+        event_id = str(header.get("event_id")) if isinstance(header, dict) and header.get("event_id") else None
+        if not event_id:
+            message_id = _event_message_id(event) if isinstance(event, dict) else None
+            if message_id and _seen_fallback_message(
+                fallback_processed_message_ids,
+                allowed_bot,
+                message_id,
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "duplicate_message",
+                    "bot_role": _bot_role_for_allowed_bot(allowed_bot),
+                }
+        if event_id:
+            try:
+                if not weather_memory.claim_event(allowed_bot, event_id):
+                    logger.warning("feishu_event_duplicate allowed_bot=%s event_id=%s", allowed_bot, event_id)
+                    return {
+                        "status": "ignored",
+                        "reason": "duplicate_event",
+                        "bot_role": _bot_role_for_allowed_bot(allowed_bot),
+                    }
+            except Exception:  # noqa: BLE001 - idempotency storage failure degrades to normal handling
+                logger.exception("feishu_event_claim_failed allowed_bot=%s", allowed_bot)
         try:
-            return await _handle_feishu_event(payload, account, feishu_client, allowed_bot)
+            result = await _handle_feishu_event(payload, account, feishu_client, allowed_bot)
+            if event_id:
+                try:
+                    if result.get("event_reply_error"):
+                        weather_memory.fail_event(allowed_bot, event_id)
+                    else:
+                        weather_memory.complete_event(allowed_bot, event_id, result)
+                except Exception:  # noqa: BLE001 - ledger failure must not turn a successful reply into fallback
+                    logger.exception("feishu_event_finalize_failed allowed_bot=%s event_id=%s", allowed_bot, event_id)
+            return result
         except HTTPException:
+            if event_id:
+                try:
+                    weather_memory.fail_event(allowed_bot, event_id)
+                except Exception:  # noqa: BLE001
+                    pass
             raise
         except Exception:  # noqa: BLE001 - 永不沉默: 任何未预料异常都回复用户并 200
             logger.exception("feishu_event_unhandled_error allowed_bot=%s", allowed_bot)
+            if event_id:
+                try:
+                    weather_memory.fail_event(allowed_bot, event_id)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 event = payload.get("event", {}) if isinstance(payload, dict) else {}
                 chat_id = _event_chat_id(event)
@@ -1506,20 +1644,35 @@ def _event_message_id(event: dict[str, Any]) -> str | None:
     return str(message_id) if message_id else None
 
 
+def _payload_event_id(payload: dict[str, Any]) -> str | None:
+    header = payload.get("header", {}) if isinstance(payload, dict) else {}
+    event_id = header.get("event_id") if isinstance(header, dict) else None
+    if event_id:
+        return str(event_id)
+    event = payload.get("event", {}) if isinstance(payload, dict) else {}
+    return _event_message_id(event) if isinstance(event, dict) else None
+
+
 def _event_thread_id(event: dict[str, Any]) -> str | None:
     message = event.get("message", {})
     if not isinstance(message, dict):
         return None
-    thread_id = message.get("thread_id")
+    # 飞书回复线程有时只给 root_id / parent_id，三者应归入同一隔离维度。
+    thread_id = message.get("thread_id") or message.get("root_id") or message.get("parent_id")
     return str(thread_id) if thread_id else None
 
 
-def _seen_message(seen: dict[str, float], allowed_bot: str, message_id: str, ttl_seconds: int = 600) -> bool:
+def _seen_fallback_message(
+    seen: dict[str, float],
+    allowed_bot: str,
+    message_id: str,
+    ttl_seconds: int = 600,
+) -> bool:
+    """Compatibility dedup for synthetic/legacy events that have no event_id."""
     now = time.monotonic()
-    expired = [key for key, created_at in seen.items() if now - created_at > ttl_seconds]
-    for key in expired:
-        seen.pop(key, None)
-
+    for key, created_at in list(seen.items()):
+        if now - created_at > ttl_seconds:
+            seen.pop(key, None)
     key = f"{allowed_bot}:{message_id}"
     if key in seen:
         return True
@@ -1537,8 +1690,56 @@ def _event_sender_id(event: dict[str, Any]) -> str:
     return str(sid or "")
 
 
-def _pending_region_key(allowed_bot: str, chat_id: str, sender_id: str = "", thread_id: str = "") -> str:
-    return f"{allowed_bot}:{chat_id}:{sender_id}:{thread_id}"
+def _event_chat_type(event: dict[str, Any]) -> str:
+    message = event.get("message", {}) if isinstance(event, dict) else {}
+    chat_type = message.get("chat_type") if isinstance(message, dict) else None
+    if not chat_type:
+        chat_type = event.get("chat_type") if isinstance(event, dict) else None
+    return str(chat_type or "unknown").lower()
+
+
+def _conversation_state_key(event: dict[str, Any], bot_role: str) -> str | None:
+    chat_id = _event_chat_id(event)
+    sender_id = _event_sender_id(event)
+    if not chat_id or not sender_id:
+        return None
+    return _conversation_key(
+        bot_role,
+        chat_id,
+        _event_thread_id(event),
+        sender_id,
+        _event_chat_type(event),
+    )
+
+
+def _load_conversation_state(event: dict[str, Any], bot_role: str) -> dict[str, Any] | None:
+    key = _conversation_state_key(event, bot_role)
+    if not key:
+        return None
+    try:
+        return weather_memory.load_conversation_state(key)
+    except Exception:  # noqa: BLE001 - memory is best effort
+        return None
+
+
+def _clear_conversation_state(event: dict[str, Any], bot_role: str) -> None:
+    key = _conversation_state_key(event, bot_role)
+    if not key:
+        return
+    try:
+        weather_memory.clear_conversation_state(key)
+    except Exception:  # noqa: BLE001 - memory is best effort
+        pass
+
+
+def _pending_region_key(
+    allowed_bot: str,
+    chat_id: str,
+    sender_id: str = "",
+    thread_id: str = "",
+    chat_type: str = "",
+) -> str:
+    return f"{allowed_bot}:{chat_type or 'unknown'}:{chat_id}:{sender_id}:{thread_id}"
 
 
 def _merge_pending_region_text(region_text: str, pending: dict[str, Any]) -> str:
@@ -1727,6 +1928,8 @@ async def _send_feishu_event_response(
         result.get("event_reply_message_id", ""),
         result.get("event_reply_error", ""),
     )
+    if result.get("event_reply_error"):
+        return result
     try:
         _pref_subs = (
             submissions_to_record
@@ -1740,15 +1943,33 @@ async def _send_feishu_event_response(
         if not _bot_text and result.get("card"):
             _bot_text = _card_memory_summary(_pref_subs) or "[已发送天气卡片]"
         _record_conversation_turn(
-            result.get("bot_role") or "", chat_id, _event_thread_id(event), _event_sender_id(event), _event_text(event), _bot_text
+            result.get("bot_role") or "",
+            chat_id,
+            _event_thread_id(event),
+            _event_sender_id(event),
+            str(event.get("_normalized_text") or _event_text(event)),
+            _bot_text,
+            _event_chat_type(event),
         )
         if _pref_subs:
-            weather_memory.remember_query(
-                result.get("bot_role") or "",
-                _event_sender_id(event),
-                getattr(_pref_subs[0], "region", None),
-                max(1, len(_pref_subs)),
-            )
+            state_key = _conversation_state_key(event, WEATHER_FORECAST_BOT_ROLE)
+            if state_key:
+                state = weather_memory.load_conversation_state(state_key) or {"state_version": 1}
+                first = _pref_subs[0]
+                state["last_successful_request"] = {
+                    "region": getattr(first, "region", None),
+                    "target_date": getattr(first, "target_date", None),
+                    "days": max(1, int(result.get("days") or len(_pref_subs))),
+                    "metrics": result.get("metrics") or [],
+                }
+                weather_memory.save_conversation_state(state_key, state)
+        task_payload = result.get("task")
+        if isinstance(task_payload, dict) and task_payload.get("task_id"):
+            state_key = _conversation_state_key(event, WEATHER_TASK_BOT_ROLE)
+            if state_key:
+                state = weather_memory.load_conversation_state(state_key) or {"state_version": 1}
+                state["last_task_id"] = str(task_payload["task_id"])
+                weather_memory.save_conversation_state(state_key, state)
     except Exception:  # noqa: BLE001
         pass
     return result
@@ -1796,6 +2017,106 @@ def _event_text(event: dict[str, Any]) -> str:
     return str(content)
 
 
+def _normalize_event_text(text: str, event: dict[str, Any], allowed_bot: str) -> str:
+    normalized = (text or "").replace("\u200b", " ")
+    normalized = re.sub(r"<at\b[^>]*>.*?</at>", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"@_user_\d+\s*", " ", normalized)
+    for alias in sorted(_bot_aliases(allowed_bot), key=len, reverse=True):
+        normalized = re.sub(rf"@?\s*{re.escape(alias)}(?:机器人)?\s*", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip(" ，,。；;：:")
+
+
+_CONTEXT_RESET_RE = re.compile(r"重新查|重新查询|不要沿用|别沿用|清除(?:上下文|记录)|忘掉(?:刚才|上次)")
+_CONTEXT_FOLLOWUP_RE = re.compile(
+    r"那明天|明天呢|后天呢|刚才那个|上次那个|换成|改成|不是.+是|只看|只要|重试一下|再试一次"
+)
+_DATE_SIGNAL_RE = re.compile(
+    r"今天|今日|明天|明日|后天|大后天|未来|接下来|最近|\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
+    r"\d{1,2}月\d{1,2}[日号]|[一二三四五六七八九十\d]+[天日]"
+)
+_WINDOW_SIGNAL_RE = re.compile(r"(?:未来|接下来|最近|改成)\s*[一二两三四五六七八九十\d]+\s*[天日]")
+
+
+def _region_from_followup_fragment(fragment: str) -> str | None:
+    candidate = re.split(
+        r"未来|接下来|最近|今天|今日|明天|明日|后天|天气|气象|预报|降雨|降水|温度|风速|云量",
+        fragment,
+        maxsplit=1,
+    )[0].strip(" ，,。；;：:的是")
+    if not candidate or re.fullmatch(r"[一二两三四五六七八九十\d]+[天日]?", candidate):
+        return None
+    cleaned = _clean_region_candidate(candidate)
+    if cleaned and (cleaned in BUILTIN_LOCATIONS or cleaned in LOCATION_ALIAS_MAP):
+        # 保留用户原文中的具体市/区县名，避免“辽宁盘锦”再次被省级规则截成辽宁。
+        return cleaned
+    explicit = _explicit_region_from_text(fragment)
+    return explicit or cleaned
+
+
+def _region_expression_for_followup(region: str) -> str:
+    aliases = [
+        alias
+        for alias, normalized in LOCATION_ALIASES
+        if normalized == region and not _is_province_only_region(alias) and len(alias) >= 2
+    ]
+    if aliases:
+        return min(aliases, key=len)
+    return region
+
+
+def _contextual_weather_text(
+    text: str,
+    event: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Merge a short weather follow-up with the last successful request.
+
+    Returns ``(text, action)`` where action is ``reset`` when the caller should
+    acknowledge a context reset without issuing a weather request.
+    """
+    if _CONTEXT_RESET_RE.search(text):
+        _clear_conversation_state(event, WEATHER_FORECAST_BOT_ROLE)
+        return text, "reset"
+
+    state = _load_conversation_state(event, WEATHER_FORECAST_BOT_ROLE) or {}
+    last = state.get("last_successful_request")
+    if not isinstance(last, dict) or not last.get("region"):
+        return text, None
+
+    current_metrics = weather_metrics_from_text(text)
+    explicit_region = _explicit_region_from_text(text)
+
+    # 否定纠正必须只取肯定部分，不能把“广州、深圳”误判成两地对比。
+    correction = re.search(r"(?:不是|不要)\s*[^，,。；;]+[，,。；;]\s*(?:是|改成|换成)?\s*(.+)", text)
+    if correction:
+        explicit_region = _region_from_followup_fragment(correction.group(1))
+    else:
+        replacement = re.search(r"(?:换成|改成)\s*(.+)", text)
+        if replacement and not _WINDOW_SIGNAL_RE.search(text):
+            explicit_region = _region_from_followup_fragment(replacement.group(1))
+
+    is_followup = bool(_CONTEXT_FOLLOWUP_RE.search(text))
+    is_followup = is_followup or bool(current_metrics and not explicit_region)
+    is_followup = is_followup or bool(_DATE_SIGNAL_RE.search(text) and not explicit_region and len(text) <= 24)
+    if not is_followup:
+        return text, None
+
+    region = explicit_region or _region_expression_for_followup(str(last.get("region")))
+    target_date = str(last.get("target_date") or _target_date_from_text(text))
+    days = max(1, int(last.get("days") or 1))
+    metrics = current_metrics or last.get("metrics") or None
+
+    if _DATE_SIGNAL_RE.search(text):
+        target_date = _target_date_from_text(text)
+        if re.search(r"明天|明日|后天|大后天|今天|今日", text) and not _WINDOW_SIGNAL_RE.search(text):
+            days = 1
+    if _WINDOW_SIGNAL_RE.search(text):
+        days = _days_from_text(text)
+
+    metric_phrase = weather_metric_phrase(metrics)
+    metric_suffix = f" {metric_phrase}" if metric_phrase else ""
+    return f"{region} {target_date} 未来{days}天{metric_suffix}", None
+
+
 def _event_chat_id(event: dict[str, Any]) -> str | None:
     message = event.get("message", {})
     chat_id = message.get("chat_id") or event.get("chat_id")
@@ -1808,7 +2129,11 @@ def _task_id_from_text(text: str) -> str | None:
 
 
 def _is_task_submission_command(text: str) -> bool:
-    return _task_id_from_text(text) is not None
+    return _task_id_from_text(text) is not None and _task_action_from_text(text) not in {
+        "query",
+        "remind",
+        "close",
+    }
 
 
 PAST_WEATHER_RE = re.compile(
@@ -1912,7 +2237,23 @@ def _is_weather_command(text: str) -> bool:
 
 
 def _is_task_command(text: str) -> bool:
-    return "气象任务" in text or ("气象" in text and "任务" in text)
+    return (
+        "气象任务" in text
+        or ("气象" in text and "任务" in text)
+        or ("任务" in text and _task_action_from_text(text) is not None)
+    )
+
+
+def _task_action_from_text(text: str) -> str | None:
+    if any(keyword in text for keyword in ("关闭", "结束", "终止", "截止任务")):
+        return "close"
+    if any(keyword in text for keyword in ("提醒", "催办", "催一下", "通知提交")):
+        return "remind"
+    if any(keyword in text for keyword in ("查询", "查看", "状态", "进度", "刚才的任务")):
+        return "query"
+    if any(keyword in text for keyword in ("发布", "创建", "新建", "发起", "生成")):
+        return "create"
+    return None
 
 
 def _is_help_command(text: str) -> bool:
@@ -2055,7 +2396,8 @@ def _region_from_text(text: str) -> str:
 
 
 def _task_region_from_text(text: str) -> str | None:
-    return _explicit_region_from_text(text) or _task_bare_region_from_text(text)
+    candidate = _explicit_region_from_text(text) or _task_bare_region_from_text(text)
+    return _clean_task_region_candidate(candidate) if candidate else None
 
 
 def _task_bare_region_from_text(text: str) -> str | None:
@@ -2071,6 +2413,8 @@ def _clean_task_region_candidate(candidate: str) -> str | None:
     region = _clean_region_candidate(candidate)
     if not region:
         return None
+    # “发布今日广州气象任务”中的“今日”是日期，不是地名的一部分。
+    region = re.sub(r"^(?:今天|今日|明天|明日|后天|大后天)\s*", "", region)
     region = region.strip(" 的")
     if not region or region in TASK_BARE_REGION_BLOCKLIST:
         return None
@@ -2143,6 +2487,8 @@ def _has_extra_place_after_province(text: str, province: str) -> bool:
             after = after[len(prefix):]
             break
     if not after:
+        return False
+    if starts_with_province_scope_modifier(after):
         return False
     ch = after[0]
     return bool(re.match(r"[一-鿿]", ch)) and ch not in _PROVINCE_STOP_AFTER
@@ -2224,7 +2570,32 @@ def _clean_region_candidate(candidate: str) -> str | None:
     # 日期碎片/"各地区"等泛指被"地区"后缀误抓成地名(如"月下旬各地区"), 剔除
     if any(frag in region for frag in ("上旬", "中旬", "下旬", "各地", "各区", "各市", "各县", "各省")):
         return None
+    interpreted = interpret_region_scope(region)
+    if interpreted.scope is not None:
+        return interpreted.entity
     return region
+
+
+def _location_candidate_supported_by_text(candidate: str, text: str) -> bool:
+    """Reject LLM-only locations that have no specific place token in the user text."""
+
+    compact_candidate = re.sub(r"\s+", "", candidate)
+    compact_text = re.sub(r"\s+", "", text)
+    if compact_candidate and compact_candidate in compact_text:
+        return True
+    province_removed = False
+    for alias, normalized in sorted(LOCATION_ALIASES, key=lambda item: len(item[0]), reverse=True):
+        if not _is_province_only_region(normalized):
+            continue
+        for prefix in (normalized, alias):
+            if compact_candidate.startswith(prefix):
+                compact_candidate = compact_candidate[len(prefix) :]
+                province_removed = True
+                break
+        if province_removed:
+            break
+    core = re.sub(r"(特别行政区|自治区|自治州|地区|新区|省|市|县|区|盟|州)+$", "", compact_candidate)
+    return len(core) >= 2 and core in compact_text
 
 
 def _coordinates_from_text(text: str) -> tuple[float, float] | None:
