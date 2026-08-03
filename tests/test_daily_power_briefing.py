@@ -652,6 +652,57 @@ async def test_dry_run_generates_cache_without_sending_feishu(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested_mode", [None, "send"])
+async def test_briefing_requires_explicit_send_opt_in(
+    monkeypatch,
+    tmp_path,
+    requested_mode,
+):
+    settings = Settings(
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+        feishu_app_id=None,
+        feishu_app_secret=None,
+    )
+    snapshot = {
+        "cache_key": "2026-07-27:test:test",
+        "generated_at": "2026-07-27T09:00:00+08:00",
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "summary_card": {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"content": "测试晨报"}},
+                "elements": [],
+            },
+        },
+    }
+    sent: list[str] = []
+
+    async def fake_snapshot(*args, **kwargs):
+        return snapshot, True
+
+    async def fake_send(self, chat_id, card):
+        sent.append(chat_id)
+        return f"message-{chat_id}"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("POWER_BRIEFING_MODE", raising=False)
+    monkeypatch.delenv("POWER_BRIEFING_ALLOW_SEND", raising=False)
+
+    await daily_power_briefing.go(requested_mode)
+
+    assert sent == []
+
+
+@pytest.mark.asyncio
 async def test_scheduled_send_records_each_card_thread_pointer(monkeypatch, tmp_path):
     settings = Settings(
         power_briefing_cache_db=str(tmp_path / "briefing.db"),
@@ -697,6 +748,7 @@ async def test_scheduled_send_records_each_card_thread_pointer(monkeypatch, tmp_
         ),
     )
     monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.setenv("POWER_BRIEFING_ALLOW_SEND", "1")
 
     await daily_power_briefing.go("send")
 

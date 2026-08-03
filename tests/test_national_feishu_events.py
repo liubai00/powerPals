@@ -1,5 +1,9 @@
+import json
+from uuid import uuid4
+
 from fastapi.testclient import TestClient
 
+from services.weather_bot import memory as weather_memory
 from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuClient
 from services.weather_bot.location import LocationResolver, ResolvedLocation
@@ -751,6 +755,247 @@ def test_weather_feishu_endpoint_handles_direct_chat_without_mention():
     assert body["status"] == "handled"
     assert body["bot_role"] == "weather_forecast_bot"
     assert body["text"]
+
+
+def test_weather_feishu_endpoint_ignores_unmentioned_group_interactive_card(monkeypatch):
+    sent_messages: list[tuple[str, str]] = []
+    event_suffix = uuid4().hex
+
+    async def fake_send_text(self, chat_id, text):
+        sent_messages.append((chat_id, text))
+        return "unexpected-message-id"
+
+    async def fake_send_card(self, chat_id, card):
+        sent_messages.append((chat_id, "interactive"))
+        return "unexpected-card-id"
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send_text)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send_card)
+    service = CapturingForecastService()
+    settings = Settings(feishu_weather_verification_token=None)
+    client = TestClient(create_app(forecast_service=service, settings=settings))
+    card_content = {
+        "title": None,
+        "elements": [],
+        "user_dsl": json.dumps(
+            {
+                "body": {
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": "下周关注福建，云云",
+                        }
+                    ]
+                }
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": f"event-unmentioned-aidc-card-{event_suffix}",
+                "event_type": "im.message.receive_v1",
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_author"}},
+                "message": {
+                    "message_id": f"om_unmentioned_aidc_card_{event_suffix}",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "message_type": "interactive",
+                    "content": json.dumps(card_content, ensure_ascii=False),
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ignored",
+        "bot_role": "weather_forecast_bot",
+        "reason": "unsupported_group_message_type",
+    }
+    assert service.seen_requests == []
+    assert sent_messages == []
+
+
+def test_weather_feishu_endpoint_ignores_unmentioned_group_weather_text(monkeypatch):
+    sent_messages: list[str] = []
+
+    async def fake_send(*args, **kwargs):
+        sent_messages.append("sent")
+        return "unexpected-message-id"
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    service = CapturingForecastService()
+    settings = Settings(feishu_weather_verification_token=None)
+    client = TestClient(create_app(forecast_service=service, settings=settings))
+    suffix = uuid4().hex
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": f"event-unmentioned-weather-{suffix}",
+                "event_type": "im.message.receive_v1",
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_author"}},
+                "message": {
+                    "message_id": f"om_unmentioned_weather_{suffix}",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": json.dumps({"text": "广州明天天气"}, ensure_ascii=False),
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ignored",
+        "bot_role": "weather_forecast_bot",
+        "reason": "group_message_not_addressed",
+    }
+    assert service.seen_requests == []
+    assert sent_messages == []
+
+
+def test_weather_feishu_endpoint_rejects_bare_bot_name_and_fake_group_at(monkeypatch):
+    sent_messages: list[str] = []
+
+    async def fake_send(*args, **kwargs):
+        sent_messages.append("sent")
+        return "unexpected-message-id"
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    settings = Settings(feishu_weather_verification_token=None)
+    client = TestClient(create_app(forecast_service=CapturingForecastService(), settings=settings))
+    suffix = uuid4().hex
+
+    for index, text in enumerate(("云云今天真活跃", "@云云 广州明天天气")):
+        response = client.post(
+            "/feishu/events/weather",
+            json={
+                "schema": "2.0",
+                "header": {
+                    "event_id": f"event-fake-bot-mention-{index}-{suffix}",
+                    "event_type": "im.message.receive_v1",
+                },
+                "event": {
+                    "sender": {"sender_id": {"open_id": "ou_author"}},
+                    "message": {
+                        "message_id": f"om_fake_bot_mention_{index}_{suffix}",
+                        "chat_id": "oc_group",
+                        "chat_type": "group",
+                        "message_type": "text",
+                        "content": json.dumps({"text": text}, ensure_ascii=False),
+                    },
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ignored",
+            "bot_role": "weather_forecast_bot",
+            "reason": "group_message_not_addressed",
+        }
+    assert sent_messages == []
+
+
+def test_weather_feishu_endpoint_handles_explicit_group_mention(monkeypatch):
+    async def fake_send(*args, **kwargs):
+        return "weather-card-id"
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    service = CapturingForecastService()
+    settings = Settings(feishu_weather_verification_token=None)
+    client = TestClient(create_app(forecast_service=service, settings=settings))
+    suffix = uuid4().hex
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": f"event-explicit-mention-{suffix}",
+                "event_type": "im.message.receive_v1",
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_author"}},
+                "message": {
+                    "message_id": f"om_explicit_mention_{suffix}",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": json.dumps({"text": "@_user_1 广州明天天气"}, ensure_ascii=False),
+                    "mentions": [{"key": "@_user_1", "name": "云云"}],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "handled"
+    assert service.seen_request is not None
+
+
+def test_unaddressed_group_stays_silent_when_reply_marker_storage_fails(monkeypatch):
+    sent_messages: list[str] = []
+
+    async def fake_send(*args, **kwargs):
+        sent_messages.append("sent")
+        return "unexpected-message-id"
+
+    def fail_load(*args, **kwargs):
+        raise RuntimeError("simulated conversation storage failure")
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    monkeypatch.setattr(weather_memory, "load_conversation_state", fail_load)
+    settings = Settings(feishu_weather_verification_token=None)
+    client = TestClient(create_app(forecast_service=CapturingForecastService(), settings=settings))
+    suffix = uuid4().hex
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": f"event-storage-failure-{suffix}",
+                "event_type": "im.message.receive_v1",
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_author"}},
+                "message": {
+                    "message_id": f"om_storage_failure_{suffix}",
+                    "root_id": "om_unrelated_root",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": json.dumps({"text": "明天继续讨论"}, ensure_ascii=False),
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ignored",
+        "bot_role": "weather_forecast_bot",
+        "reason": "group_message_not_addressed",
+    }
+    assert sent_messages == []
 
 
 def test_task_feishu_endpoint_uses_mentions_to_detect_help_question():

@@ -1454,7 +1454,35 @@ def create_app(
             return {"status": "ignored", "reason": "unsupported_event_type", "event_type": event_type}
 
         event = payload.get("event", {})
+        if _is_group_chat(event) and not _is_supported_group_message_type(event):
+            return {
+                "status": "ignored",
+                "bot_role": _bot_role_for_allowed_bot(allowed_bot),
+                "reason": "unsupported_group_message_type",
+            }
+
         raw_text = _event_text(event)
+        if (
+            _is_group_chat(event)
+            and not _is_addressed_to_bot(raw_text, event, allowed_bot)
+            and not _is_reply_to_recorded_bot_message(event, allowed_bot)
+        ):
+            return {
+                "status": "ignored",
+                "bot_role": _bot_role_for_allowed_bot(allowed_bot),
+                "reason": "group_message_not_addressed",
+            }
+        if (
+            allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_TASK_BOT}
+            and not _is_group_chat(event)
+            and not _is_direct_chat(event)
+            and not _is_legacy_specialized_event_addressed(raw_text, event, allowed_bot)
+        ):
+            return {
+                "status": "ignored",
+                "bot_role": _bot_role_for_allowed_bot(allowed_bot),
+            }
+
         logger.warning(
             "feishu_event_text allowed_bot=%s event_keys=%s message_keys=%s text=%r",
             allowed_bot,
@@ -1462,14 +1490,6 @@ def create_app(
             sorted(event.get("message", {}).keys()) if isinstance(event, dict) and isinstance(event.get("message"), dict) else [],
             raw_text,
         )
-
-        if (
-            allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_TASK_BOT}
-            and not _is_addressed_to_bot(raw_text, event, allowed_bot)
-            # 气象 bot「云云」: 明确天气查询(自带城市/经纬度/台风/对比)免@也自动回; 其余仍需@
-            and not (allowed_bot == FEISHU_WEATHER_BOT and _is_clear_weather_query(raw_text))
-        ):
-            return {"status": "ignored", "bot_role": _bot_role_for_allowed_bot(allowed_bot)}
 
         text = _normalize_event_text(raw_text, event, allowed_bot)
         event["_normalized_text"] = text
@@ -1863,15 +1883,132 @@ def _merge_pending_region_text(region_text: str, pending: dict[str, Any]) -> str
     return f"{region_text} {target_date} 未来{days}天{suffix}"
 
 
-def _is_addressed_to_bot(text: str, event: dict[str, Any], allowed_bot: str) -> bool:
+def _is_addressed_to_bot(_text: str, event: dict[str, Any], allowed_bot: str) -> bool:
     aliases = _bot_aliases(allowed_bot)
     if not aliases:
-        return True
+        return False
     if _is_direct_chat(event):
         return True
 
+    mention_values = _event_mention_texts(event)
+    return any(alias in item for alias in aliases for item in mention_values)
+
+
+def _is_legacy_specialized_event_addressed(
+    text: str,
+    event: dict[str, Any],
+    allowed_bot: str,
+) -> bool:
+    """Compatibility for old webhook fixtures that omit chat_type and structured mentions."""
+    aliases = _bot_aliases(allowed_bot)
     searchable = [text, *_event_mention_texts(event)]
     return any(alias in item for alias in aliases for item in searchable)
+
+
+def _is_group_chat(event: dict[str, Any]) -> bool:
+    return _event_chat_type(event) in {"group", "group_chat"}
+
+
+def _event_message_type(event: dict[str, Any]) -> str:
+    message = event.get("message", {}) if isinstance(event, dict) else {}
+    message_type = message.get("message_type") if isinstance(message, dict) else None
+    return str(message_type or "").strip().lower()
+
+
+def _is_supported_group_message_type(event: dict[str, Any]) -> bool:
+    # Fail closed for cards, files, images, audio and other machine payloads.
+    # Feishu's normal @ conversation messages are message_type=text.
+    return _event_message_type(event) == "text"
+
+
+def _bot_reply_marker_key(chat_id: str, message_id: str) -> str:
+    return f"bot-reply|{chat_id}|{message_id}"
+
+
+def _remember_bot_reply_message(
+    event: dict[str, Any],
+    message_id: str,
+    bot_role: str,
+) -> None:
+    if not _is_group_chat(event) or not message_id:
+        return
+    chat_id = _event_chat_id(event)
+    if not chat_id:
+        return
+    try:
+        weather_memory.save_conversation_state(
+            _bot_reply_marker_key(chat_id, message_id),
+            {
+                "state_version": 1,
+                "source": "recorded_bot_reply",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "bot_role": bot_role,
+            },
+        )
+    except Exception:  # noqa: BLE001 - a delivered reply must not be retried or duplicated
+        logger.exception("feishu_bot_reply_marker_save_failed chat_id=%s", chat_id)
+
+
+def _event_reply_target_ids(event: dict[str, Any]) -> list[str]:
+    message = event.get("message", {}) if isinstance(event, dict) else {}
+    if not isinstance(message, dict):
+        return []
+    target_ids: list[str] = []
+    for key in ("root_id", "parent_id"):
+        value = message.get(key)
+        if value and str(value) not in target_ids:
+            target_ids.append(str(value))
+    return target_ids
+
+
+def _is_reply_to_recorded_bot_message(event: dict[str, Any], allowed_bot: str) -> bool:
+    if not _is_group_chat(event):
+        return False
+    chat_id = _event_chat_id(event)
+    if not chat_id:
+        return False
+    allowed_marker_roles = {
+        FEISHU_WEATHER_BOT: {WEATHER_FORECAST_BOT_ROLE},
+        FEISHU_TASK_BOT: {WEATHER_TASK_BOT_ROLE},
+        FEISHU_LEGACY_BOT: {
+            WEATHER_FORECAST_BOT_ROLE,
+            WEATHER_TASK_BOT_ROLE,
+            "legacy_combined_bot",
+        },
+    }.get(allowed_bot, set())
+    for target_id in _event_reply_target_ids(event):
+        try:
+            marker = weather_memory.load_conversation_state(
+                _bot_reply_marker_key(chat_id, target_id)
+            )
+            marker_role = str(marker.get("bot_role") or "") if marker else ""
+            if (
+                marker
+                and marker.get("source") == "recorded_bot_reply"
+                and marker_role in allowed_marker_roles
+            ):
+                return True
+
+            # Backward compatibility for scheduled briefing cards sent before the strict gate.
+            scheduled_key = _conversation_key(
+                WEATHER_FORECAST_BOT_ROLE,
+                chat_id,
+                target_id,
+                "*",
+                _event_chat_type(event),
+            )
+            scheduled_state = weather_memory.load_conversation_state(scheduled_key)
+            if (
+                allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_LEGACY_BOT}
+                and scheduled_state
+                and scheduled_state.get("source") == "scheduled_briefing"
+            ):
+                return True
+        except Exception:  # noqa: BLE001 - fail closed when reply ownership cannot be proven
+            logger.exception("feishu_bot_reply_marker_load_failed chat_id=%s", chat_id)
+            return False
+    return False
 
 
 def _is_direct_chat(event: dict[str, Any]) -> bool:
@@ -1882,24 +2019,13 @@ def _is_direct_chat(event: dict[str, Any]) -> bool:
     return str(chat_type).lower() in {"p2p", "private", "single", "direct"}
 
 
-def _is_clear_weather_query(text: str) -> bool:
-    """群里未被@时, 仅"自带地点/经纬度/台风/多地对比"的明确天气查询才免@自动回;
-    无城市的"会下雨吗"、跟进短语、闲聊等一律不触发, 避免在群里插话刷屏。"""
-    if not _is_weather_command(text):
-        return False
-    return bool(
-        _explicit_region_from_text(text)
-        or _coordinates_from_text(text)
-        or mentions_typhoon(text)
-        or len(_comparison_regions_from_text(text)) >= 2
-    )
-
-
 def _bot_aliases(allowed_bot: str) -> list[str]:
     if allowed_bot == FEISHU_WEATHER_BOT:
         return WEATHER_BOT_ALIASES
     if allowed_bot == FEISHU_TASK_BOT:
         return TASK_BOT_ALIASES
+    if allowed_bot == FEISHU_LEGACY_BOT:
+        return WEATHER_BOT_ALIASES + TASK_BOT_ALIASES
     return []
 
 
@@ -2012,6 +2138,11 @@ async def _send_feishu_event_response(
                 message_id = await feishu_client.send_text_message(chat_id, text)
         if message_id:
             result["event_reply_message_id"] = message_id
+            _remember_bot_reply_message(
+                event,
+                message_id,
+                str(result.get("bot_role") or ""),
+            )
     except Exception as exc:  # noqa: BLE001 - ack the event even when message delivery fails
         result["event_reply_error"] = str(exc)
     if isinstance(submission_to_record, WeatherSubmission) and record_submission:
@@ -2095,6 +2226,15 @@ async def _send_feishu_event_response(
                     "metrics": result.get("metrics") or [],
                 }
                 weather_memory.save_conversation_state(state_key, state)
+                if message_id and not _event_thread_id(event):
+                    reply_thread_key = _conversation_key(
+                        WEATHER_FORECAST_BOT_ROLE,
+                        chat_id,
+                        message_id,
+                        _event_sender_id(event),
+                        _event_chat_type(event),
+                    )
+                    weather_memory.save_conversation_state(reply_thread_key, state)
         task_payload = result.get("task")
         if isinstance(task_payload, dict) and task_payload.get("task_id"):
             state_key = _conversation_state_key(event, WEATHER_TASK_BOT_ROLE)
@@ -2102,6 +2242,15 @@ async def _send_feishu_event_response(
                 state = weather_memory.load_conversation_state(state_key) or {"state_version": 1}
                 state["last_task_id"] = str(task_payload["task_id"])
                 weather_memory.save_conversation_state(state_key, state)
+                if message_id and not _event_thread_id(event):
+                    reply_thread_key = _conversation_key(
+                        WEATHER_TASK_BOT_ROLE,
+                        chat_id,
+                        message_id,
+                        _event_sender_id(event),
+                        _event_chat_type(event),
+                    )
+                    weather_memory.save_conversation_state(reply_thread_key, state)
     except Exception:  # noqa: BLE001
         pass
     return result

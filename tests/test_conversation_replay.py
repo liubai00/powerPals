@@ -98,6 +98,8 @@ def _event(
         "message_type": "text",
         "content": f'{{"text": "{text}"}}',
     }
+    if chat_type == "group" and text.lstrip().startswith("@云云"):
+        message["mentions"] = [{"key": "@_user_1", "name": "云云"}]
     if thread_id:
         message["thread_id"] = thread_id
     if root_id:
@@ -258,6 +260,93 @@ def test_context_is_isolated_by_user_inside_same_thread(monkeypatch, isolated_db
     followup = service.requests[before:]
     assert len(followup) == 1
     assert followup[0].region == "广州"
+
+
+def test_group_reply_without_mention_only_works_for_recorded_bot_message(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    def post_weather(client: TestClient, event: dict) -> dict:
+        response = client.post("/feishu/events/weather", json=event)
+        assert response.status_code == 200
+        return response.json()
+
+    with TestClient(app) as client:
+        first = post_weather(
+            client,
+            _event(
+                "@云云 广州天气",
+                message_id="bot-reply-seed",
+                chat_type="group",
+            ),
+        )
+        requests_before_reply = len(service.requests)
+        trusted_reply = post_weather(
+            client,
+            _event(
+                "明天呢",
+                message_id="trusted-bot-reply",
+                chat_type="group",
+                root_id=first["event_reply_message_id"],
+            ),
+        )
+        untrusted_reply = post_weather(
+            client,
+            _event(
+                "明天呢",
+                message_id="untrusted-thread-reply",
+                chat_type="group",
+                root_id="somebody-elses-message",
+            ),
+        )
+
+    assert first["status"] == "handled"
+    assert trusted_reply["status"] == "handled"
+    assert len(service.requests) == requests_before_reply + 1
+    assert service.requests[-1].region == "广州"
+    assert untrusted_reply == {
+        "status": "ignored",
+        "bot_role": "weather_forecast_bot",
+        "reason": "group_message_not_addressed",
+    }
+
+
+def test_group_reply_marker_is_isolated_by_bot_role(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    app = create_app(settings=_settings(), forecast_service=CapturingForecastService())
+
+    with TestClient(app) as client:
+        weather_response = client.post(
+            "/feishu/events/weather",
+            json=_event(
+                "@云云 广州天气",
+                message_id="role-weather-seed",
+                chat_type="group",
+            ),
+        ).json()
+        task_response = client.post(
+            "/feishu/events/task",
+            json=_event(
+                "明天呢",
+                message_id="role-task-cross-reply",
+                chat_type="group",
+                root_id=weather_response["event_reply_message_id"],
+            ),
+        ).json()
+
+    assert weather_response["status"] == "handled"
+    assert task_response == {
+        "status": "ignored",
+        "bot_role": "weather_task_bot",
+        "reason": "group_message_not_addressed",
+    }
 
 
 def test_duplicate_event_is_deduplicated_across_app_restart(monkeypatch, isolated_db_path) -> None:
@@ -522,7 +611,7 @@ def test_scheduled_briefing_thread_pointer_allows_any_replying_user_to_expand(
         generated = _post(
             client,
             _event(
-                "生成今天的电力气象决策晨报 2.0",
+                "@云云 生成今天的电力气象决策晨报 2.0",
                 message_id="scheduled-seed",
                 chat_id="scheduled-chat",
                 sender_id="operator",
@@ -568,7 +657,11 @@ def test_scheduled_briefing_thread_pointer_allows_any_replying_user_to_expand(
     assert expanded["status"] == "handled"
     assert expanded["mode"] == "power_briefing_expand"
     assert len(service.requests) == requests_after_generation
-    assert unrelated_thread["status"] == "needs_briefing_context"
+    assert unrelated_thread == {
+        "status": "ignored",
+        "bot_role": "legacy_combined_bot",
+        "reason": "group_message_not_addressed",
+    }
 
 
 def test_expand_all_markets_without_prior_briefing_does_not_fetch(

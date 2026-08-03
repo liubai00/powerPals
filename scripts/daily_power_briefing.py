@@ -109,7 +109,7 @@ async def go(mode: str | None = None) -> None:
         )
     )
 
-    selected_mode = (mode or os.getenv("POWER_BRIEFING_MODE") or "send").strip().lower()
+    selected_mode = (mode or os.getenv("POWER_BRIEFING_MODE") or "precompute").strip().lower()
     dry_run = os.getenv("DRY_RUN") == "1"
     if selected_mode == "precompute" or dry_run:
         card = snapshot["summary_card"]
@@ -128,6 +128,9 @@ async def go(mode: str | None = None) -> None:
         return
     if selected_mode != "send":
         raise ValueError(f"unsupported POWER_BRIEFING_MODE: {selected_mode}")
+    if os.getenv("POWER_BRIEFING_ALLOW_SEND") != "1":
+        print("NO-SEND mode=send reason=POWER_BRIEFING_ALLOW_SEND_disabled")
+        return
 
     legacy = m._legacy_feishu_account(settings, None)
     account = m._role_feishu_account(settings, m.FEISHU_WEATHER_BOT, legacy)
@@ -154,7 +157,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=("precompute", "send"),
-        default=os.getenv("POWER_BRIEFING_MODE") or "send",
+        default=os.getenv("POWER_BRIEFING_MODE") or "precompute",
     )
     return parser.parse_args()
 
