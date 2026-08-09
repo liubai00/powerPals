@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+import logging
 from typing import Protocol
 
 from services.weather_bot.aggregation import aggregate_provider_forecasts
 from services.weather_bot.config import Settings
+from services.weather_bot.controlled_learning import ControlledLearningStore
 from services.weather_bot.location import LocationResolver, apply_location, location_payload, location_slug
 from services.weather_bot.llm import LlmClient
 from services.weather_bot.models import (
@@ -23,6 +25,7 @@ from services.weather_bot.providers import build_default_providers
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
+logger = logging.getLogger(__name__)
 
 
 class WeatherProvider(Protocol):
@@ -50,9 +53,28 @@ class ForecastService:
             llm_client=llm_client,
         )
         self.location_resolver = location_resolver or LocationResolver(self.settings)
+        self.learning_store: ControlledLearningStore | None = None
+        if self.settings.controlled_learning_enabled:
+            try:
+                self.learning_store = ControlledLearningStore(self.settings.controlled_learning_db)
+            except Exception:  # noqa: BLE001 - learning must never break weather service startup
+                logger.exception("controlled_learning_store_init_failed")
 
     async def forecast(self, request: ForecastRequest) -> WeatherSubmission:
-        location = await self.location_resolver.resolve(request)
+        try:
+            location = await self.location_resolver.resolve(request)
+        except Exception as exc:
+            self._record_learning_signal(
+                "forecast_request_failed",
+                "error",
+                {
+                    "stage": "location_resolution",
+                    "region": request.region,
+                    "target_date": request.target_date,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
         request = apply_location(request, location)
         provider_results = []
         for provider_name in request.providers:
@@ -75,7 +97,23 @@ class ForecastService:
                     ProviderForecast(provider=provider_name, status="error", points=[], error_message=str(exc))
                 )
 
-        aggregated = aggregate_provider_forecasts(provider_results)
+        try:
+            aggregated = aggregate_provider_forecasts(provider_results)
+        except Exception as exc:
+            self._record_learning_signal(
+                "forecast_unusable",
+                "error",
+                {
+                    "stage": "provider_aggregation",
+                    "region": request.region,
+                    "target_date": request.target_date,
+                    "provider_status": {
+                        result.provider: result.status for result in provider_results
+                    },
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
         submit_time = _submit_time(request.target_date)
         data_cutoff_time = _data_cutoff_time(request.target_date)
         forecast_start, forecast_end = _forecast_window(request.target_date)
@@ -119,7 +157,30 @@ class ForecastService:
             risk_notes=submission.risk_notes,
             business_readable_summary=_business_summary(submission),
         )
+        if self.learning_store is not None:
+            try:
+                self.learning_store.record_forecast_snapshot(submission)
+            except Exception:  # noqa: BLE001 - evidence collection is best effort only
+                logger.exception("controlled_learning_snapshot_failed")
         return submission
+
+    def _record_learning_signal(
+        self,
+        signal_type: str,
+        severity: str,
+        payload: dict[str, object],
+    ) -> None:
+        if self.learning_store is None:
+            return
+        try:
+            self.learning_store.record_signal(
+                signal_type,
+                "forecast_service",
+                severity,
+                payload,
+            )
+        except Exception:  # noqa: BLE001 - evidence collection is best effort only
+            logger.exception("controlled_learning_signal_failed signal_type=%s", signal_type)
 
 
 def _task_id(target_date: str, location_token: str) -> str:

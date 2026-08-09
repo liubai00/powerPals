@@ -256,6 +256,37 @@ examples/weather_submission_shenzhen.json
 schemas/weather_submission_v1.schema.json
 ```
 
+## 受控持续学习 1.0
+
+云云支持离线、可审计的“受控持续学习”，但不会自行修改代码、配置或数据源权重，也不会通过学习任务发送飞书消息。学习输入来自自动生成的解析案例、管理员补充的结构化案例，以及预报到期后的公开历史参考天气评分。当前参考源是 Open-Meteo 历史格点/再分析数据，不等同于官方气象站实况。
+
+本地运行完整周期（回放 + 到期实况评分 + 候选报告）：
+
+```powershell
+python -m services.weather_bot.controlled_learning_cli run
+```
+
+不访问外部实况、只验证本地解析链路：
+
+```powershell
+python -m services.weather_bot.controlled_learning_cli run --skip-truth --strict
+```
+
+管理员案例使用 `ReplayCase` JSON，通过 CLI 加入；案例不会从普通飞书聊天自动收集：
+
+```powershell
+python -m services.weather_bot.controlled_learning_cli add-case --file .\my-replay-case.json
+```
+
+查看候选及记录人工决定：
+
+```powershell
+python -m services.weather_bot.controlled_learning_cli candidates --status pending
+python -m services.weather_bot.controlled_learning_cli decide cand-xxxxxxxxxxxxxxxx --status approved --actor admin --reason "已完成人工复核"
+```
+
+`approved` 只表示审计状态，不会自动应用。真正变更仍需独立修改、全量测试、提交和部署。周期报告默认写入 `data/controlled_learning/reports/`，生产定时任务模板见 `deploy/controlled_learning.cron`。
+
 ## 最小裁判评分
 
 `/api/judge/weather/score` 用于后续裁判 Bot 的第一步，不依赖大模型，不生成榜单。输入：

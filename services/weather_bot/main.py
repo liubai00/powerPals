@@ -434,7 +434,7 @@ def create_app(
     forecast_report_cache: dict[str, tuple[float, list[WeatherSubmission], list[dict[str, str]]]] = {}
     pending_region_clarifications: dict[str, dict[str, Any]] = {}
 
-    app = FastAPI(title="PowerPals Weather Data Workbench", version="0.6.0")
+    app = FastAPI(title="PowerPals Weather Data Workbench", version="0.7.0")
 
     def _cache_task(task: WeatherTask) -> WeatherTask:
         task_index[task.task_id] = task
@@ -2821,6 +2821,16 @@ def _explicit_region_from_text(text: str) -> str | None:
     if suffixed_region and (builtin_region is None or len(suffixed_region) > len(builtin_region)):
         return LOCATION_ALIAS_MAP.get(suffixed_region, suffixed_region)
     if builtin_region:
+        # “辽宁盘锦”既包含省名也包含已知地级市。省名先命中时继续检查更具体的
+        # 城市别名，避免退回省级代表点或依赖 LLM 才能纠正。
+        if _is_province_only_region(builtin_region) and _has_extra_place_after_province(search_text, builtin_region):
+            province_canonical = LOCATION_ALIAS_MAP.get(builtin_region, builtin_region)
+            province_prefix = re.sub(r"(?:维吾尔自治区|壮族自治区|回族自治区|自治区|省)$", "", province_canonical)
+            for alias, normalized in sorted(LOCATION_ALIASES, key=lambda item: len(item[0]), reverse=True):
+                if _is_province_only_region(alias) or alias not in search_text:
+                    continue
+                if str(normalized).startswith(province_prefix):
+                    return normalized
         return builtin_region
     if suffixed_region:
         return LOCATION_ALIAS_MAP.get(suffixed_region, suffixed_region)

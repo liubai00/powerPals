@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     local_hydrology_jsonl_path: str = "data/hydrology_records.jsonl"
     power_briefing_cache_db: str = "data/power_briefing_cache.db"
     power_briefing_cache_ttl_seconds: int = 86400
+    controlled_learning_enabled: bool = False
+    controlled_learning_db: str = "data/controlled_learning.db"
+    controlled_learning_report_dir: str = "data/controlled_learning/reports"
+    controlled_learning_truth_delay_days: int = 1
+    controlled_learning_min_provider_samples: int = 5
+    controlled_learning_archive_api_url: str = "https://archive-api.open-meteo.com/v1/archive"
     public_base_url: str | None = None
     default_weather_region: str = "广东省深圳市"
     default_weather_latitude: float | None = None
