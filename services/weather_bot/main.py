@@ -12,13 +12,18 @@ from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, Response
 
 from services.weather_bot.bot_identity import mentions_expected_bot
+from services.weather_bot.admin_actions import (
+    AdminActionLedger,
+    InvalidIdempotencyKey,
+    canonical_request_fingerprint,
+)
 from services.weather_bot.cards import build_feishu_card, build_text_reply_card, build_weather_comparison_card, is_rich_reply_text
-from services.weather_bot.auth import AdminApiAuthenticator
+from services.weather_bot.auth import AdminApiAuthenticator, parse_admin_roles
 from services.weather_bot.config import Settings
 from services.weather_bot.decision_boundary import weather_only_boundary_answer
 from services.weather_bot.electricity_entities import (
@@ -46,7 +51,6 @@ from services.weather_bot.location import (
     starts_with_province_scope_modifier,
 )
 from services.weather_bot.logging_safety import (
-    redact_sensitive_text,
     safe_error_summary,
     text_log_metadata,
 )
@@ -58,10 +62,11 @@ from services.weather_bot.official_warnings import (
 )
 from services.weather_bot.power_briefing_markets import NATIONAL_MARKETS, MarketZone, RepresentativePoint
 from services.weather_bot.service import ForecastService
-from services.weather_bot.send_policy import AdminSendPolicy
+from services.weather_bot.send_policy import AdminSendPolicy, parse_target_allowlist
 from services.weather_bot.source_registry import SourceRegistry
 from services.weather_bot.storage import JsonlRecorder
 from services.weather_bot.subscription_runtime import SubscriptionCoordinator
+from services.weather_bot.subscription_commands import parse_subscription_command
 from services.weather_bot.subscriptions import ConversationScope, SubscriptionStore
 from services.weather_bot.typhoon import (
     QWEATHER_TYPHOON_PROVIDER,
@@ -105,6 +110,10 @@ WEATHER_FORECAST_BOT_ROLE = "weather_forecast_bot"
 WEATHER_TASK_BOT_ROLE = "weather_task_bot"
 _FEISHU_EVENT_AUTHENTICATED = "_weather_bot_callback_authenticated"
 _FEISHU_GROUP_ADDRESS_VERIFIED = "_weather_bot_group_address_verified"
+_FEISHU_PASSIVE_DELIVERY_ENABLED = "_weather_bot_passive_delivery_enabled"
+_FEISHU_HISTORY_ENABLED = "_weather_bot_history_enabled"
+_FEISHU_HISTORY_TTL_SECONDS = "_weather_bot_history_ttl_seconds"
+_FEISHU_HISTORY_MAX_TURNS = "_weather_bot_history_max_turns"
 WEATHER_BOT_ALIASES = ["云云", "AI气象预测小助手", "气象预测小助手", "气象小助手", "全国气象预测机器人"]
 TASK_BOT_ALIASES = ["点点", "AI任务小助手", "任务小助手", "气象任务发布机器人"]
 WEATHER_TASK_ID_RE = re.compile(r"WEATHER-CN-(.+)-(\d{4})(\d{2})(\d{2})-DAYAHEAD-001")
@@ -420,15 +429,33 @@ def _record_conversation_turn(
     user_text: str,
     bot_text: str,
     chat_type: str = "",
+    *,
+    history_enabled: bool = False,
+    history_ttl_seconds: int = weather_memory.TURN_TTL_SECONDS,
+    history_max_turns: int = weather_memory.TURN_MAX_PER_KEY,
 ) -> None:
-    if not chat_id or not (user_text or bot_text):
+    if not history_enabled or not chat_id or not (user_text or bot_text):
         return
     key = _conversation_key(bot_role, chat_id, thread_id, sender_id, chat_type)
     try:
         if user_text and user_text.strip():
-            weather_memory.record_turn(key, "user", user_text.strip())
+            weather_memory.record_turn(
+                key,
+                "user",
+                user_text.strip(),
+                enabled=True,
+                ttl_seconds=history_ttl_seconds,
+                max_per_key=history_max_turns,
+            )
         if bot_text and bot_text.strip():
-            weather_memory.record_turn(key, "assistant", bot_text.strip())
+            weather_memory.record_turn(
+                key,
+                "assistant",
+                bot_text.strip(),
+                enabled=True,
+                ttl_seconds=history_ttl_seconds,
+                max_per_key=history_max_turns,
+            )
     except Exception:  # noqa: BLE001 - 记忆失败不影响主流程
         pass
 
@@ -439,13 +466,20 @@ def _recent_conversation_turns(
     thread_id: str | None,
     sender_id: str,
     chat_type: str = "",
+    *,
+    history_enabled: bool = False,
+    history_ttl_seconds: int = weather_memory.TURN_TTL_SECONDS,
 ) -> list[dict[str, str]]:
-    if not chat_id:
+    if not history_enabled or not chat_id:
         return []
     try:
         # bot / chat type / chat / thread / sender 五维严格隔离。群内协作不应以串用户上下文为代价。
         key = _conversation_key(bot_role, chat_id, thread_id, sender_id, chat_type)
-        return weather_memory.recent_turns(key)
+        return weather_memory.recent_turns(
+            key,
+            enabled=True,
+            ttl_seconds=history_ttl_seconds,
+        )
     except Exception:  # noqa: BLE001
         return []
 
@@ -456,6 +490,11 @@ def create_app(
     settings: Settings | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
+    if not settings.conversation_history_enabled:
+        try:
+            weather_memory.purge_conversation_history()
+        except Exception:  # noqa: BLE001 - optional history cleanup is best effort
+            logger.exception("conversation_history_startup_purge_failed")
     source_registry = SourceRegistry.from_json(
         settings.weather_source_policies_json,
         environment=settings.app_env,
@@ -497,13 +536,48 @@ def create_app(
     fallback_processed_message_ids: dict[str, float] = {}
     forecast_report_cache: dict[str, tuple[float, list[WeatherSubmission], list[dict[str, str]]]] = {}
     forecast_evidence_history: dict[tuple[str, str], list[WeatherSubmission]] = {}
-    require_admin_api = AdminApiAuthenticator(settings.admin_api_token)
+    require_admin_api = AdminApiAuthenticator(
+        settings.admin_api_token,
+        actor_id=settings.admin_api_actor_id,
+        roles=parse_admin_roles(settings.admin_api_roles_json),
+        environment=settings.app_env,
+    )
+
+    async def require_external_data_workbench() -> None:
+        if not settings.external_data_workbench_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "External news/hydrology workbench is disabled until a "
+                    "provenance and retention adapter is reviewed"
+                ),
+            )
     admin_send_policy = AdminSendPolicy(
         global_send_enabled=settings.global_feishu_send_enabled,
         dry_run=settings.dry_run,
+        admin_send_enabled=settings.admin_api_send_enabled,
+        admin_send_targets=parse_target_allowlist(settings.admin_api_send_targets_json),
     )
-    subscription_store = SubscriptionStore(settings.subscriptions_db)
-    subscription_coordinator = SubscriptionCoordinator(subscription_store)
+    admin_principal = require_admin_api.principal
+    admin_action_ledger = AdminActionLedger(
+        settings.admin_api_audit_db,
+        actor_id=admin_principal.actor_id if admin_principal else "unbound",
+        role=(
+            sorted(admin_principal.roles)[0]
+            if admin_principal and admin_principal.roles
+            else "unbound"
+        ),
+    )
+    subscription_store = (
+        SubscriptionStore(settings.subscriptions_db)
+        if settings.subscriptions_enabled
+        else None
+    )
+    subscription_coordinator = (
+        SubscriptionCoordinator(subscription_store)
+        if subscription_store is not None
+        else None
+    )
     allow_unsigned_feishu_events = unsigned_feishu_events_allowed(settings)
     try:
         configured_subscription_admins = json.loads(
@@ -676,6 +750,7 @@ def create_app(
         if not chat_id or not retry_text or not _is_weather_command(retry_text):
             return
         try:
+            request = _request_from_text(retry_text)
             weather_memory.save_retry_request(
                 _pending_region_key(
                     allowed_bot,
@@ -686,7 +761,12 @@ def create_app(
                 ),
                 {
                     "command_type": "forecast",
-                    "text": redact_sensitive_text(retry_text)[:300],
+                    "region": request.region,
+                    "latitude": request.latitude,
+                    "longitude": request.longitude,
+                    "target_date": request.target_date,
+                    "days": request.days,
+                    "metrics": weather_metrics_from_text(retry_text),
                 },
             )
         except Exception:  # noqa: BLE001 - retry state is best effort
@@ -986,27 +1066,42 @@ def create_app(
         deleted = location_book.delete(alias)
         return {"status": "deleted" if deleted else "not_found", "alias": alias}
 
-    @app.post("/api/news/items", dependencies=[Depends(require_admin_api)])
+    @app.post(
+        "/api/news/items",
+        dependencies=[Depends(require_admin_api), Depends(require_external_data_workbench)],
+    )
     async def create_news_item(item: NewsItem) -> dict[str, Any]:
         news_recorder.append(item)
         return {"status": "accepted", "item": item.model_dump(mode="json")}
 
-    @app.get("/api/news/digest")
+    @app.get(
+        "/api/news/digest",
+        dependencies=[Depends(require_admin_api), Depends(require_external_data_workbench)],
+    )
     async def news_digest() -> dict[str, Any]:
         items = news_recorder.read_json_objects()
         return {"status": "ok", "count": len(items), "items": list(reversed(items))}
 
-    @app.post("/api/hydrology/records", dependencies=[Depends(require_admin_api)])
+    @app.post(
+        "/api/hydrology/records",
+        dependencies=[Depends(require_admin_api), Depends(require_external_data_workbench)],
+    )
     async def create_hydrology_record(record: HydrologyRecord) -> dict[str, Any]:
         hydrology_recorder.append(record)
         return {"status": "accepted", "record": record.model_dump(mode="json")}
 
-    @app.get("/api/hydrology/records")
+    @app.get(
+        "/api/hydrology/records",
+        dependencies=[Depends(require_admin_api), Depends(require_external_data_workbench)],
+    )
     async def list_hydrology_records() -> dict[str, Any]:
         records = hydrology_recorder.read_json_objects()
         return {"status": "ok", "count": len(records), "records": list(reversed(records))}
 
-    @app.get("/api/hydrology/export")
+    @app.get(
+        "/api/hydrology/export",
+        dependencies=[Depends(require_admin_api), Depends(require_external_data_workbench)],
+    )
     async def export_hydrology_records() -> Response:
         return Response(
             content="\ufeff" + hydrology_csv(hydrology_recorder.read_json_objects()),
@@ -1030,24 +1125,69 @@ def create_app(
         return score_weather_submission(request)
 
     @app.post("/api/weather/publish", dependencies=[Depends(require_admin_api)])
-    async def publish(request: ForecastRequest | None = None) -> dict[str, Any]:
+    async def publish(
+        http_request: Request,
+        request: ForecastRequest | None = None,
+    ) -> dict[str, Any]:
         request = request or _tomorrow_request()
-        result = await service.forecast(request)
-        card = build_feishu_card(result, show_task_id=True)
-        card_message_id = None
         card_send_decision = admin_send_policy.card_send_decision(weather_account.default_chat_id)
         external_write_decision = admin_send_policy.external_write_decision()
-        if card_send_decision.allowed:
-            card_message_id = await weather_feishu.send_interactive_card(weather_account.default_chat_id, card)
-        if external_write_decision.allowed:
-            recorder.append(SubmissionRecord(submission=result, card_message_id=card_message_id))
-            await weather_feishu.write_bitable_record(result, card_message_id)
-        return {
-            "status": "published" if external_write_decision.allowed else "generated",
-            "submission": result.model_dump(mode="json"),
-            "card": card,
-            "delivery": card_send_decision.as_dict(),
-        }
+        action_claim = None
+        idempotency_key = ""
+        if external_write_decision.allowed and settings.admin_api_idempotency_required:
+            idempotency_key = http_request.headers.get("idempotency-key", "")
+            try:
+                action_claim = admin_action_ledger.claim(
+                    "weather.publish",
+                    idempotency_key,
+                    canonical_request_fingerprint(request.model_dump(mode="json")),
+                )
+            except InvalidIdempotencyKey as exc:
+                raise HTTPException(status_code=428, detail=str(exc)) from exc
+            if action_claim.status == "replay" and action_claim.response is not None:
+                return action_claim.response
+            if action_claim.status == "conflict":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used for a different request",
+                )
+            if action_claim.status == "in_progress":
+                raise HTTPException(status_code=409, detail="Administrative action is in progress")
+        try:
+            result = await service.forecast(request)
+            card = build_feishu_card(result, show_task_id=True)
+            card_message_id = None
+            if card_send_decision.allowed:
+                card_message_id = await weather_feishu.send_interactive_card(
+                    weather_account.default_chat_id,
+                    card,
+                    idempotency_key=action_claim.send_uuid if action_claim else None,
+                )
+            if external_write_decision.allowed:
+                recorder.append(SubmissionRecord(submission=result, card_message_id=card_message_id))
+                await weather_feishu.write_bitable_record(result, card_message_id)
+            response: dict[str, Any] = {
+                "status": "published" if external_write_decision.allowed else "generated",
+                "submission": result.model_dump(mode="json"),
+                "card": card,
+                "delivery": card_send_decision.as_dict(),
+            }
+            if action_claim and action_claim.owner_token:
+                admin_action_ledger.complete(
+                    "weather.publish",
+                    idempotency_key,
+                    action_claim.owner_token,
+                    response,
+                )
+            return response
+        except Exception:
+            if action_claim and action_claim.owner_token:
+                admin_action_ledger.fail(
+                    "weather.publish",
+                    idempotency_key,
+                    action_claim.owner_token,
+                )
+            raise
 
     @app.post("/api/tasks/weather/create", dependencies=[Depends(require_admin_api)])
     async def create_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
@@ -1056,51 +1196,149 @@ def create_app(
         return task.model_dump(mode="json")
 
     @app.post("/api/tasks/weather/publish", dependencies=[Depends(require_admin_api)])
-    async def publish_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
-        location = await _resolve_task_location(location_resolver, request)
+    async def publish_weather_task(
+        http_request: Request,
+        request: WeatherTaskRequest,
+    ) -> dict[str, Any]:
         external_write_decision = admin_send_policy.external_write_decision()
-        task = task_service.create_dayahead_task(request.target_date, location, request.days)
-        if external_write_decision.allowed:
-            task = task_service.publish(task)
-        card = build_task_card(task)
-        text = build_task_text(task)
-        card_message_id = None
         card_send_decision = admin_send_policy.card_send_decision(task_account.default_chat_id)
-        if card_send_decision.allowed:
-            card_message_id = await task_feishu.send_interactive_card(task_account.default_chat_id, card)
-        if external_write_decision.allowed:
-            task = _cache_task(task.model_copy(update={"task_card_message_id": card_message_id}))
-            task_recorder.append(task)
-            await task_feishu.write_task_bitable_record(task)
-        return {
-            "status": "published" if external_write_decision.allowed else "generated",
-            "task": task.model_dump(mode="json"),
-            "card": card,
-            "text": text,
-            "delivery": card_send_decision.as_dict(),
-        }
+        action_claim = None
+        idempotency_key = ""
+        if external_write_decision.allowed and settings.admin_api_idempotency_required:
+            idempotency_key = http_request.headers.get("idempotency-key", "")
+            try:
+                action_claim = admin_action_ledger.claim(
+                    "tasks.weather.publish",
+                    idempotency_key,
+                    canonical_request_fingerprint(request.model_dump(mode="json")),
+                )
+            except InvalidIdempotencyKey as exc:
+                raise HTTPException(status_code=428, detail=str(exc)) from exc
+            if action_claim.status == "replay" and action_claim.response is not None:
+                return action_claim.response
+            if action_claim.status == "conflict":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used for a different request",
+                )
+            if action_claim.status == "in_progress":
+                raise HTTPException(status_code=409, detail="Administrative action is in progress")
+        try:
+            location = await _resolve_task_location(location_resolver, request)
+            task = task_service.create_dayahead_task(request.target_date, location, request.days)
+            if external_write_decision.allowed:
+                task = task_service.publish(task)
+            card = build_task_card(task)
+            text = build_task_text(task)
+            card_message_id = None
+            if card_send_decision.allowed:
+                card_message_id = await task_feishu.send_interactive_card(
+                    task_account.default_chat_id,
+                    card,
+                    idempotency_key=action_claim.send_uuid if action_claim else None,
+                )
+            if external_write_decision.allowed:
+                task = _cache_task(task.model_copy(update={"task_card_message_id": card_message_id}))
+                task_recorder.append(task)
+                await task_feishu.write_task_bitable_record(task)
+            response: dict[str, Any] = {
+                "status": "published" if external_write_decision.allowed else "generated",
+                "task": task.model_dump(mode="json"),
+                "card": card,
+                "text": text,
+                "delivery": card_send_decision.as_dict(),
+            }
+            if action_claim and action_claim.owner_token:
+                admin_action_ledger.complete(
+                    "tasks.weather.publish",
+                    idempotency_key,
+                    action_claim.owner_token,
+                    response,
+                )
+            return response
+        except Exception:
+            if action_claim and action_claim.owner_token:
+                admin_action_ledger.fail(
+                    "tasks.weather.publish",
+                    idempotency_key,
+                    action_claim.owner_token,
+                )
+            raise
 
     @app.post("/api/tasks/weather/remind", dependencies=[Depends(require_admin_api)])
-    async def remind_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
-        location = await _resolve_task_location(location_resolver, request)
-        task = task_service.remind(task_service.publish(task_service.create_dayahead_task(request.target_date, location, request.days)))
-        card = build_task_card(task)
+    async def remind_weather_task(
+        http_request: Request,
+        request: WeatherTaskRequest,
+    ) -> dict[str, Any]:
         card_send_decision = admin_send_policy.card_send_decision(task_account.default_chat_id)
         external_write_decision = admin_send_policy.external_write_decision()
-        if card_send_decision.allowed:
-            card_message_id = await task_feishu.send_interactive_card(task_account.default_chat_id, card)
-            task = task.model_copy(update={"task_card_message_id": card_message_id})
-        if external_write_decision.allowed:
-            task = _cache_task(task)
-            task_recorder.append(task)
-            await task_feishu.write_task_bitable_record(task)
-        return {
-            "status": "published" if external_write_decision.allowed else "generated",
-            "task": task.model_dump(mode="json"),
-            "card": card,
-            "text": build_task_text(task),
-            "delivery": card_send_decision.as_dict(),
-        }
+        action_claim = None
+        idempotency_key = ""
+        if external_write_decision.allowed and settings.admin_api_idempotency_required:
+            idempotency_key = http_request.headers.get("idempotency-key", "")
+            try:
+                action_claim = admin_action_ledger.claim(
+                    "tasks.weather.remind",
+                    idempotency_key,
+                    canonical_request_fingerprint(request.model_dump(mode="json")),
+                )
+            except InvalidIdempotencyKey as exc:
+                raise HTTPException(status_code=428, detail=str(exc)) from exc
+            if action_claim.status == "replay" and action_claim.response is not None:
+                return action_claim.response
+            if action_claim.status == "conflict":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used for a different request",
+                )
+            if action_claim.status == "in_progress":
+                raise HTTPException(status_code=409, detail="Administrative action is in progress")
+        try:
+            location = await _resolve_task_location(location_resolver, request)
+            task = task_service.remind(
+                task_service.publish(
+                    task_service.create_dayahead_task(
+                        request.target_date,
+                        location,
+                        request.days,
+                    )
+                )
+            )
+            card = build_task_card(task)
+            if card_send_decision.allowed:
+                card_message_id = await task_feishu.send_interactive_card(
+                    task_account.default_chat_id,
+                    card,
+                    idempotency_key=action_claim.send_uuid if action_claim else None,
+                )
+                task = task.model_copy(update={"task_card_message_id": card_message_id})
+            if external_write_decision.allowed:
+                task = _cache_task(task)
+                task_recorder.append(task)
+                await task_feishu.write_task_bitable_record(task)
+            response: dict[str, Any] = {
+                "status": "published" if external_write_decision.allowed else "generated",
+                "task": task.model_dump(mode="json"),
+                "card": card,
+                "text": build_task_text(task),
+                "delivery": card_send_decision.as_dict(),
+            }
+            if action_claim and action_claim.owner_token:
+                admin_action_ledger.complete(
+                    "tasks.weather.remind",
+                    idempotency_key,
+                    action_claim.owner_token,
+                    response,
+                )
+            return response
+        except Exception:
+            if action_claim and action_claim.owner_token:
+                admin_action_ledger.fail(
+                    "tasks.weather.remind",
+                    idempotency_key,
+                    action_claim.owner_token,
+                )
+            raise
 
     @app.post("/api/tasks/weather/close", dependencies=[Depends(require_admin_api)])
     async def close_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
@@ -1997,6 +2235,8 @@ def create_app(
                 _event_thread_id(event),
                 _event_sender_id(event),
                 _event_chat_type(event),
+                history_enabled=settings.conversation_history_enabled,
+                history_ttl_seconds=settings.conversation_history_ttl_seconds,
             )
             if isinstance(event, dict)
             else []
@@ -2061,9 +2301,19 @@ def create_app(
         chat_id = _event_chat_id(event)
         if not chat_id:
             return
+        _record_passive_send_audit(event, bot_role, "attempted")
         try:
-            await feishu_client.send_text_message(chat_id, _progress_text(bot_role))
+            progress_message_id = await feishu_client.send_text_message(
+                chat_id,
+                _progress_text(bot_role),
+            )
+            _record_passive_send_audit(
+                event,
+                bot_role,
+                "sent" if progress_message_id else "failed",
+            )
         except Exception as exc:  # noqa: BLE001 - progress messages are best effort only
+            _record_passive_send_audit(event, bot_role, "failed")
             logger.warning(
                 "feishu_progress_message_failed bot_role=%s error_type=%s",
                 bot_role,
@@ -2164,9 +2414,62 @@ def create_app(
             # structured addressing and message normalization have succeeded.
             event[_FEISHU_GROUP_ADDRESS_VERIFIED] = True
         if allowed_bot == FEISHU_WEATHER_BOT:
+            if (
+                not settings.alert_evaluation_enabled
+                and _is_alert_evaluation_command(text)
+            ):
+                result = (
+                    {
+                        "status": "ignored",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "reason": "alert_evaluation_disabled",
+                    }
+                    if _is_group_chat(event)
+                    else {
+                        "status": "feature_disabled",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "mode": "capability_disabled",
+                        "feature": "alert_evaluation",
+                        "text": "订阅告警评估当前未启用；不会读取天气、评估规则或发送告警。",
+                    }
+                )
+                return await _send_feishu_event_response(
+                    feishu_client,
+                    event,
+                    result,
+                    _record_task_submission,
+                )
             chat_id = _event_chat_id(event)
             sender_id = _event_sender_id(event)
-            if chat_id and sender_id:
+            subscription_command = parse_subscription_command(text)
+            if subscription_command is not None and not settings.subscriptions_enabled:
+                result = (
+                    {
+                        "status": "ignored",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "reason": "subscriptions_disabled",
+                    }
+                    if _is_group_chat(event)
+                    else {
+                        "status": "feature_disabled",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "mode": "capability_disabled",
+                        "feature": "subscriptions",
+                        "text": "订阅能力当前未启用；不会创建、确认、修改或取消订阅。",
+                    }
+                )
+                return await _send_feishu_event_response(
+                    feishu_client,
+                    event,
+                    result,
+                    _record_task_submission,
+                )
+            if (
+                chat_id
+                and sender_id
+                and subscription_coordinator is not None
+                and subscription_store is not None
+            ):
                 subscription_scope = ConversationScope(
                     bot_role=WEATHER_FORECAST_BOT_ROLE,
                     chat_type=_event_chat_type(event),
@@ -2182,6 +2485,11 @@ def create_app(
                 )
                 if subscription_result is not None:
                     subscription_result["bot_role"] = WEATHER_FORECAST_BOT_ROLE
+                    subscription_result["alert_delivery"] = {
+                        "evaluation_enabled": settings.alert_evaluation_enabled,
+                        "send_enabled": settings.alert_send_enabled,
+                        "activation_authorizes_delivery": False,
+                    }
                     return await _send_feishu_event_response(
                         feishu_client,
                         event,
@@ -2208,7 +2516,7 @@ def create_app(
                         )
         if allowed_bot != FEISHU_TASK_BOT and _is_retry_command(text):
             retry_request = _take_retry_request(event, allowed_bot)
-            retry_text = str(retry_request.get("text") or "") if retry_request else ""
+            retry_text = _retry_request_text(retry_request)
             if not retry_text:
                 result = {
                     "status": "handled",
@@ -2275,6 +2583,22 @@ def create_app(
             _clear_pending_region(event, allowed_bot)
             if allowed_bot == FEISHU_TASK_BOT:
                 result = _redirect_to_bot_command(WEATHER_TASK_BOT_ROLE, WEATHER_FORECAST_BOT_ROLE)
+            elif not settings.manual_power_briefing_enabled:
+                result = (
+                    {
+                        "status": "ignored",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "reason": "manual_power_briefing_disabled",
+                    }
+                    if _is_group_chat(event)
+                    else {
+                        "status": "feature_disabled",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "mode": "capability_disabled",
+                        "feature": "manual_power_briefing",
+                        "text": "手动电力气象晨报能力当前未启用；基础城市天气查询仍可使用。",
+                    }
+                )
             else:
                 await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
                 result = await _handle_power_briefing_command(text, event)
@@ -2284,6 +2608,34 @@ def create_app(
                 result,
                 _record_task_submission,
             )
+
+        if not settings.electricity_weather_analysis_enabled:
+            electricity_probe = parse_electricity_entities(text)
+            if _is_renewable_complexity_ranking_query(text) or _has_electricity_weather_context(
+                text,
+                electricity_probe,
+            ):
+                result = (
+                    {
+                        "status": "ignored",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "reason": "electricity_weather_analysis_disabled",
+                    }
+                    if _is_group_chat(event)
+                    else {
+                        "status": "feature_disabled",
+                        "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                        "mode": "capability_disabled",
+                        "feature": "electricity_weather_analysis",
+                        "text": "电力交易气象分析能力当前未启用；基础城市天气查询仍可使用。",
+                    }
+                )
+                return await _send_feishu_event_response(
+                    feishu_client,
+                    event,
+                    result,
+                    _record_task_submission,
+                )
 
         if _is_renewable_complexity_ranking_query(text):
             _clear_pending_region(event, allowed_bot)
@@ -2469,6 +2821,10 @@ def create_app(
             # Callback JSON is attacker-controlled until token verification.
             candidate_event.pop(_FEISHU_EVENT_AUTHENTICATED, None)
             candidate_event.pop(_FEISHU_GROUP_ADDRESS_VERIFIED, None)
+            candidate_event.pop(_FEISHU_PASSIVE_DELIVERY_ENABLED, None)
+            candidate_event.pop(_FEISHU_HISTORY_ENABLED, None)
+            candidate_event.pop(_FEISHU_HISTORY_TTL_SECONDS, None)
+            candidate_event.pop(_FEISHU_HISTORY_MAX_TURNS, None)
         if not verify_feishu_token(
             payload,
             account.verification_token,
@@ -2478,6 +2834,18 @@ def create_app(
         event = payload.get("event", {}) if isinstance(payload, dict) else {}
         if isinstance(event, dict):
             event[_FEISHU_EVENT_AUTHENTICATED] = True
+            event[_FEISHU_PASSIVE_DELIVERY_ENABLED] = (
+                settings.feishu_passive_reply_enabled and not settings.dry_run
+            )
+            event[_FEISHU_HISTORY_ENABLED] = bool(settings.conversation_history_enabled)
+            event[_FEISHU_HISTORY_TTL_SECONDS] = max(
+                1,
+                int(settings.conversation_history_ttl_seconds),
+            )
+            event[_FEISHU_HISTORY_MAX_TURNS] = max(
+                1,
+                int(settings.conversation_history_max_turns),
+            )
         header = payload.get("header", {}) if isinstance(payload, dict) else {}
         event_id = str(header.get("event_id")) if isinstance(header, dict) and header.get("event_id") else None
         if not event_id:
@@ -2495,14 +2863,26 @@ def create_app(
         if event_id:
             try:
                 if not weather_memory.claim_event(allowed_bot, event_id):
-                    logger.warning("feishu_event_duplicate allowed_bot=%s event_id=%s", allowed_bot, event_id)
+                    logger.warning(
+                        "feishu_event_duplicate allowed_bot=%s event_sha256=%s",
+                        allowed_bot,
+                        text_log_metadata(event_id)["text_sha256"],
+                    )
                     return {
                         "status": "ignored",
                         "reason": "duplicate_event",
                         "bot_role": _bot_role_for_allowed_bot(allowed_bot),
                     }
-            except Exception:  # noqa: BLE001 - idempotency storage failure degrades to normal handling
-                logger.exception("feishu_event_claim_failed allowed_bot=%s", allowed_bot)
+            except Exception as exc:  # noqa: BLE001 - duplicate replies are worse than a retryable 503
+                logger.error(
+                    "feishu_event_claim_failed allowed_bot=%s error_type=%s",
+                    allowed_bot,
+                    safe_error_summary(exc),
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Event idempotency unavailable",
+                ) from None
         try:
             result = await _handle_feishu_event(payload, account, feishu_client, allowed_bot)
             if event_id:
@@ -2513,9 +2893,9 @@ def create_app(
                         weather_memory.complete_event(allowed_bot, event_id, result)
                 except Exception as exc:  # noqa: BLE001 - ledger failure must not turn a successful reply into fallback
                     logger.error(
-                        "feishu_event_finalize_failed allowed_bot=%s event_id=%s error_type=%s",
+                        "feishu_event_finalize_failed allowed_bot=%s event_sha256=%s error_type=%s",
                         allowed_bot,
-                        event_id,
+                        text_log_metadata(event_id)["text_sha256"],
                         safe_error_summary(exc),
                     )
             return result
@@ -2541,17 +2921,39 @@ def create_app(
                 event = payload.get("event", {}) if isinstance(payload, dict) else {}
                 chat_id = _event_chat_id(event)
                 if chat_id and _passive_feishu_delivery_allowed(event):
+                    fallback_bot_role = _bot_role_for_allowed_bot(allowed_bot)
                     fallback_text = (
                         "云云处理这条消息时出了点小状况😥 已经记下来修啦~\n"
                         "可以换个问法再试试：查天气用「城市 + 未来3天」；分析类问题稍后再问我一次。"
                     )
                     incoming_message_id = _event_message_id(event)
                     thread_id = _event_thread_id(event)
+                    _record_passive_send_audit(event, fallback_bot_role, "attempted")
                     if incoming_message_id and thread_id:
-                        await feishu_client.reply_text_message(incoming_message_id, fallback_text, in_thread=True)
+                        fallback_message_id = await feishu_client.reply_text_message(
+                            incoming_message_id,
+                            fallback_text,
+                            in_thread=True,
+                        )
                     else:
-                        await feishu_client.send_text_message(chat_id, fallback_text)
+                        fallback_message_id = await feishu_client.send_text_message(
+                            chat_id,
+                            fallback_text,
+                        )
+                    _record_passive_send_audit(
+                        event,
+                        fallback_bot_role,
+                        "sent" if fallback_message_id else "failed",
+                    )
             except Exception:  # noqa: BLE001
+                try:
+                    _record_passive_send_audit(
+                        event,
+                        _bot_role_for_allowed_bot(allowed_bot),
+                        "failed",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 pass
             return {"status": "error_fallback", "bot_role": _bot_role_for_allowed_bot(allowed_bot)}
 
@@ -2819,6 +3221,28 @@ def _merge_pending_region_text(region_text: str, pending: dict[str, Any]) -> str
     return f"{region_text} {target_date} 未来{days}天{suffix}"
 
 
+def _retry_request_text(payload: dict[str, Any] | None) -> str:
+    """Rebuild a deterministic query from minimized retry entities."""
+
+    if not isinstance(payload, dict):
+        return ""
+    region = str(payload.get("region") or "").strip()
+    latitude = payload.get("latitude")
+    longitude = payload.get("longitude")
+    if not region and isinstance(latitude, (int, float)) and isinstance(
+        longitude,
+        (int, float),
+    ):
+        region = f"{float(latitude):.6f},{float(longitude):.6f}"
+    if not region:
+        return ""
+    target_date = str(payload.get("target_date") or "").strip()
+    days = min(16, max(1, int(payload.get("days") or 1)))
+    metric_phrase = weather_metric_phrase(payload.get("metrics"))
+    suffix = f" {metric_phrase}" if metric_phrase else ""
+    return f"{region} {target_date} 未来{days}天{suffix}".strip()
+
+
 def _is_addressed_to_bot(
     _text: str,
     event: dict[str, Any],
@@ -2871,6 +3295,8 @@ def _passive_feishu_delivery_allowed(event: dict[str, Any]) -> bool:
     """Permit an authenticated direct reply or a structurally addressed group."""
 
     if not isinstance(event, dict) or event.get(_FEISHU_EVENT_AUTHENTICATED) is not True:
+        return False
+    if event.get(_FEISHU_PASSIVE_DELIVERY_ENABLED) is not True:
         return False
     if _is_group_chat(event):
         return event.get(_FEISHU_GROUP_ADDRESS_VERIFIED) is True
@@ -2932,6 +3358,14 @@ _OFFICIAL_WARNING_QUERY_RE = re.compile(
     r"(?:官方|气象台|预警中心).{0,10}(?:预警|警报)|"
     r"(?:预警|警报).{0,10}(?:官方|气象台|预警中心)"
 )
+_ALERT_EVALUATION_COMMAND_RE = re.compile(
+    r"(?:立即|现在|重新|手动)?(?:评估|检查|判断|查看).{0,10}(?:订阅|告警|预警).{0,10}(?:触发|命中|生效)|"
+    r"(?:订阅|告警|预警).{0,10}(?:是否|有没有|会不会)?(?:触发|命中|生效)"
+)
+
+
+def _is_alert_evaluation_command(text: str) -> bool:
+    return bool(_ALERT_EVALUATION_COMMAND_RE.search(re.sub(r"\s+", "", text or "")))
 _OFFICIAL_WARNING_TYPES = (
     "高温",
     "暴雨",
@@ -3115,10 +3549,6 @@ def _is_supported_group_message_type(event: dict[str, Any]) -> bool:
     return _event_message_type(event) == "text"
 
 
-def _bot_reply_marker_key(chat_id: str, message_id: str) -> str:
-    return f"bot-reply|{chat_id}|{message_id}"
-
-
 def _remember_bot_reply_message(
     event: dict[str, Any],
     message_id: str,
@@ -3127,22 +3557,57 @@ def _remember_bot_reply_message(
     if not _is_group_chat(event) or not message_id:
         return
     chat_id = _event_chat_id(event)
-    if not chat_id:
+    sender_id = _event_sender_id(event)
+    chat_type = _event_chat_type(event) or "group"
+    if not chat_id or not sender_id or not bot_role:
         return
     try:
-        weather_memory.save_conversation_state(
-            _bot_reply_marker_key(chat_id, message_id),
-            {
-                "state_version": 1,
-                "source": "recorded_bot_reply",
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "bot_role": bot_role,
-            },
+        weather_memory.save_bot_reply_marker(
+            bot_role=bot_role,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            thread_id=message_id,
+            user_id=sender_id,
+            message_id=message_id,
             ttl_seconds=weather_memory.BRIEFING_CONTEXT_TTL_SECONDS,
         )
     except Exception:  # noqa: BLE001 - a delivered reply must not be retried or duplicated
-        logger.exception("feishu_bot_reply_marker_save_failed chat_id=%s", chat_id)
+        logger.exception(
+            "feishu_bot_reply_marker_save_failed chat_hash=%s",
+            text_log_metadata(chat_id)["text_sha256"],
+        )
+
+
+def _record_passive_send_audit(
+    event: dict[str, Any],
+    bot_role: str,
+    status: str,
+) -> None:
+    """Best-effort append-only audit with identifiers hashed by memory.py."""
+
+    send_id = _event_message_id(event)
+    chat_id = _event_chat_id(event)
+    sender_id = _event_sender_id(event)
+    chat_type = _event_chat_type(event)
+    thread_id = _event_thread_id(event) or send_id
+    if not all((send_id, bot_role, chat_type, chat_id, thread_id, sender_id)):
+        return
+    try:
+        weather_memory.record_send_audit(
+            send_id=send_id,
+            bot_role=bot_role,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=sender_id,
+            status=status,
+        )
+    except Exception as exc:  # noqa: BLE001 - audit failure must not duplicate a reply
+        logger.warning(
+            "feishu_passive_send_audit_failed status=%s error_type=%s",
+            status,
+            safe_error_summary(exc),
+        )
 
 
 def _event_reply_target_ids(event: dict[str, Any]) -> list[str]:
@@ -3161,7 +3626,9 @@ def _is_reply_to_recorded_bot_message(event: dict[str, Any], allowed_bot: str) -
     if not _is_group_chat(event):
         return False
     chat_id = _event_chat_id(event)
-    if not chat_id:
+    sender_id = _event_sender_id(event)
+    chat_type = _event_chat_type(event) or "group"
+    if not chat_id or not sender_id:
         return False
     allowed_marker_roles = {
         FEISHU_WEATHER_BOT: {WEATHER_FORECAST_BOT_ROLE},
@@ -3174,16 +3641,17 @@ def _is_reply_to_recorded_bot_message(event: dict[str, Any], allowed_bot: str) -
     }.get(allowed_bot, set())
     for target_id in _event_reply_target_ids(event):
         try:
-            marker = weather_memory.load_conversation_state(
-                _bot_reply_marker_key(chat_id, target_id)
-            )
-            marker_role = str(marker.get("bot_role") or "") if marker else ""
-            if (
-                marker
-                and marker.get("source") == "recorded_bot_reply"
-                and marker_role in allowed_marker_roles
-            ):
-                return True
+            for marker_role in allowed_marker_roles:
+                marker = weather_memory.load_bot_reply_marker(
+                    bot_role=marker_role,
+                    chat_type=chat_type,
+                    chat_id=chat_id,
+                    thread_id=target_id,
+                    user_id=sender_id,
+                    message_id=target_id,
+                )
+                if marker and marker.get("source") == "recorded_bot_reply":
+                    return True
 
             # Backward compatibility for scheduled briefing cards sent before the strict gate.
             scheduled_key = _conversation_key(
@@ -3201,7 +3669,10 @@ def _is_reply_to_recorded_bot_message(event: dict[str, Any], allowed_bot: str) -
             ):
                 return True
         except Exception:  # noqa: BLE001 - fail closed when reply ownership cannot be proven
-            logger.exception("feishu_bot_reply_marker_load_failed chat_id=%s", chat_id)
+            logger.exception(
+                "feishu_bot_reply_marker_load_failed chat_hash=%s",
+                text_log_metadata(chat_id)["text_sha256"],
+            )
             return False
     return False
 
@@ -3348,6 +3819,9 @@ async def _send_feishu_event_response(
         text = result.get("text")
         incoming_message_id = _event_message_id(event)
         thread_id = _event_thread_id(event)
+        bot_role = str(result.get("bot_role") or "")
+        if isinstance(card, dict) or (isinstance(text, str) and text):
+            _record_passive_send_audit(event, bot_role, "attempted")
         if isinstance(card, dict):
             if incoming_message_id and thread_id:
                 message_id = await feishu_client.reply_interactive_card(incoming_message_id, card, in_thread=True)
@@ -3367,13 +3841,21 @@ async def _send_feishu_event_response(
             else:
                 message_id = await feishu_client.send_text_message(chat_id, text)
         if message_id:
+            _record_passive_send_audit(event, bot_role, "sent")
             result["event_reply_message_id"] = message_id
             _remember_bot_reply_message(
                 event,
                 message_id,
                 str(result.get("bot_role") or ""),
             )
+        elif isinstance(card, dict) or (isinstance(text, str) and text):
+            _record_passive_send_audit(event, bot_role, "failed")
     except Exception as exc:  # noqa: BLE001 - ack the event even when message delivery fails
+        _record_passive_send_audit(
+            event,
+            str(result.get("bot_role") or ""),
+            "failed",
+        )
         result["event_reply_error"] = safe_error_summary(exc)
     if isinstance(submission_to_record, WeatherSubmission) and record_submission:
         try:
@@ -3392,12 +3874,14 @@ async def _send_feishu_event_response(
             result["submission_record_count"] = recorded
         except Exception as exc:  # noqa: BLE001 - event ack should not depend on Bitable writes
             result["submission_record_error"] = safe_error_summary(exc)
+    reply_message_id = str(result.get("event_reply_message_id") or "")
     logger.warning(
-        "feishu_event_result status=%s bot_role=%s has_chat_id=%s reply_message_id=%s reply_error=%s",
+        "feishu_event_result status=%s bot_role=%s has_chat_id=%s "
+        "reply_message_sha256=%s reply_error=%s",
         result.get("status"),
         result.get("bot_role"),
         bool(chat_id),
-        result.get("event_reply_message_id", ""),
+        text_log_metadata(reply_message_id)["text_sha256"] if reply_message_id else "",
         result.get("event_reply_error", ""),
     )
     if result.get("event_reply_error"):
@@ -3425,6 +3909,15 @@ async def _send_feishu_event_response(
             str(event.get("_normalized_text") or _event_text(event)),
             _bot_text,
             _event_chat_type(event),
+            history_enabled=event.get(_FEISHU_HISTORY_ENABLED) is True,
+            history_ttl_seconds=int(
+                event.get(_FEISHU_HISTORY_TTL_SECONDS)
+                or weather_memory.TURN_TTL_SECONDS
+            ),
+            history_max_turns=int(
+                event.get(_FEISHU_HISTORY_MAX_TURNS)
+                or weather_memory.TURN_MAX_PER_KEY
+            ),
         )
         briefing_cache_key = result.get("briefing_cache_key")
         if (
@@ -3496,8 +3989,12 @@ async def _send_feishu_event_response(
                         _event_chat_type(event),
                     )
                     weather_memory.save_conversation_state(reply_thread_key, state)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001 - context remains best effort
+        logger.warning(
+            "feishu_context_update_failed error_type=%s missing_name=%s",
+            type(exc).__name__,
+            getattr(exc, "name", ""),
+        )
     return result
 
 

@@ -231,6 +231,77 @@ async def test_post_llm_boundary_rejects_colloquial_price_and_bid_claims():
         assert "只能提供气象事实和气象侧风险代理" in answer
 
 
+async def test_price_direction_synonyms_fail_closed_before_and_after_the_llm():
+    for unsafe_claim in (
+        "气象条件利好现货，明日电价或将反弹",
+        "高温对电价形成支撑，价格有望冲高",
+        "天气使现货盘面转强，电价继续处在高位",
+    ):
+        pre_llm_answer = await answer_weather_knowledge_question(
+            FailsIfCalledLlmClient(),
+            user_text=unsafe_claim,
+            fallback="fallback",
+        )
+        post_llm_answer = await answer_weather_knowledge_question(
+            EchoUnsafeMarketClaimLlmClient(unsafe_claim),
+            user_text="解释天气变化的一般影响",
+            fallback="fallback",
+        )
+
+        assert "不能仅凭天气判断价格方向" in pre_llm_answer
+        assert unsafe_claim not in post_llm_answer
+        assert "不能判断实际负荷、出力或价格方向" in post_llm_answer
+
+
+async def test_bid_price_and_quantity_synonyms_fail_closed_before_and_after_the_llm():
+    for unsafe_claim in (
+        "天气偏紧，建议把申报量往上调",
+        "明日电量可以多申报一点",
+        "气象转弱，可以压减报量",
+        "申报价适当抬高更稳妥",
+        "天气宽松时可以报便宜一些",
+    ):
+        pre_llm_answer = await answer_weather_knowledge_question(
+            FailsIfCalledLlmClient(),
+            user_text=unsafe_claim,
+            fallback="fallback",
+        )
+        post_llm_answer = await answer_weather_knowledge_question(
+            EchoUnsafeMarketClaimLlmClient(unsafe_claim),
+            user_text="解释天气变化的一般影响",
+            fallback="fallback",
+        )
+
+        assert "不能仅凭天气给出具体报价" in pre_llm_answer
+        assert unsafe_claim not in post_llm_answer
+        assert "报价、仓位或交易指令" in post_llm_answer
+
+
+async def test_position_and_long_short_synonyms_fail_closed_before_and_after_the_llm():
+    for unsafe_claim in (
+        "高温延续，建议开多单",
+        "天气转凉，现货可以偏空操作",
+        "气象条件改善，可以增持多头头寸",
+        "天气偏暖，建议看多现货",
+        "把空头敞口适当加大",
+        "当前仓位可以加重一些",
+    ):
+        pre_llm_answer = await answer_weather_knowledge_question(
+            FailsIfCalledLlmClient(),
+            user_text=unsafe_claim,
+            fallback="fallback",
+        )
+        post_llm_answer = await answer_weather_knowledge_question(
+            EchoUnsafeMarketClaimLlmClient(unsafe_claim),
+            user_text="解释天气变化的一般影响",
+            fallback="fallback",
+        )
+
+        assert "不能仅凭天气给出买入、卖出、做多、做空或仓位指令" in pre_llm_answer
+        assert unsafe_claim not in post_llm_answer
+        assert "报价、仓位或交易指令" in post_llm_answer
+
+
 async def test_weather_only_hydropower_increment_request_does_not_invent_generation():
     answer = await answer_weather_knowledge_question(
         FailsIfCalledLlmClient(),

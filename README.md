@@ -96,11 +96,24 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 所有会写入本地业务数据或主动发布内容的 `/api/*` 管理接口都必须携带
 `Authorization: Bearer <ADMIN_API_TOKEN>`。未配置 Token、未携带凭证或凭证错误时均默认拒绝，
 且不会调用预测、飞书或本地写入逻辑。天气查询、报告读取和飞书事件回调不使用这个管理凭证。
+生产和预发布环境还必须把凭证绑定到明确的 `ADMIN_API_ACTOR_ID`，并在
+`ADMIN_API_ROLES_JSON` 中授予 `administrator`；只有 Token 而没有身份和角色时仍会拒绝。
 
 即使鉴权成功，`/api/weather/publish`、`/api/tasks/weather/publish` 和
-`/api/tasks/weather/remind` 也只有在 `GLOBAL_FEISHU_SEND_ENABLED=true` 且
-`DRY_RUN=false` 时才允许产生飞书外部写入；否则只生成预览并在响应的 `delivery.reason`
-中说明 `global_send_disabled` 或 `dry_run`。生产环境不应把 Token 写入日志或提交到仓库。
+`/api/tasks/weather/remind` 也只有在 `GLOBAL_FEISHU_SEND_ENABLED=true`、
+`ADMIN_API_SEND_ENABLED=true`、目标 `chat_id` 位于 `ADMIN_API_SEND_TARGETS_JSON`
+且 `DRY_RUN=false` 时才允许发送飞书卡片。管理 API 的开关和白名单独立于 09:00
+晨报，避免开启晨报时连带放开其他发布入口；任一条件不满足时只生成预览并在响应的
+`delivery.reason` 中给出拒绝原因。允许产生外部副作用时还必须携带 `Idempotency-Key`；
+相同键和相同请求只复用首次结果，不会重复发送或写入，相同键配不同请求则拒绝。
+审计库仅保存键/请求哈希、actor、role、动作、状态和时间，不保存 Token 或原始请求正文，
+并按 90 天窗口清理。生产环境不应把 Token 或目标 ID 写入日志或提交到仓库。
+
+飞书用户主动发起的合法问答回复与主动群发使用不同开关：
+`FEISHU_PASSIVE_REPLY_ENABLED=false` 可用于“只计算、不回复”的影子阶段；`DRY_RUN=true`
+拥有更高优先级，会同时阻止被动回复、进度消息和任务 Bitable/JSONL 写入。正常内部问答阶段
+可只开启被动回复而继续保持 `GLOBAL_FEISHU_SEND_ENABLED=false`，因此不会连带开启 09:00 晨报、
+告警或管理 API 群发。
 
 ### 外部数据事实边界
 
@@ -348,7 +361,7 @@ summary
 
 电力气象晨报使用独立入口 `scripts/daily_power_briefing.py`，生产定时配置保存在 `deploy/power_briefing.cron`。全国版本覆盖 31 个省级地区、33 个电力气象分析区和 75 个代表点。现有任务保持北京时间 08:50 运行 `--mode precompute` 写入共享 SQLite 快照，09:00 的计划发送任务读取同一快照；升级和回滚都不得删除这两个定时定义。
 
-计划发送采用三重门禁：`GLOBAL_FEISHU_SEND_ENABLED=true`、`POWER_BRIEFING_ALLOW_SEND=true`、目标 `chat_id` 存在于人工审核的 `POWER_BRIEFING_TARGETS_JSON`。cron 只选择 `send` 模式，不再覆盖计划开关。`DRY_RUN=true` 是无条件否决开关；任一条件不满足都只生成、不发送，也不会占用发送幂等键。每个“日期化发布时次 + 目标”使用 SQLite 持久化发送账本和稳定飞书 UUID；重复或并发运行最多产生一次外部消息，明确失败或过期租约使用同一 UUID 安全重试，账本按晨报版本保留窗口默认清理 90 天前记录。代码中不保存群 ID。快照默认保留 24 小时；用户在群内真实 @云云手动生成晨报后，可回复该机器人消息并发送“展开全部分析区”读取同一快照，不会重复抓取。覆盖率分别展示明日预测与今日对比基线；只有 1 个代表点成功的分析区会标为“不可外推全区”，且不会进入全区资源排行。每条风险的方向、城市、时段、驱动和变化都来自同一个结构化信号事件，不跨角色或跨点拼接。
+计划发送采用三重门禁：`GLOBAL_FEISHU_SEND_ENABLED=true`、`POWER_BRIEFING_ALLOW_SEND=true`、目标 `chat_id` 存在于人工审核的 `POWER_BRIEFING_TARGETS_JSON`。cron 只选择 `send` 模式，不再覆盖计划开关。`DRY_RUN=true` 是无条件否决开关；任一条件不满足都不发送，也不会占用发送幂等键。只有 08:50 `precompute` 可以生成快照；09:00 `send` 只读取当日、`09:00` 时次且包含 `forecast_run_id` 的新鲜快照，缺失或过期时以 `precompute_snapshot_missing` 失败关闭，不临时抓取和生成。每个“日期化发布时次 + 目标 + 快照 + run_id”使用 SQLite 持久化发送账本和稳定飞书 UUID；重复或并发运行最多产生一次外部消息，明确失败或过期租约使用同一 UUID 安全重试，账本按晨报版本保留窗口默认清理 90 天前记录。代码中不保存群 ID。快照默认保留 24 小时；用户在群内真实 @云云手动生成晨报后，可回复该机器人消息并发送“展开全部分析区”读取同一快照，不会重复抓取。覆盖率分别展示明日预测与今日对比基线；只有 1 个代表点成功的分析区会标为“不可外推全区”，且不会进入全区资源排行。每条风险的方向、城市、时段、驱动和变化都来自同一个结构化信号事件，不跨角色或跨点拼接。
 
 订阅本身不是发送授权：私聊必须明确回复“确认订阅”，群聊还必须由配置的审核管理员在同一群、同一线程二次明确确认，“可以”“好的”等模糊回复不会激活。订阅状态即使成为 `ACTIVE` 也不能绕过全局发送开关、告警发送开关、目标范围和 `DRY_RUN`；当前生产应保持 `ALERT_SEND_ENABLED=false`，直至主动通知发送链、来源许可和目标白名单全部独立验收。
 
@@ -391,13 +404,26 @@ notes
 ```text
 APP_ENV=production
 ADMIN_API_TOKEN=
+ADMIN_API_ACTOR_ID=
+ADMIN_API_ROLES_JSON=[]
+ADMIN_API_SEND_ENABLED=false
+ADMIN_API_SEND_TARGETS_JSON=[]
+ADMIN_API_AUDIT_DB=data/admin_api_audit.db
+ADMIN_API_IDEMPOTENCY_REQUIRED=true
 GLOBAL_FEISHU_SEND_ENABLED=false
-DRY_RUN=false
+DRY_RUN=true
 QWEATHER_API_KEY=
 QWEATHER_API_HOST=
 CAIYUN_API_KEY=
 OPENCLAW_API_URL=
 OPENCLAW_API_KEY=
+OPENCLAW_EGRESS_ENABLED=false
+OPENCLAW_ALLOWED_HTTPS_PREFIXES_JSON=[]
+LLM_API_BASE_URL=
+LLM_API_KEY=
+LLM_EGRESS_ENABLED=false
+LLM_ALLOWED_HTTPS_PREFIXES_JSON=[]
+LLM_MODEL=gpt-5.6-sol
 FEISHU_APP_ID=
 FEISHU_APP_SECRET=
 FEISHU_VERIFICATION_TOKEN=
@@ -415,6 +441,15 @@ FEISHU_WEATHER_BOT_OPEN_ID=
 FEISHU_TASK_BOT_OPEN_ID=
 FEISHU_ALLOW_LEGACY_NAME_MENTIONS=false
 FEISHU_ALLOW_UNSIGNED_EVENTS=false
+FEISHU_PASSIVE_REPLY_ENABLED=false
+ELECTRICITY_WEATHER_ANALYSIS_ENABLED=false
+MANUAL_POWER_BRIEFING_ENABLED=false
+SUBSCRIPTIONS_ENABLED=false
+ALERT_EVALUATION_ENABLED=false
+EXTERNAL_DATA_WORKBENCH_ENABLED=false
+CONVERSATION_HISTORY_ENABLED=false
+CONVERSATION_HISTORY_TTL_SECONDS=1800
+CONVERSATION_HISTORY_MAX_TURNS=6
 FEISHU_BITABLE_APP_TOKEN=
 FEISHU_BITABLE_TABLE_ID=
 FEISHU_TASK_BITABLE_TABLE_ID=
@@ -432,6 +467,8 @@ SUBSCRIPTION_ADMIN_OPEN_IDS_JSON=[]
 PUBLIC_BASE_URL=
 ```
 
+电力气象分析、手动晨报、订阅、告警评估和旧版外部数据工作台使用五个互不替代的功能开关；订阅激活不等于允许评估，允许评估也不等于允许发送。生产模板全部默认关闭。旧版新闻/水文手工录入尚未接入来源、许可和保留期适配器，因此在所有发布阶段都必须保持 `EXTERNAL_DATA_WORKBENCH_ENABLED=false`。基础城市天气查询不依赖这些开关。自由文本对话历史也默认关闭；地点、日期、指标、任务和晨报指针使用独立的结构化状态、五维隔离和分类 TTL，不需要保存聊天全文。
+
 群聊采用严格触发策略：只处理飞书事件中带有机器人结构化 `mentions`、且 mention `open_id` 与当前机器人配置完全一致的文本消息，或对机器人已发送消息的精确回复；普通群消息、同名普通用户、手打的“@云云”文本以及卡片、文件、图片等非文本消息一律静默忽略。生产必须配置 `FEISHU_WEATHER_BOT_OPEN_ID`、`FEISHU_TASK_BOT_OPEN_ID`（单机器人兼容入口使用 `FEISHU_BOT_OPEN_ID`），并保持 `FEISHU_ALLOW_LEGACY_NAME_MENTIONS=false`。私聊无需 `@`。
 
 ### 生产发布硬阻断
@@ -444,6 +481,20 @@ PUBLIC_BASE_URL=
 4. 密钥、Token、chat_id 和内部许可材料只能通过生产密钥/配置系统注入，不写入仓库、镜像、日志、报告或测试 fixture。
 5. 先在 `DRY_RUN=true`、全局发送关闭时通过 96 条事件回放、全量测试、配置解析和同一快照晨报校验；保存上一稳定镜像/提交、配置哈希和数据库备份。
 6. 灰度先只计算不回复/不发送，再开放内部私聊，最后仅对一个已审核晨报目标观察一个完整发布周期；不得补发灰度前积压消息。异常时立即关闭 `ALERT_SEND_ENABLED` 和 `GLOBAL_FEISHU_SEND_ENABLED`，冻结 outbox，恢复上一稳定镜像/配置，并保留审计数据排查。
+
+上述硬门禁可用离线 preflight 转成机器可读结果（不会联网、抓天气或发送飞书）：
+
+```powershell
+.\.venv\Scripts\python.exe -m services.weather_bot.release_preflight `
+  --phase shadow `
+  --evidence C:\secure\weather-release-evidence.json
+```
+
+`--phase` 依次支持 `shadow`、`passive`、`scheduled`。`shadow` 要求五项受控能力全部关闭；初始 `passive` 只允许电力气象分析和鉴权后的被动回复；`scheduled` 只允许已审核的同快照晨报链，手动晨报、订阅、告警评估和旧版外部数据工作台仍关闭。命令只输出检查代码和通用说明，
+不会回显 Token、app secret、open_id 或 chat_id；通过返回退出码 0，任一项缺失返回 2 和
+`BLOCKED`。外部 evidence 文件至少要引用待发布/上一稳定提交、配置 SHA-256、可读备份、
+监控与回滚责任人、逐来源审批单及有效期；首次计划发送还必须恰好对应一个目标审批引用。
+preflight 的 `READY` 只是必要条件，不能替代真实许可、目标授权和变更审批。
 
 现有 08:50/09:00 任务定义在灰度和回滚中都保留；只有重新核对来源、目标、幂等和快照后才可恢复 09:00 发送。更完整的检查表见 `docs/weather_power_trading_assistant_upgrade_plan.md`。
 

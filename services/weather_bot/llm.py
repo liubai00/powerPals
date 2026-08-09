@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -26,24 +27,37 @@ class LlmClient:
         api_key: str | None = None,
         model: str | None = None,
         timeout: float = 20.0,
+        egress_allowed: bool = True,
     ):
         self.api_base_url = api_base_url.rstrip("/") if api_base_url else None
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.egress_allowed = egress_allowed
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "LlmClient":
+        allowed_prefixes = _parse_prefix_allowlist(
+            settings.llm_allowed_https_prefixes_json
+        )
+        chat_url = _chat_completions_url(settings.llm_api_base_url)
         return cls(
             api_base_url=settings.llm_api_base_url,
             api_key=settings.llm_api_key,
             model=settings.llm_model,
             timeout=settings.llm_timeout,
+            egress_allowed=(
+                settings.llm_egress_enabled
+                and not settings.dry_run
+                and settings.llm_model == "gpt-5.6-sol"
+                and bool(allowed_prefixes)
+                and _matches_allowed_https_prefix(chat_url, allowed_prefixes)
+            ),
         )
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_base_url and self.api_key and self.model)
+        return bool(self.egress_allowed and self.api_base_url and self.api_key and self.model)
 
     async def chat(
         self,
@@ -93,11 +107,82 @@ class LlmClient:
 
     def _chat_completions_url(self) -> str:
         assert self.api_base_url is not None
-        if self.api_base_url.endswith("/chat/completions"):
-            return self.api_base_url
-        if self.api_base_url.endswith("/v1"):
-            return f"{self.api_base_url}/chat/completions"
-        return f"{self.api_base_url}/v1/chat/completions"
+        return _chat_completions_url(self.api_base_url)
+
+
+def _chat_completions_url(api_base_url: str | None) -> str:
+    if not api_base_url:
+        return ""
+    api_base_url = api_base_url.rstrip("/")
+    if api_base_url.endswith("/chat/completions"):
+        return api_base_url
+    if api_base_url.endswith("/v1"):
+        return f"{api_base_url}/chat/completions"
+    return f"{api_base_url}/v1/chat/completions"
+
+
+def _matches_allowed_https_prefix(url: str, allowed_prefixes: tuple[str, ...]) -> bool:
+    try:
+        target = urlsplit(url)
+        target_port = target.port
+    except ValueError:
+        return False
+    if not _is_safe_https_url(target):
+        return False
+    for prefix in allowed_prefixes:
+        try:
+            allowed = urlsplit(prefix)
+            allowed_port = allowed.port
+        except ValueError:
+            continue
+        if not _is_safe_https_url(allowed):
+            continue
+        if allowed.hostname != target.hostname or allowed_port != target_port:
+            continue
+        allowed_path = allowed.path.rstrip("/")
+        if (
+            not allowed_path
+            or target.path == allowed_path
+            or target.path.startswith(f"{allowed_path}/")
+        ):
+            return True
+    return False
+
+
+def _is_safe_https_url(parts) -> bool:
+    if parts.scheme != "https" or not parts.hostname:
+        return False
+    if parts.username is not None or parts.password is not None:
+        return False
+    if parts.query or parts.fragment or "\\" in parts.path:
+        return False
+    decoded_path = unquote(parts.path)
+    if decoded_path != parts.path or "\\" in decoded_path:
+        return False
+    return not any(segment in {".", ".."} for segment in decoded_path.split("/"))
+
+
+def _parse_prefix_allowlist(raw: str) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(parsed, list) or not parsed:
+        return ()
+    if any(
+        not isinstance(item, str) or not item or item != item.strip()
+        for item in parsed
+    ):
+        return ()
+    for item in parsed:
+        try:
+            parts = urlsplit(item)
+            parts.port
+        except ValueError:
+            return ()
+        if not _is_safe_https_url(parts):
+            return ()
+    return tuple(parsed)
 
 
 async def extract_location_with_llm(

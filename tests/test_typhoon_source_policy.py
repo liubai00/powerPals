@@ -53,6 +53,7 @@ def _verified_policy(**overrides: object) -> SourcePolicy:
         "timezone": "Asia/Shanghai",
         "max_age_seconds": 900,
         "retention_policy": "metadata_only",
+        "retention_seconds": 86_400,
         "attribution_required": True,
         "attribution_text": "QWeather",
     }

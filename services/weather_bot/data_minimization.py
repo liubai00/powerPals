@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import re
 
 from services.weather_bot.models import ForecastSummary, WeatherSubmission
@@ -26,8 +27,32 @@ def minimize_submission_for_storage(submission: WeatherSubmission) -> WeatherSub
     """
 
     used = set(submission.aggregated_forecast.providers_used)
+    recorded_providers = {item.provider for item in submission.provider_results}
+    if used - recorded_providers:
+        raise ValueError(
+            "used provider provenance is required for submission persistence"
+        )
     used_results = [item for item in submission.provider_results if item.provider in used]
-    metadata_only = any(item.retention_policy == "metadata_only" for item in used_results)
+    if not _is_valid_expiry(submission.retention_expires_at):
+        raise ValueError(
+            "submission retention_expires_at is required for persistence"
+        )
+    if any(
+        not _is_valid_expiry(item.retention_expires_at)
+        for item in used_results
+    ):
+        raise ValueError(
+            "used provider retention_expires_at is required for submission persistence"
+        )
+    expiry_candidates = [
+        submission.retention_expires_at,
+        *(item.retention_expires_at for item in used_results),
+    ]
+    retention_expires_at = min(expiry_candidates, key=_expiry_datetime)
+    metadata_only = (
+        submission.retention_policy == "metadata_only"
+        or any(item.retention_policy == "metadata_only" for item in used_results)
+    )
     providers = [
         item.model_copy(update={"points": [], "daily": {}, "raw": None})
         for item in submission.provider_results
@@ -82,6 +107,10 @@ def minimize_submission_for_storage(submission: WeatherSubmission) -> WeatherSub
             "key_factors": key_factors,
             "risk_notes": risk_notes,
             "explanation": explanation,
+            "retention_policy": (
+                "metadata_only" if metadata_only else "derived_only"
+            ),
+            "retention_expires_at": retention_expires_at,
         }
     )
 
@@ -111,3 +140,17 @@ def _minimize_task_id_for_location(task_id: str, location: dict) -> str:
         f"{prefix}-EXTERNAL-GEO-{provenance_token}"
         f"{coordinate_suffix[dated_suffix.start():]}"
     )
+
+
+def _is_valid_expiry(value: str | None) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        expiry = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return expiry.tzinfo is not None and expiry.utcoffset() is not None
+
+
+def _expiry_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))

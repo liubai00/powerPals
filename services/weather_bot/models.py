@@ -61,6 +61,7 @@ class ProviderForecast(BaseModel):
     source_url: str | None = None
     content_sha256: str | None = None
     retention_policy: Literal["derived_only", "metadata_only"] = "derived_only"
+    retention_expires_at: str | None = None
     raw: dict[str, Any] | None = Field(
         default=None,
         exclude=True,
@@ -195,6 +196,8 @@ class WeatherSubmission(BaseModel):
     confidence: dict[str, Any]
     key_factors: list[str]
     risk_notes: list[str]
+    retention_policy: Literal["derived_only", "metadata_only"] = "metadata_only"
+    retention_expires_at: str | None = None
     disclaimer: str = DEFAULT_DISCLAIMER
 
 

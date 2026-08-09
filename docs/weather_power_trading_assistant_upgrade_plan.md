@@ -1,12 +1,12 @@
 # 云云：电力交易气象决策助手升级规划
 
-> 文档状态：已确认，等待进入开发
+> 文档状态：本地实施与离线验证已完成；生产发布因外部审批证据缺失保持 `BLOCKED`
 > 编制日期：2026-08-09
 > 本地项目：`D:\workspace\project\weather_agent`
 > 生产服务器：`38.76.196.233`
 > 禁止操作：`117.72.103.1`
 > 生产模型约束：`gpt-5.6-sol`
-> 当前基线提交：`20ed817 feat(weather): add review-gated controlled learning`
+> 本轮实施起点：`433f06b feat(weather): build guarded power trading weather assistant`
 
 ## 1. 执行摘要
 
@@ -36,7 +36,7 @@
 | 订阅与告警 | 已实现草稿/确认/管理员二次确认、规则状态、去重、冷却、恢复与审计基础能力 | 主动通知未获生产授权，必须保持 `ALERT_SEND_ENABLED=false` |
 | 官方预警适配器 | 已按当前经纬度 endpoint 做最小字段、许可与来源校验 | 没有审核后的 QWeather policy 时返回不可用，不得搜索或模型补写 |
 | 受控学习 | 只生成可审计样本、回放、评分和候选 | 不会自动改代码、部署、更换模型或发送消息 |
-| 发布验证 | 定向测试持续执行 | 96 条端到端回放、全量测试分类和发布清单全部完成前仍不可部署 |
+| 发布验证 | 96 条端到端回放、全量测试、编译、compose 解析和离线 preflight 已完成 | preflight 因真实来源/目标/身份/备份与审批证据缺失返回 `BLOCKED` |
 
 本增补不等于生产验收。尤其是 API Key、可访问 endpoint 或本地测试通过，都不能替代第三方许可审查、生产目标授权和灰度审批。
 
@@ -990,6 +990,7 @@ P1 开始前增加外部数据可获得性检查：
 - `ALERT_EVALUATION_ENABLED`
 - `ALERT_SEND_ENABLED`
 - `ALERT_TARGET_ALLOWLIST`
+- `EXTERNAL_DATA_WORKBENCH_ENABLED`（所有发布阶段保持关闭，直至来源/许可/保留期适配器通过审核）
 - `LLM_INTENT_FALLBACK_ENABLED`
 - `GLOBAL_FEISHU_SEND_ENABLED`
 
@@ -1112,7 +1113,7 @@ GET https://{reviewed-api-host}/weatheralert/v1/current/{latitude}/{longitude}
 2. `POWER_BRIEFING_ALLOW_SEND=true`；
 3. 当前目标 `chat_id` 位于人工审核的 `POWER_BRIEFING_TARGETS_JSON`。
 
-`DRY_RUN=true` 对以上结果拥有无条件否决权。目标列表为空、JSON 无效、目标重复或任一开关不满足时，只生成/读取快照，发送次数必须为 0，也不得占用成功发送幂等键。cron 只选择 `send` 模式，不得用命令行环境变量覆盖 `POWER_BRIEFING_ALLOW_SEND`。每个“日期化发布时次 + 目标 chat_id”必须通过持久化发送账本原子认领，并向飞书传递稳定 UUID；重复、并发和失败重试复用同一个 UUID。定时脚本和代码不得硬编码群 ID。
+`DRY_RUN=true` 对以上结果拥有无条件否决权。目标列表为空、JSON 无效、目标重复或任一开关不满足时，发送次数必须为 0，也不得占用成功发送幂等键。只有 08:50 `precompute` 允许抓取和生成；09:00 `send` 必须只读取同一日期、`09:00` 时次、带 `forecast_run_id` 的新鲜快照，快照缺失或过期时失败关闭，不能现场重新抓取或生成。cron 只选择 `send` 模式，不得用命令行环境变量覆盖 `POWER_BRIEFING_ALLOW_SEND`。每个“日期化发布时次 + 目标 chat_id + cache_key + forecast_run_id”必须通过持久化发送账本原子认领，并向飞书传递稳定 UUID；重复、并发和失败重试复用同一个 UUID。定时脚本和代码不得硬编码群 ID。
 
 旧版 09:00 任务发布、16:30 提醒、17:00 预测节奏与晨报不是同一计划。它必须受独立且默认关闭的 `LEGACY_WEATHER_SCHEDULER_ENABLED` 控制，不能因晨报开启 `GLOBAL_FEISHU_SEND_ENABLED` 而被连带启用。
 
@@ -1141,6 +1142,8 @@ GET https://{reviewed-api-host}/weatheralert/v1/current/{latitude}/{longitude}
 - 监控、告警和一键关闭 `ALERT_SEND_ENABLED`/`GLOBAL_FEISHU_SEND_ENABLED` 的责任人未值守。
 
 禁止用测试策略、虚构条款版本、示例 endpoint、测试 chat_id 或“先上线再补审批”绕过此门禁。当前默认 `WEATHER_SOURCE_POLICIES_JSON=[]` 和 `POWER_BRIEFING_TARGETS_JSON=[]` 正是有意的部署硬阻断，不是待随手补齐的普通配置。
+
+代码侧必须运行 `python -m services.weather_bot.release_preflight --phase <shadow|passive|scheduled> --evidence <外部证据文件>`，把上述可机器核验项固化为 `READY/BLOCKED` 和退出码。证据文件只保存审批/备份/提交/配置哈希/责任人引用及有效期，不得含 Token、API Key、chat_id、open_id 或许可正文。`shadow` 必须是 `DRY_RUN=true`、0 回复、0 主动发送；`passive` 只允许鉴权后的用户触发回复；`scheduled` 首轮只允许一个具备独立审批引用的晨报目标。preflight 通过只是发布必要条件，不得代替人工许可、目标授权、监控值守或变更审批。
 
 ### 21.5 灰度步骤
 

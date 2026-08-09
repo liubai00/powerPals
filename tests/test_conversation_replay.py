@@ -345,6 +345,44 @@ def test_group_reply_without_mention_only_works_for_recorded_bot_message(
     }
 
 
+def test_group_reply_marker_does_not_authorize_a_different_user(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/feishu/events/weather",
+            json=_event(
+                "@云云 广州天气",
+                message_id="user-isolation-seed",
+                chat_type="group",
+                sender_id="user-a",
+            ),
+        ).json()
+        requests_before_reply = len(service.requests)
+        cross_user_reply = client.post(
+            "/feishu/events/weather",
+            json=_event(
+                "明天呢",
+                message_id="user-isolation-cross-reply",
+                chat_type="group",
+                sender_id="user-b",
+                root_id=first["event_reply_message_id"],
+            ),
+        ).json()
+
+    assert cross_user_reply == {
+        "status": "ignored",
+        "bot_role": "weather_forecast_bot",
+        "reason": "group_message_not_addressed",
+    }
+    assert len(service.requests) == requests_before_reply
+
+
 def test_private_out_of_scope_chat_returns_capability_boundary_without_external_calls(
     monkeypatch,
     isolated_db_path,

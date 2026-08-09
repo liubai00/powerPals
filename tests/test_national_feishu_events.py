@@ -8,7 +8,13 @@ from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuClient
 from services.weather_bot.location import LocationResolver, ResolvedLocation
 from services.weather_bot.main import create_app
-from services.weather_bot.models import AggregatedForecast, ForecastPoint, ForecastSummary, WeatherSubmission
+from services.weather_bot.models import (
+    AggregatedForecast,
+    ForecastPoint,
+    ForecastSummary,
+    ProviderForecast,
+    WeatherSubmission,
+)
 
 
 class CapturingForecastService:
@@ -24,7 +30,16 @@ class CapturingForecastService:
             region=request.region,
             target_date=request.target_date,
             data_cutoff_time="2026-06-09T16:00:00+08:00",
-            provider_results=[],
+            provider_results=[
+                ProviderForecast(
+                    provider="open_meteo",
+                    retrieved_at="2026-06-09T00:00:00+00:00",
+                    source_url="https://weather.example.test/v1/forecast",
+                    content_sha256="a" * 64,
+                    retention_policy="derived_only",
+                    retention_expires_at="2099-01-01T00:00:00+00:00",
+                )
+            ],
             aggregated_forecast=AggregatedForecast(
                 providers_used=["open_meteo"],
                 points=[
@@ -49,6 +64,8 @@ class CapturingForecastService:
             confidence={"score": 0.7, "description": "中等"},
             key_factors=["多源气象预报融合"],
             risk_notes=["局地短时天气存在不确定性"],
+            retention_policy="derived_only",
+            retention_expires_at="2099-01-01T00:00:00+00:00",
         )
 
 
@@ -704,6 +721,48 @@ def test_weather_task_submission_records_after_card_reply(monkeypatch, tmp_path)
     submissions = client.get(f"/api/tasks/weather/{task_id}/submissions")
     assert submissions.status_code == 200
     assert submissions.json()["count"] == 1
+
+
+def test_dry_run_weather_task_submission_neither_replies_nor_records(monkeypatch, tmp_path):
+    async def fail_send_interactive_card(self, chat_id, card):
+        raise AssertionError("DRY_RUN must not send a passive reply")
+
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fail_send_interactive_card)
+    submission_log = tmp_path / "weather_submissions.jsonl"
+    task_log = tmp_path / "weather_tasks.jsonl"
+    task_id = "WEATHER-CN-440100-20260610-DAYAHEAD-001"
+    service = CapturingForecastService()
+    settings = Settings(
+        dry_run=True,
+        feishu_weather_verification_token=None,
+        local_jsonl_path=str(submission_log),
+        local_task_jsonl_path=str(task_log),
+    )
+    client = TestClient(create_app(forecast_service=service, settings=settings))
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "event": {
+                "message": {
+                    "chat_id": "oc_test_chat",
+                    "chat_type": "p2p",
+                    "content": f'{{"text":"{task_id}"}}',
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "handled"
+    assert body["mode"] == "task_submission"
+    assert "event_reply_message_id" not in body
+    assert "submission_record_status" not in body
+    assert not submission_log.exists()
+    submissions = client.get(f"/api/tasks/weather/{task_id}/submissions")
+    assert submissions.status_code == 200
+    assert submissions.json()["count"] == 0
 
 
 def test_multi_day_weather_task_submission_records_all_days(monkeypatch, tmp_path):

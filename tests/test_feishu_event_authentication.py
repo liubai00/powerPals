@@ -134,6 +134,41 @@ def test_forged_group_chat_id_never_causes_a_send(monkeypatch, tmp_path):
     assert sends == []
 
 
+def test_event_idempotency_store_failure_is_fail_closed(monkeypatch, tmp_path):
+    sends: list[tuple[str, str]] = []
+
+    async def fake_send_text(self, chat_id, text):
+        sends.append(("text", chat_id))
+        return "om-unexpected"
+
+    async def fake_send_card(self, chat_id, card):
+        sends.append(("card", chat_id))
+        return "om-unexpected"
+
+    def fail_claim_event(*args, **kwargs):
+        raise OSError("simulated idempotency store outage")
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send_text)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send_card)
+    monkeypatch.setattr(weather_main.weather_memory, "claim_event", fail_claim_event)
+    settings = _settings(
+        tmp_path,
+        app_env="production",
+        feishu_weather_verification_token="correct-token",
+        feishu_weather_bot_open_id="ou_weather_bot",
+    )
+    client = TestClient(create_app(forecast_service=_NoForecastService(), settings=settings))
+
+    response = client.post(
+        "/feishu/events/weather",
+        json=_group_event(token="correct-token", event_id="evt-store-outage"),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Event idempotency unavailable"
+    assert sends == []
+
+
 def test_authenticated_structured_group_mention_can_receive_passive_reply(
     monkeypatch,
     tmp_path,
@@ -167,6 +202,110 @@ def test_authenticated_structured_group_mention_can_receive_passive_reply(
     assert response.status_code == 200
     assert response.json()["status"] == "handled"
     assert sends == [("card", "oc_target")]
+
+
+def test_authenticated_passive_reply_appends_minimal_send_audit(
+    monkeypatch,
+    tmp_path,
+):
+    audit_statuses: list[str] = []
+
+    async def fake_send_card(self, chat_id, card):
+        return "om-reply"
+
+    def capture_audit(**entry):
+        audit_statuses.append(entry["status"])
+
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send_card)
+    monkeypatch.setattr(weather_main.weather_memory, "record_send_audit", capture_audit)
+    settings = _settings(
+        tmp_path,
+        app_env="production",
+        feishu_passive_reply_enabled=True,
+        feishu_weather_verification_token="correct-token",
+        feishu_weather_bot_open_id="ou_weather_bot",
+    )
+    client = TestClient(create_app(forecast_service=_NoForecastService(), settings=settings))
+
+    response = client.post(
+        "/feishu/events/weather",
+        json=_group_event(token="correct-token"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "handled"
+    assert audit_statuses == ["attempted", "sent"]
+
+
+def test_dry_run_blocks_authenticated_passive_reply(
+    monkeypatch,
+    tmp_path,
+):
+    sends: list[tuple[str, str]] = []
+
+    async def fake_send_text(self, chat_id, text):
+        sends.append(("text", chat_id))
+        return "om-unexpected"
+
+    async def fake_send_card(self, chat_id, card):
+        sends.append(("card", chat_id))
+        return "om-unexpected"
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send_text)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send_card)
+    settings = _settings(
+        tmp_path,
+        app_env="production",
+        dry_run=True,
+        feishu_weather_verification_token="correct-token",
+        feishu_weather_bot_open_id="ou_weather_bot",
+    )
+    client = TestClient(create_app(forecast_service=_NoForecastService(), settings=settings))
+
+    response = client.post(
+        "/feishu/events/weather",
+        json=_group_event(token="correct-token"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "handled"
+    assert sends == []
+
+
+def test_explicit_passive_reply_switch_supports_zero_send_shadow_mode(
+    monkeypatch,
+    tmp_path,
+):
+    sends: list[tuple[str, str]] = []
+
+    async def fake_send_text(self, chat_id, text):
+        sends.append(("text", chat_id))
+        return "om-unexpected"
+
+    async def fake_send_card(self, chat_id, card):
+        sends.append(("card", chat_id))
+        return "om-unexpected"
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send_text)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send_card)
+    settings = _settings(
+        tmp_path,
+        app_env="production",
+        dry_run=False,
+        feishu_passive_reply_enabled=False,
+        feishu_weather_verification_token="correct-token",
+        feishu_weather_bot_open_id="ou_weather_bot",
+    )
+    client = TestClient(create_app(forecast_service=_NoForecastService(), settings=settings))
+
+    response = client.post(
+        "/feishu/events/weather",
+        json=_group_event(token="correct-token"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "handled"
+    assert sends == []
 
 
 def test_authenticated_group_addressing_failure_does_not_emit_fallback_message(

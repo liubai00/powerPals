@@ -169,8 +169,8 @@ _EXECUTOR_BY_CASE: dict[int, str] = {
     9: "event_ledger:duplicate",
     67: "memory:restart_within_ttl",
     68: "memory:expired_state",
-    85: "admin_auth:missing_token",
-    86: "send_policy:global_disabled",
+    85: "public_admin_api:missing_token",
+    86: "public_admin_api:global_disabled",
     87: "bot_identity:same_name_wrong_open_id",
     88: "forecast_time:separate_fields",
     95: "boundary:no_external_power_data",
@@ -367,16 +367,8 @@ def _execute(item: CoreReplayItem, *, today: date) -> tuple[bool, dict[str, Any]
         return _execute_memory_restart(executor_id, expired=False)
     if executor_id == "memory:expired_state":
         return _execute_memory_restart(executor_id, expired=True)
-    if executor_id == "admin_auth:missing_token":
-        return _execute_missing_admin_auth(executor_id)
-    if executor_id == "send_policy:global_disabled":
-        from services.weather_bot.send_policy import AdminSendPolicy
-
-        policy = AdminSendPolicy(global_send_enabled=False, dry_run=False)
-        external = policy.external_write_decision()
-        card = policy.card_send_decision("oc_target")
-        passed = not external.allowed and not card.allowed and card.reason == "global_send_disabled"
-        return passed, {"executor": executor_id, "external": external.as_dict(), "card": card.as_dict()}
+    if executor_id.startswith("public_admin_api:"):
+        return _execute_public_admin_api(item)
     if executor_id == "forecast_time:separate_fields":
         from services.weather_bot.models import TimeInfo
 
@@ -654,6 +646,13 @@ def _execute_public_feishu_event(
             settings = Settings(
                 _env_file=None,
                 app_env="test",
+                feishu_allow_unsigned_events=True,
+                feishu_passive_reply_enabled=True,
+                dry_run=False,
+                electricity_weather_analysis_enabled=True,
+                manual_power_briefing_enabled=True,
+                subscriptions_enabled=True,
+                alert_evaluation_enabled=True,
                 feishu_app_id=None,
                 feishu_app_secret=None,
                 feishu_verification_token=None,
@@ -677,6 +676,7 @@ def _execute_public_feishu_event(
                     '"required_metrics":["warning_id","headline","original_issuer","published_at","effective_at","expires_at","message_type","source_tag"],'
                     '"coverage_model":"latitude-longitude-point","timezone":"Asia/Shanghai",'
                     '"max_age_seconds":600,"retention_policy":"metadata_only",'
+                    '"retention_seconds":86400,'
                     '"attribution_required":true,"attribution_text":"QWeather"}]'
                     if item.case_number == 50
                     else "[]"
@@ -1158,24 +1158,126 @@ def _execute_memory_restart(executor_id: str, *, expired: bool) -> tuple[bool, d
     return passed, {"executor": executor_id, "expired": expired, "state_loaded": bool(loaded)}
 
 
-def _execute_missing_admin_auth(executor_id: str) -> tuple[bool, dict[str, Any]]:
-    from fastapi import HTTPException
-    from starlette.requests import Request
+def _execute_public_admin_api(item: CoreReplayItem) -> tuple[bool, dict[str, Any]]:
+    from fastapi.testclient import TestClient
 
-    from services.weather_bot.auth import AdminApiAuthenticator
+    from services.weather_bot.config import Settings
+    from services.weather_bot.feishu import FeishuClient
+    from services.weather_bot.main import create_app
+    from services.weather_bot.models import (
+        AggregatedForecast,
+        ForecastPoint,
+        ForecastSummary,
+        WeatherSubmission,
+    )
 
-    request = Request({"type": "http", "method": "POST", "path": "/api/weather/publish", "headers": []})
-    coroutine = AdminApiAuthenticator(None)(request)
-    status_code = None
-    try:
-        coroutine.send(None)
-    except HTTPException as exc:
-        status_code = exc.status_code
-    except StopIteration:
-        status_code = 200
-    finally:
-        coroutine.close()
-    return status_code in {401, 403}, {"executor": executor_id, "status_code": status_code, "feishu_sends": 0}
+    class OfflineForecastService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def forecast(self, request: Any) -> WeatherSubmission:
+            self.calls += 1
+            return WeatherSubmission(
+                task_id="WEATHER-CN-440300-20260810-DAYAHEAD-001",
+                region="Shenzhen",
+                target_date="2026-08-10",
+                data_cutoff_time="2026-08-09T16:00:00+08:00",
+                provider_results=[],
+                aggregated_forecast=AggregatedForecast(
+                    providers_used=["offline_fixture"],
+                    points=[
+                        ForecastPoint(
+                            time="2026-08-10T00:00:00+08:00",
+                            temperature=28.0,
+                            precipitation_probability=20.0,
+                            wind_speed=2.0,
+                            cloud_cover=60.0,
+                        )
+                    ],
+                    summary=ForecastSummary(
+                        max_temperature=28.0,
+                        min_temperature=28.0,
+                        rain_probability=20.0,
+                        wind_speed=2.0,
+                        cloud_cover=60.0,
+                        main_weather="cloudy",
+                        high_risk_period="none",
+                    ),
+                ),
+                confidence={"score": 0.7, "description": "medium"},
+                key_factors=["offline replay fixture"],
+                risk_notes=["offline replay fixture"],
+                disclaimer="weather information only",
+            )
+
+    async def record_send(*args: Any, **kwargs: Any) -> str:
+        sends.append("feishu")
+        return "should-not-send"
+
+    async def record_write(*args: Any, **kwargs: Any) -> None:
+        writes.append("bitable")
+
+    sends: list[str] = []
+    writes: list[str] = []
+    service = OfflineForecastService()
+    with tempfile.TemporaryDirectory(prefix="weather-admin-api-replay-") as temp_dir:
+        root = Path(temp_dir)
+        settings = Settings(
+            _env_file=None,
+            admin_api_token="offline-admin-token",
+            admin_api_send_enabled=True,
+            admin_api_send_targets_json='["oc_reviewed"]',
+            admin_api_audit_db=str(root / "admin_actions.db"),
+            global_feishu_send_enabled=False,
+            feishu_weather_default_chat_id="oc_reviewed",
+            local_jsonl_path=str(root / "submissions.jsonl"),
+            local_task_jsonl_path=str(root / "tasks.jsonl"),
+            local_locations_path=str(root / "locations.json"),
+            local_news_jsonl_path=str(root / "news.jsonl"),
+            local_hydrology_jsonl_path=str(root / "hydrology.jsonl"),
+            subscriptions_db=str(root / "subscriptions.db"),
+            alerts_db=str(root / "alerts.db"),
+            power_briefing_cache_db=str(root / "briefing.db"),
+        )
+        with (
+            mock.patch.object(FeishuClient, "send_interactive_card", record_send),
+            mock.patch.object(FeishuClient, "write_bitable_record", record_write),
+        ):
+            client = TestClient(create_app(forecast_service=service, settings=settings))
+            headers = (
+                {"Authorization": "Bearer offline-admin-token"}
+                if item.case_number == 86
+                else {}
+            )
+            response = client.post(
+                "/api/weather/publish",
+                headers=headers,
+                json={"region": "Shenzhen", "target_date": "2026-08-10"},
+            )
+
+    body = response.json() if response.status_code == 200 else {}
+    delivery_reason = (body.get("delivery") or {}).get("reason")
+    passed = (
+        response.status_code in {401, 403}
+        and service.calls == 0
+        and not sends
+        and not writes
+        if item.case_number == 85
+        else response.status_code == 200
+        and service.calls == 1
+        and delivery_reason == "global_send_disabled"
+        and not sends
+        and not writes
+    )
+    return passed, {
+        "executor": "public_admin_api",
+        "status_code": response.status_code,
+        "delivery_reason": delivery_reason,
+        "forecast_calls": service.calls,
+        "feishu_sends": len(sends),
+        "bitable_writes": len(writes),
+        "external_calls": 0,
+    }
 
 
 def _execute_electricity_entities(
@@ -2279,6 +2381,7 @@ def _execute_source_retention_policy(
         timezone="Asia/Shanghai",
         max_age_seconds=3600,
         retention_policy="derived_only",
+        retention_seconds=86400,
     )
     shanghai = timezone(timedelta(hours=8), name="Asia/Shanghai")
     now = datetime.combine(today, datetime.min.time(), tzinfo=shanghai).replace(hour=8)

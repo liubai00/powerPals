@@ -7,6 +7,7 @@ COPY services ./services
 COPY schemas ./schemas
 COPY examples ./examples
 COPY docs ./docs
+COPY scripts ./scripts
 
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --timeout 120 --retries 5 .
 

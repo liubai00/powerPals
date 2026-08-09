@@ -22,6 +22,12 @@ def explicit_unsigned_feishu_test_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("FEISHU_ALLOW_UNSIGNED_EVENTS", "true")
+    # Legacy behavior tests opt into runtime capabilities explicitly.  Runtime
+    # defaults stay fail-closed and are verified in test_runtime_feature_flags.
+    monkeypatch.setenv("ELECTRICITY_WEATHER_ANALYSIS_ENABLED", "true")
+    monkeypatch.setenv("MANUAL_POWER_BRIEFING_ENABLED", "true")
+    monkeypatch.setenv("SUBSCRIPTIONS_ENABLED", "true")
+    monkeypatch.setenv("ALERT_EVALUATION_ENABLED", "true")
 
 
 @pytest.fixture
@@ -84,6 +90,7 @@ def verified_test_source_registry() -> Callable[..., SourceRegistry]:
                 max_age_seconds=3600,
                 min_completeness=0.95,
                 retention_policy="derived_only",
+                retention_seconds=86_400,
             )
             for provider, url_prefix in provider_url_prefixes.items()
         ]

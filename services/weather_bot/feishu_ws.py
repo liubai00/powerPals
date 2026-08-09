@@ -10,6 +10,7 @@ import lark_oapi as lark
 from lark_oapi import ws
 
 from services.weather_bot.config import Settings
+from services.weather_bot.logging_safety import text_log_metadata
 
 
 logger = logging.getLogger(__name__)
@@ -39,11 +40,12 @@ def run_feishu_ws_bot(role: str | None = None, settings: Settings | None = None)
         payload = _sdk_event_payload(data, bot)
         event = payload.get("event", {})
         message = event.get("message", {}) if isinstance(event, dict) else {}
+        message_id = str(message.get("message_id") or "") if isinstance(message, dict) else ""
         logger.info(
-            "Feishu WS event received role=%s event_type=%s message_id=%s chat_type=%s",
+            "Feishu WS event received role=%s event_type=%s message_sha256=%s chat_type=%s",
             bot.role,
             payload.get("header", {}).get("event_type") if isinstance(payload.get("header"), dict) else "",
-            message.get("message_id") if isinstance(message, dict) else "",
+            text_log_metadata(message_id)["text_sha256"] if message_id else "",
             message.get("chat_type") if isinstance(message, dict) else "",
         )
         response = httpx.post(
@@ -53,10 +55,9 @@ def run_feishu_ws_bot(role: str | None = None, settings: Settings | None = None)
         )
         if response.status_code >= 400:
             logger.warning(
-                "Feishu WS event dispatch failed role=%s status=%s body=%s",
+                "Feishu WS event dispatch failed role=%s status=%s",
                 bot.role,
                 response.status_code,
-                response.text[:500],
             )
 
     def ignore_event(data) -> None:

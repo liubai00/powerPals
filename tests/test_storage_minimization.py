@@ -49,6 +49,7 @@ def make_submission(*, retention_policy: str) -> WeatherSubmission:
                 source_url="https://weather.example.test/v1/forecast",
                 content_sha256="a" * 64,
                 retention_policy=retention_policy,
+                retention_expires_at="2026-08-12T08:00:00+00:00",
             )
         ],
         aggregated_forecast=AggregatedForecast(
@@ -60,6 +61,8 @@ def make_submission(*, retention_policy: str) -> WeatherSubmission:
         confidence={"score": 0.8, "description": "高"},
         key_factors=["高温使负荷天气压力代理升高"],
         risk_notes=["晚峰持续高温"],
+        retention_policy=retention_policy,
+        retention_expires_at="2026-08-12T08:00:00+00:00",
         explanation=ExplanationProfile(
             key_factors=["高温使负荷天气压力代理升高"],
             risk_notes=["晚峰持续高温"],
@@ -190,10 +193,13 @@ def test_event_idempotency_ledger_stores_only_result_metadata(monkeypatch, tmp_p
     )
 
     with sqlite3.connect(db_path) as conn:
-        encoded = conn.execute(
-            "SELECT response FROM event_ledger WHERE bot_scope=? AND event_id=?",
-            ("weather", "event-storage-min"),
-        ).fetchone()[0]
+        stored_scope, stored_event_id, encoded = conn.execute(
+            "SELECT bot_scope,event_id,response FROM event_ledger"
+        ).fetchone()
+    assert stored_scope.startswith("id-sha256:v1:")
+    assert stored_event_id.startswith("id-sha256:v1:")
+    assert stored_scope != "weather"
+    assert stored_event_id != "event-storage-min"
     assert json.loads(encoded) == {
         "status": "handled",
         "bot_role": "weather_forecast_bot",

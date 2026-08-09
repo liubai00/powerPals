@@ -59,6 +59,7 @@ def _verified_policy(**overrides: object) -> SourcePolicy:
         "max_age_seconds": 600,
         "min_completeness": 1.0,
         "retention_policy": "metadata_only",
+        "retention_seconds": 86_400,
         "attribution_required": True,
         "attribution_text": "QWeather",
     }

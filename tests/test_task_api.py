@@ -15,6 +15,8 @@ def _admin_settings(**overrides) -> Settings:
     return Settings(
         _env_file=None,
         admin_api_token="test-admin-token",
+        admin_api_send_enabled=True,
+        admin_api_idempotency_required=False,
         global_feishu_send_enabled=True,
         **overrides,
     )

@@ -154,6 +154,7 @@ async def test_builtin_provider_declared_endpoint_must_match_policy_before_fetch
         timezone="Asia/Shanghai",
         max_age_seconds=3600,
         retention_policy="derived_only",
+        retention_seconds=86_400,
     )
     service = ForecastService(
         providers={"open_meteo": provider},
@@ -200,6 +201,7 @@ async def test_overbroad_caiyun_policy_is_zero_fetch_before_path_credential_use(
         timezone="Asia/Shanghai",
         max_age_seconds=3600,
         retention_policy="derived_only",
+        retention_seconds=86_400,
     )
     service = ForecastService(
         providers={"caiyun": provider},
@@ -270,6 +272,7 @@ async def test_builtin_provider_rejects_response_from_unapproved_actual_endpoint
         timezone="Asia/Shanghai",
         max_age_seconds=3600,
         retention_policy="derived_only",
+        retention_seconds=86_400,
     )
     service = ForecastService(
         providers={"open_meteo": OpenMeteoProvider()},
@@ -304,6 +307,7 @@ def verified_registry(*, environment: str = "production", **overrides) -> Source
         "max_age_seconds": 3600,
         "min_completeness": 0.95,
         "retention_policy": "derived_only",
+        "retention_seconds": 86_400,
     }
     values.update(overrides)
     return SourceRegistry([SourcePolicy(**values)], environment=environment)
@@ -426,6 +430,7 @@ async def test_environment_json_can_explicitly_configure_a_verified_source_profi
                 "max_age_seconds": 3600,
                 "min_completeness": 0.95,
                 "retention_policy": "derived_only",
+                "retention_seconds": 86_400,
             }
         ]
     )
@@ -474,6 +479,8 @@ async def test_incomplete_verified_policy_configuration_fails_closed(missing_pol
         "coverage_model": "point",
         "timezone": "Asia/Shanghai",
         "max_age_seconds": 3600,
+        "retention_policy": "derived_only",
+        "retention_seconds": 86_400,
     }
     policy.pop(missing_policy_field)
     service = ForecastService(

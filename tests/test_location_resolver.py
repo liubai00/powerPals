@@ -195,6 +195,7 @@ async def test_qweather_candidate_selection_rejects_wrong_province(monkeypatch):
         timezone="Asia/Shanghai",
         max_age_seconds=86400,
         retention_policy="derived_only",
+        retention_seconds=86_400,
         attribution_required=True,
         attribution_text="QWeather",
     )

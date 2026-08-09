@@ -44,6 +44,8 @@ def _snapshot(
         "expires_at": f"{report_date}T10:01:00+08:00",
         "forecast_run_id": run_id,
         "release_slot": release_slot,
+        "proxy_method_version": "power-weather-proxy-v1",
+        "weight_version": "market-risk-weight-v1",
         "retrieved_at": f"{report_date}T08:58:00+08:00",
         "provider_issued_at": {"open_meteo": None},
         "valid_time": {
@@ -447,6 +449,8 @@ async def test_generated_briefing_3_snapshot_exposes_traceable_run_and_quality_m
 
     assert snapshot["schema_version"] == 2
     assert snapshot["forecast_run_id"] == "briefing-run-20260810-0900"
+    assert snapshot["proxy_method_version"] == "power-weather-proxy-v1"
+    assert snapshot["weight_version"] == "market-risk-weight-v1"
     assert snapshot["retrieved_at"] == "2026-08-10T08:58:00+08:00"
     assert snapshot["provider_issued_at"] == {
         "open_meteo": None,
@@ -474,6 +478,10 @@ async def test_generated_briefing_3_snapshot_exposes_traceable_run_and_quality_m
     assert "实际抓取 2026-08-10 08:58" in card_text
     assert "聚合完成 2026-08-10 08:58" in card_text
     assert "Open-Meteo 起报时间未提供" in card_text
+    assert "代理口径 power-weather-proxy-v1" in card_text
+    assert "权重版本 market-risk-weight-v1" in card_text
+    assert "https://api.open-meteo.com/v1/forecast" in card_text
+    assert "SHA-256 " + "a" * 64 in card_text
     assert "数据质量 降级" in card_text
     assert "provider_issued_at_missing" not in card_text
     assert "上一同发布时次版本不可用" in card_text
@@ -481,7 +489,7 @@ async def test_generated_briefing_3_snapshot_exposes_traceable_run_and_quality_m
 
 
 @pytest.mark.asyncio
-async def test_briefing_compares_risk_only_with_yesterdays_same_release_version(
+async def test_briefing_refuses_to_compare_yesterdays_tomorrow_with_todays_tomorrow(
     monkeypatch,
     tmp_path,
 ):
@@ -508,7 +516,17 @@ async def test_briefing_compares_risk_only_with_yesterdays_same_release_version(
         f"{power_briefing.POWER_BRIEFING_REPORT_VERSION}"
     )
     previous["market_risk_snapshots"] = [
-        {"market_id": "cn-37-shandong", "severity": 0}
+        {
+            "market_id": "cn-37-shandong",
+            "severity": 0,
+            "target_valid_time": {
+                "start": "2026-08-10T00:00:00+08:00",
+                "end": "2026-08-10T23:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "proxy_method_version": "power-weather-proxy-v1",
+            "weight_version": "market-risk-weight-v1",
+        }
     ]
     previous_key = previous["cache_key"]
     assert cache.claim_generation(previous_key, "previous", now=100)
@@ -531,19 +549,216 @@ async def test_briefing_compares_risk_only_with_yesterdays_same_release_version(
     )
 
     assert current["previous_run_id"] == "briefing-run-20260809-0900"
-    assert current["version_change"] == {
+    assert current["version_change"]["status"] == "unavailable"
+    assert current["version_change"]["reason"] == "target_valid_time_mismatch"
+    assert "upgraded_markets" not in current["version_change"]
+    assert "downgraded_markets" not in current["version_change"]
+    card_text = _card_text(current["summary_card"])
+    assert "目标有效时间不同，不进行版本升降比较" in card_text
+    assert "较上一同发布时次 briefing-run-20260809-0900：" not in card_text
+
+
+@pytest.mark.asyncio
+async def test_briefing_refuses_a_risk_row_that_conflicts_with_the_previous_run_methodology(
+    monkeypatch,
+    tmp_path,
+):
+    market_config = _market_config()
+    current_row = _row(hot_tomorrow=True)
+
+    async def fake_fetch(*args, **kwargs):
+        return current_row
+
+    monkeypatch.setattr(power_briefing, "NATIONAL_MARKETS", market_config)
+    monkeypatch.setattr(
+        power_briefing,
+        "MARKET_POINTS",
+        ((market_config[0], market_config[0].points[0]),),
+    )
+    monkeypatch.setattr(power_briefing, "_fetch", fake_fetch)
+    cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=3600)
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["market_config_version"] = power_briefing.MARKET_CONFIG_VERSION
+    previous["report_version"] = power_briefing.POWER_BRIEFING_REPORT_VERSION
+    previous["cache_key"] = (
+        "2026-08-09:"
+        f"{power_briefing.MARKET_CONFIG_VERSION}:"
+        f"{power_briefing.POWER_BRIEFING_REPORT_VERSION}"
+    )
+    previous["proxy_method_version"] = "legacy-proxy-v0"
+    previous["market_risk_snapshots"] = [
+        {
+            "market_id": "cn-37-shandong",
+            "severity": 0,
+            "target_valid_time": {
+                "start": "2026-08-11T00:00:00+08:00",
+                "end": "2026-08-11T23:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            # A row may not claim a newer methodology than its parent run.
+            "proxy_method_version": "power-weather-proxy-v1",
+            "weight_version": "market-risk-weight-v1",
+        }
+    ]
+    previous_key = previous["cache_key"]
+    assert cache.claim_generation(previous_key, "previous", now=100)
+    cache.save_and_release(
+        previous_key,
+        "previous",
+        previous,
+        generator_version=power_briefing.POWER_BRIEFING_REPORT_VERSION,
+        generated_at=100,
+    )
+
+    current = await power_briefing.generate_briefing_snapshot(
+        object(),
+        None,
+        "2026-08-10",
+        cache=cache,
+        generated_at=datetime.fromisoformat("2026-08-10T09:01:00+08:00"),
+        forecast_run_id="briefing-run-20260810-0900",
+        release_slot="09:00",
+    )
+
+    assert current["version_change"]["status"] == "unavailable"
+    assert (
+        current["version_change"]["reason"]
+        == "previous_methodology_metadata_conflict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_briefing_compares_the_same_region_target_time_and_methodology(
+    monkeypatch,
+    tmp_path,
+):
+    market_config = _market_config()
+    current_row = _row(hot_tomorrow=True)
+
+    async def fake_fetch(*args, **kwargs):
+        return current_row
+
+    monkeypatch.setattr(power_briefing, "NATIONAL_MARKETS", market_config)
+    monkeypatch.setattr(
+        power_briefing,
+        "MARKET_POINTS",
+        ((market_config[0], market_config[0].points[0]),),
+    )
+    monkeypatch.setattr(power_briefing, "_fetch", fake_fetch)
+    cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=3600)
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["market_config_version"] = power_briefing.MARKET_CONFIG_VERSION
+    previous["report_version"] = power_briefing.POWER_BRIEFING_REPORT_VERSION
+    previous["cache_key"] = (
+        "2026-08-09:"
+        f"{power_briefing.MARKET_CONFIG_VERSION}:"
+        f"{power_briefing.POWER_BRIEFING_REPORT_VERSION}"
+    )
+    previous["market_risk_snapshots"] = [
+        {
+            "market_id": "cn-37-shandong",
+            "severity": 0,
+            "target_valid_time": {
+                "start": "2026-08-11T00:00:00+08:00",
+                "end": "2026-08-11T23:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "proxy_method_version": "power-weather-proxy-v1",
+            "weight_version": "market-risk-weight-v1",
+        }
+    ]
+    previous_key = previous["cache_key"]
+    assert cache.claim_generation(previous_key, "previous", now=100)
+    cache.save_and_release(
+        previous_key,
+        "previous",
+        previous,
+        generator_version=power_briefing.POWER_BRIEFING_REPORT_VERSION,
+        generated_at=100,
+    )
+
+    current = await power_briefing.generate_briefing_snapshot(
+        object(),
+        None,
+        "2026-08-10",
+        cache=cache,
+        generated_at=datetime.fromisoformat("2026-08-10T09:01:00+08:00"),
+        forecast_run_id="briefing-run-20260810-0900",
+        release_slot="09:00",
+    )
+
+    change = current["version_change"]
+    assert change["status"] == "available"
+    assert change["reason"] == "aligned_region_valid_time_and_methodology"
+    assert change["comparable_markets"] == 1
+    assert change["upgraded_markets"] == 1
+    assert change["comparison_basis"] == {
+        "current_target_valid_time": {
+            "start": "2026-08-11T00:00:00+08:00",
+            "end": "2026-08-11T23:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        "previous_target_valid_time": {
+            "start": "2026-08-11T00:00:00+08:00",
+            "end": "2026-08-11T23:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        "proxy_method_version": "power-weather-proxy-v1",
+        "weight_version": "market-risk-weight-v1",
+    }
+
+
+def test_version_library_rejects_an_available_change_with_misaligned_valid_times(tmp_path):
+    cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=3600)
+    snapshot = _snapshot(run_id="run-falsely-comparable")
+    snapshot["market_risk_snapshots"] = [
+        {
+            "market_id": "cn-37-shandong",
+            "severity": 3,
+            "target_valid_time": {
+                "start": "2026-08-11T00:00:00+08:00",
+                "end": "2026-08-11T23:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "proxy_method_version": "power-weather-proxy-v1",
+            "weight_version": "market-risk-weight-v1",
+        }
+    ]
+    snapshot["previous_run_id"] = "run-previous"
+    snapshot["version_change"] = {
         "status": "available",
         "reason": "same_release_previous_day",
-        "previous_run_id": "briefing-run-20260809-0900",
-        "previous_report_date": "2026-08-09",
+        "previous_run_id": "run-previous",
         "comparable_markets": 1,
         "upgraded_markets": 1,
         "downgraded_markets": 0,
         "unchanged_markets": 0,
+        "comparison_basis": {
+            "current_target_valid_time": {
+                "start": "2026-08-11T00:00:00+08:00",
+                "end": "2026-08-11T23:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "previous_target_valid_time": {
+                "start": "2026-08-10T00:00:00+08:00",
+                "end": "2026-08-10T23:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "proxy_method_version": "power-weather-proxy-v1",
+            "weight_version": "market-risk-weight-v1",
+        },
     }
-    assert "较上一同发布时次 briefing-run-20260809-0900" in _card_text(
-        current["summary_card"]
+    key = snapshot["cache_key"]
+    assert cache.claim_generation(key, "owner", now=100)
+    cache.save_and_release(
+        key,
+        "owner",
+        snapshot,
+        generator_version="power-briefing-3.0",
+        generated_at=100,
     )
+
+    assert cache.load_version("run-falsely-comparable") is None
 
 
 @pytest.mark.asyncio

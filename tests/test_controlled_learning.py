@@ -429,6 +429,22 @@ def test_core_replay_gate_executes_all_96_documented_cases():
     assert report["unresolved_case_numbers"] == []
 
 
+def test_core_replay_gate_uses_the_public_admin_api_for_p0_send_cases() -> None:
+    from services.weather_bot.core_replay_gate import run_core_replay_gate
+
+    report = run_core_replay_gate(today=date(2026, 8, 9))
+    outcomes = {item["case_number"]: item for item in report["items"]}
+
+    for number in (85, 86):
+        assert outcomes[number]["outcome"] == "passed"
+        assert outcomes[number]["evidence"]["executor"] == "public_admin_api"
+        assert outcomes[number]["evidence"]["forecast_calls"] in {0, 1}
+        assert outcomes[number]["evidence"]["feishu_sends"] == 0
+    assert outcomes[85]["evidence"]["status_code"] in {401, 403}
+    assert outcomes[85]["evidence"]["forecast_calls"] == 0
+    assert outcomes[86]["evidence"]["delivery_reason"] == "global_send_disabled"
+
+
 def test_core_replay_gate_executes_documented_electricity_entity_cases():
     from services.weather_bot.core_replay_gate import run_core_replay_gate
 

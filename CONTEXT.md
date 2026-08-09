@@ -17,7 +17,7 @@ A privacy-minimized observation of a low-confidence forecast, unavailable provid
 _Avoid_: Conversation transcript
 
 **Forecast Snapshot**:
-An immutable copy of provider forecasts and their location/date scope, retained so it can later be compared with observed weather.
+An immutable, retention-bounded evidence record containing only policy-allowed derived daily features plus run, valid-time, source URL/hash and retrieval metadata. Raw provider payloads and hourly point series are not retained by controlled learning.
 _Avoid_: Live forecast cache
 
 **Objective Verification**:
@@ -31,3 +31,19 @@ _Avoid_: Automatic patch, automatic release
 **Candidate Decision**:
 An explicit administrative approval, rejection, or rollback recorded against an improvement candidate; approval alone does not alter runtime behavior.
 _Avoid_: Automatic adoption
+
+**Power-weather Analysis Area**:
+A configured geographic/electrical reporting scope used to group representative weather points. It is not automatically an independent trading market.
+_Avoid_: Market (when only the weather-analysis scope is known)
+
+**Representative Point**:
+A named city or coordinate used as a transparent proxy for one analysis area. One point must not be described as province-wide observation.
+_Avoid_: Province-wide truth
+
+**Weather-side Proxy**:
+A weather-derived pressure or resource signal, such as cooling pressure, shortwave-radiation resource, 10-metre surface-wind resource, or forecast-complexity proxy. It is not actual load, generation, supply-demand balance or price.
+_Avoid_: Load forecast, generation forecast, price signal
+
+**Forecast Version Comparison**:
+A comparison between distinct forecast runs for the same analysis area, target valid time, proxy-method version and weight version.
+_Avoid_: Comparing different target dates as a forecast revision

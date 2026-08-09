@@ -38,6 +38,7 @@ def _typhoon_policy_json(environment: str = "test") -> str:
         timezone="Asia/Shanghai",
         max_age_seconds=3600,
         retention_policy="metadata_only",
+        retention_seconds=86_400,
         attribution_required=True,
         attribution_text="QWeather test attribution",
     )

@@ -19,6 +19,8 @@ def _registry(prefix: str = "https://approved.example.com/v1") -> SourceRegistry
         coverage_model="point",
         timezone="Asia/Shanghai",
         max_age_seconds=3600,
+        retention_policy="derived_only",
+        retention_seconds=86_400,
     )
     return SourceRegistry([policy], environment="test")
 

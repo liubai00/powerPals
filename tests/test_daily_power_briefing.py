@@ -1,12 +1,14 @@
 import asyncio
 from datetime import datetime
 import json
+import time
 
 import pytest
 
 from scripts import daily_power_briefing
 from scripts.daily_power_briefing import _confidence_label, _continuous_windows, build_briefing_card
 from services.weather_bot import main as weather_main
+from services.weather_bot.briefing_cache import BriefingCache
 from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuClient
 from services.weather_bot.models import (
@@ -32,6 +34,257 @@ def test_scheduled_briefing_has_no_source_code_chat_targets() -> None:
 def test_scheduled_briefing_targets_fail_closed_on_invalid_configuration() -> None:
     settings = Settings(power_briefing_targets_json="not-json")
     assert daily_power_briefing._approved_chat_targets(settings) == []
+
+
+def test_scheduled_briefing_targets_fail_closed_on_duplicate_chat_id() -> None:
+    settings = Settings(
+        power_briefing_targets_json=json.dumps(
+            [
+                {"name": "晨报群 A", "chat_id": "oc_duplicate"},
+                {"name": "晨报群 B", "chat_id": "oc_duplicate"},
+            ],
+            ensure_ascii=False,
+        )
+    )
+
+    assert daily_power_briefing._approved_chat_targets(settings) == []
+
+
+def test_scheduled_briefing_targets_fail_closed_on_any_invalid_member() -> None:
+    settings = Settings(
+        power_briefing_targets_json=json.dumps(
+            [
+                {"name": "已审核晨报群", "chat_id": "oc_reviewed"},
+                {"name": "缺少目标 ID"},
+            ],
+            ensure_ascii=False,
+        )
+    )
+
+    assert daily_power_briefing._approved_chat_targets(settings) == []
+
+
+def _scheduled_snapshot(
+    *,
+    report_date: str = "2026-08-09",
+    release_slot: str = "09:00",
+    run_id: str = "briefing-run-20260809-0850",
+) -> dict:
+    cache_key = daily_power_briefing.briefing_cache_key(report_date)
+    _, market_config_version, report_version = cache_key.rsplit(":", 2)
+    card = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {"title": {"content": "scheduled briefing"}},
+            "elements": [],
+        },
+    }
+    return {
+        "schema_version": 2,
+        "cache_key": cache_key,
+        "report_date": report_date,
+        "market_config_version": market_config_version,
+        "report_version": report_version,
+        "generated_at": f"{report_date}T08:50:00+08:00",
+        "expires_at": f"{report_date}T09:50:00+08:00",
+        "forecast_run_id": run_id,
+        "release_slot": release_slot,
+        "retrieved_at": f"{report_date}T08:49:00+08:00",
+        "provider_issued_at": {"open_meteo": None},
+        "valid_time": {
+            "start": f"{report_date}T00:00:00+08:00",
+            "end": f"{report_date}T23:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        "sources": ["open_meteo"],
+        "source_forecast_run_ids": ["source-run-1"],
+        "provider_run_metadata": [
+            {
+                "provider": "open_meteo",
+                "statuses": ["ok"],
+                "retrieved_at": f"{report_date}T08:49:00+08:00",
+                "provider_issued_at": None,
+                "source_urls": ["https://api.open-meteo.com/v1/forecast"],
+                "content_sha256s": ["a" * 64],
+                "retention_policy": "derived_only",
+                "record_coverage": {
+                    "ok": 1,
+                    "source_url": 1,
+                    "content_sha256": 1,
+                },
+            }
+        ],
+        "quality": {
+            "status": "degraded",
+            "reasons": ["provider_issued_at_missing:open_meteo"],
+        },
+        "metric_coverage": {},
+        "confidence": {"level": "medium"},
+        "previous_run_id": None,
+        "version_change": {
+            "status": "unavailable",
+            "reason": "no_previous_same_release",
+        },
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+            "baseline_points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "market_risk_snapshots": [],
+        "summary_card": card,
+        "detail_card": card,
+    }
+
+
+class _ScheduledDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 8, 9, 9, 0)
+        return value.replace(tzinfo=tz) if tz is not None else value
+
+
+def _seed_scheduled_snapshot(db_path: str) -> dict:
+    snapshot = _scheduled_snapshot()
+    cache = BriefingCache(db_path, ttl_seconds=3600)
+    assert cache.claim_generation(snapshot["cache_key"], "seed")
+    cache.save_and_release(
+        snapshot["cache_key"],
+        "seed",
+        snapshot,
+        generator_version=snapshot["report_version"],
+    )
+    return snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cache_state",
+    ("missing", "expired", "release_slot_mismatch"),
+)
+async def test_scheduled_send_requires_the_fresh_0850_precomputed_snapshot(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    cache_state,
+):
+    db_path = str(tmp_path / "briefing.db")
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=db_path,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "reviewed briefing group", "chat_id": "oc_reviewed"}],
+        ),
+    )
+    if cache_state != "missing":
+        snapshot = _scheduled_snapshot(
+            release_slot="08:00" if cache_state == "release_slot_mismatch" else "09:00"
+        )
+        seed = BriefingCache(
+            db_path,
+            ttl_seconds=1 if cache_state == "expired" else 3600,
+        )
+        assert seed.claim_generation(snapshot["cache_key"], "seed")
+        seed.save_and_release(
+            snapshot["cache_key"],
+            "seed",
+            snapshot,
+            generator_version=snapshot["report_version"],
+            generated_at=time.time() - (10 if cache_state == "expired" else 0),
+        )
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 8, 9, 9, 0)
+            return value.replace(tzinfo=tz) if tz is not None else value
+
+    def fail_forecast_service(*args, **kwargs):
+        raise AssertionError("send mode must not construct ForecastService")
+
+    async def fail_generation(*args, **kwargs):
+        raise AssertionError("send mode must not generate a briefing")
+
+    async def fail_send(*args, **kwargs):
+        raise AssertionError("an unusable precomputed snapshot must not reach Feishu")
+
+    def fail_claim(*args, **kwargs):
+        raise AssertionError("an unusable precomputed snapshot must not claim the ledger")
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", fail_forecast_service)
+    monkeypatch.setattr(daily_power_briefing, "datetime", FixedDateTime)
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fail_generation)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fail_send)
+    monkeypatch.setattr(BriefingCache, "claim_scheduled_delivery", fail_claim)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    result = await daily_power_briefing.go("send")
+
+    assert result == "precompute_snapshot_missing"
+    assert "reason=precompute_snapshot_missing" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_publishes_one_exact_precomputed_snapshot_with_a_stable_uuid(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = str(tmp_path / "briefing.db")
+    snapshot = _scheduled_snapshot()
+    cache = BriefingCache(db_path, ttl_seconds=3600)
+    assert cache.claim_generation(snapshot["cache_key"], "seed")
+    cache.save_and_release(
+        snapshot["cache_key"],
+        "seed",
+        snapshot,
+        generator_version=snapshot["report_version"],
+    )
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=db_path,
+        power_briefing_cache_ttl_seconds=3600,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "reviewed briefing group", "chat_id": "oc_reviewed"}],
+        ),
+    )
+    sends: list[tuple[str, dict, str | None]] = []
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 8, 9, 9, 0)
+            return value.replace(tzinfo=tz) if tz is not None else value
+
+    async def fake_send(self, chat_id, card, *, idempotency_key=None):
+        sends.append((chat_id, card, idempotency_key))
+        return "message-1"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(daily_power_briefing, "datetime", FixedDateTime)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    monkeypatch.setattr(
+        daily_power_briefing,
+        "_remember_scheduled_briefing_thread",
+        lambda *args: None,
+    )
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    await daily_power_briefing.go("send")
+    await daily_power_briefing.go("send")
+
+    assert sends == [
+        (
+            "oc_reviewed",
+            snapshot["summary_card"],
+            "5639970c-a529-5d60-af6e-a8058747abd2",
+        )
+    ]
 
 
 def _points(
@@ -653,41 +906,92 @@ def test_market_classification_counts_are_conservative():
 
 
 @pytest.mark.asyncio
-async def test_dry_run_generates_cache_without_sending_feishu(monkeypatch, tmp_path):
+async def test_dry_run_send_stops_before_forecast_cache_ledger_or_feishu(monkeypatch, tmp_path):
     settings = Settings(
         power_briefing_cache_db=str(tmp_path / "briefing.db"),
-        feishu_app_id=None,
-        feishu_app_secret=None,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "reviewed briefing group", "chat_id": "oc_reviewed"}],
+        ),
     )
-    snapshot = {
-        "coverage": {
-            "provincial_areas": {"covered": 31, "total": 31},
-            "markets": {"covered": 33, "total": 33},
-            "points": {"covered": 75, "total": 75},
-        },
-        "statistics": {"classified_markets": 33, "configured_markets": 33},
-        "summary_card": {
-            "msg_type": "interactive",
-            "card": {
-                "header": {"title": {"content": "测试晨报"}},
-                "elements": [],
-            },
-        },
-    }
-
-    async def fake_snapshot(*args, **kwargs):
-        return snapshot, False
+    async def fail_generation(*args, **kwargs):
+        raise AssertionError("DRY_RUN send must not generate a briefing")
 
     async def fail_send(*args, **kwargs):
         raise AssertionError("DRY_RUN must never send Feishu messages")
 
+    def fail_forecast_service(*args, **kwargs):
+        raise AssertionError("DRY_RUN send must not construct ForecastService")
+
+    def fail_cache(*args, **kwargs):
+        raise AssertionError("DRY_RUN send must not open the briefing cache")
+
     monkeypatch.setattr(weather_main, "Settings", lambda: settings)
-    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
-    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(weather_main, "ForecastService", fail_forecast_service)
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fail_generation)
+    monkeypatch.setattr(daily_power_briefing, "BriefingCache", fail_cache)
     monkeypatch.setattr(FeishuClient, "send_interactive_card", fail_send)
     monkeypatch.setenv("DRY_RUN", "1")
 
-    await daily_power_briefing.go("send")
+    assert await daily_power_briefing.go("send") == "dry_run"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settings_overrides", "expected_reason"),
+    (
+        (
+            {
+                "global_feishu_send_enabled": False,
+                "power_briefing_allow_send": True,
+                "power_briefing_targets_json": json.dumps(
+                    [{"name": "reviewed", "chat_id": "oc_reviewed"}]
+                ),
+            },
+            "global_send_disabled",
+        ),
+        (
+            {
+                "global_feishu_send_enabled": True,
+                "power_briefing_allow_send": False,
+                "power_briefing_targets_json": json.dumps(
+                    [{"name": "reviewed", "chat_id": "oc_reviewed"}]
+                ),
+            },
+            "scheduled_send_disabled",
+        ),
+        (
+            {
+                "global_feishu_send_enabled": True,
+                "power_briefing_allow_send": True,
+                "power_briefing_targets_json": "[]",
+            },
+            "target_not_configured",
+        ),
+    ),
+)
+async def test_scheduled_send_gates_run_before_forecast_or_cache(
+    monkeypatch,
+    tmp_path,
+    settings_overrides,
+    expected_reason,
+):
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+        **settings_overrides,
+    )
+
+    def fail_boundary(*args, **kwargs):
+        raise AssertionError("a denied scheduled send must stop before forecast and cache")
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", fail_boundary)
+    monkeypatch.setattr(daily_power_briefing, "BriefingCache", fail_boundary)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    assert await daily_power_briefing.go("send") == expected_reason
 
 
 @pytest.mark.asyncio
@@ -814,6 +1118,7 @@ async def test_scheduled_send_records_each_card_thread_pointer(monkeypatch, tmp_
             },
         },
     }
+    snapshot = _seed_scheduled_snapshot(settings.power_briefing_cache_db)
     sent: list[str] = []
     pointers: list[tuple[str, str, str, str | None]] = []
 
@@ -826,7 +1131,7 @@ async def test_scheduled_send_records_each_card_thread_pointer(monkeypatch, tmp_
 
     monkeypatch.setattr(weather_main, "Settings", lambda: settings)
     monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
-    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _ScheduledDateTime)
     monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
     monkeypatch.setattr(
         daily_power_briefing,
@@ -932,6 +1237,7 @@ async def test_scheduled_briefing_sends_each_release_target_at_most_once_across_
             },
         },
     }
+    snapshot = _seed_scheduled_snapshot(settings.power_briefing_cache_db)
     sends: list[tuple[str, str | None]] = []
 
     async def fake_snapshot(*args, **kwargs):
@@ -943,7 +1249,7 @@ async def test_scheduled_briefing_sends_each_release_target_at_most_once_across_
 
     monkeypatch.setattr(weather_main, "Settings", lambda: settings)
     monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
-    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _ScheduledDateTime)
     monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
     monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
     monkeypatch.delenv("DRY_RUN", raising=False)
@@ -990,6 +1296,7 @@ async def test_failed_scheduled_briefing_delivery_can_retry_with_the_same_idempo
             },
         },
     }
+    snapshot = _seed_scheduled_snapshot(settings.power_briefing_cache_db)
     attempts: list[str | None] = []
 
     async def fake_snapshot(*args, **kwargs):
@@ -1003,7 +1310,7 @@ async def test_failed_scheduled_briefing_delivery_can_retry_with_the_same_idempo
 
     monkeypatch.setattr(weather_main, "Settings", lambda: settings)
     monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
-    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _ScheduledDateTime)
     monkeypatch.setattr(FeishuClient, "send_interactive_card", flaky_send)
     monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
     monkeypatch.delenv("DRY_RUN", raising=False)
@@ -1050,6 +1357,7 @@ async def test_concurrent_scheduled_briefing_runs_send_one_card_per_release_targ
             },
         },
     }
+    snapshot = _seed_scheduled_snapshot(settings.power_briefing_cache_db)
     send_started = asyncio.Event()
     finish_send = asyncio.Event()
     sends: list[str | None] = []
@@ -1065,7 +1373,7 @@ async def test_concurrent_scheduled_briefing_runs_send_one_card_per_release_targ
 
     monkeypatch.setattr(weather_main, "Settings", lambda: settings)
     monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
-    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _ScheduledDateTime)
     monkeypatch.setattr(FeishuClient, "send_interactive_card", blocking_send)
     monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
     monkeypatch.delenv("DRY_RUN", raising=False)
@@ -1123,6 +1431,7 @@ async def test_suppressed_scheduled_run_does_not_consume_the_release_target_key(
             },
         },
     }
+    snapshot = _seed_scheduled_snapshot(common["power_briefing_cache_db"])
     sends: list[str] = []
 
     async def fake_snapshot(*args, **kwargs):
@@ -1134,7 +1443,7 @@ async def test_suppressed_scheduled_run_does_not_consume_the_release_target_key(
 
     monkeypatch.setattr(weather_main, "Settings", lambda: settings_ref["current"])
     monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
-    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _ScheduledDateTime)
     monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
     monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
     monkeypatch.delenv("DRY_RUN", raising=False)

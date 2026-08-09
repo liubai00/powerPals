@@ -26,6 +26,7 @@ class SourcePolicy(BaseModel):
     max_age_seconds: int | None = Field(default=None, gt=0)
     min_completeness: float = Field(default=0.95, ge=0.0, le=1.0)
     retention_policy: Literal["derived_only", "metadata_only"] = "derived_only"
+    retention_seconds: int | None = Field(default=None, gt=0)
     attribution_required: bool = False
     attribution_text: str | None = None
 
@@ -40,8 +41,11 @@ class SourcePolicy(BaseModel):
                 "coverage_model": self.coverage_model,
                 "timezone": self.timezone,
                 "max_age_seconds": self.max_age_seconds,
+                "retention_seconds": self.retention_seconds,
             }
             missing = [name for name, value in required.items() if not value]
+            if "retention_policy" not in self.model_fields_set:
+                missing.append("retention_policy")
             if missing:
                 raise ValueError(f"verified source policy missing: {', '.join(missing)}")
             unit_metrics = {

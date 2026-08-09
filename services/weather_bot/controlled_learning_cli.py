@@ -212,6 +212,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_json(value: Any) -> None:
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
     sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n")
 
 

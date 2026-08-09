@@ -6,6 +6,7 @@ import pytest
 from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuClient
 from services.weather_bot.llm import LlmClient
+from services.weather_bot.location import LocationResolutionError
 from services.weather_bot.main import create_app
 from services.weather_bot.logging_safety import (
     redact_sensitive_text,
@@ -14,6 +15,8 @@ from services.weather_bot.logging_safety import (
 )
 from services.weather_bot import memory as weather_memory
 from services.weather_bot.search import TavilySearchClient
+from services.weather_bot.power_briefing import _fetch
+from services.weather_bot.power_briefing_markets import NATIONAL_MARKETS
 
 
 class _ErrorResponse:
@@ -89,9 +92,17 @@ def test_conversation_memory_never_persists_raw_sensitive_text(monkeypatch, tmp_
     monkeypatch.setattr(weather_memory, "DB_PATH", str(tmp_path / "memory.db"))
     raw = "查河南天气，API_KEY=private-key-value，密码: private-password"
 
-    weather_memory.record_turn("weather|p2p|chat|root|user", "user", raw)
+    weather_memory.record_turn(
+        "weather|p2p|chat|root|user",
+        "user",
+        raw,
+        enabled=True,
+    )
 
-    turns = weather_memory.recent_turns("weather|p2p|chat|root|user")
+    turns = weather_memory.recent_turns(
+        "weather|p2p|chat|root|user",
+        enabled=True,
+    )
     serialized = str(turns)
     assert "查河南天气" in serialized
     assert "private-key-value" not in serialized
@@ -122,6 +133,49 @@ def test_feishu_event_log_does_not_retain_raw_message(caplog):
     assert raw_text not in caplog.text
     assert "13800138000" not in caplog.text
     assert "text_sha256=" in caplog.text
+
+
+def test_feishu_event_logs_hash_event_and_reply_identifiers(monkeypatch, caplog, tmp_path):
+    event_id = "evt-sensitive-identifier"
+    reply_message_id = "om-sensitive-reply-identifier"
+
+    async def fake_send_card(self, chat_id, card):
+        return reply_message_id
+
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send_card)
+    monkeypatch.setattr(weather_memory, "DB_PATH", str(tmp_path / "memory.db"))
+    client = TestClient(
+        create_app(
+            settings=Settings(
+                app_env="test",
+                feishu_allow_unsigned_events=True,
+            )
+        )
+    )
+    payload = {
+        "header": {"event_id": event_id, "event_type": "im.message.receive_v1"},
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou-sensitive-user"}},
+            "message": {
+                "chat_id": "oc-sensitive-chat",
+                "chat_type": "p2p",
+                "message_id": "om-sensitive-incoming",
+                "message_type": "text",
+                "content": '{"text":"云云能做什么"}',
+            },
+        },
+    }
+
+    with caplog.at_level(logging.WARNING, logger="services.weather_bot.main"):
+        first = client.post("/feishu/events/weather", json=payload)
+        duplicate = client.post("/feishu/events/weather", json=payload)
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert event_id not in caplog.text
+    assert reply_message_id not in caplog.text
+    assert "event_sha256=" in caplog.text
+    assert "reply_message_sha256=" in caplog.text
 
 
 def test_progress_send_failure_log_never_includes_exception_message(monkeypatch, caplog):
@@ -184,6 +238,23 @@ async def test_search_http_error_log_does_not_retain_response_body(monkeypatch, 
     assert "Tavily search HTTP 400" in caplog.text
     assert "secret-response-body" not in caplog.text
     assert "should-not-be-logged" not in caplog.text
+
+
+async def test_briefing_fetch_failure_never_prints_exception_message(capsys):
+    class FailingService:
+        async def forecast(self, request):
+            raise LocationResolutionError(
+                request.region,
+                "token=private-weather-token https://secret.example/path",
+            )
+
+    market = NATIONAL_MARKETS[0]
+    await _fetch(FailingService(), market, market.points[0], "2026-08-09")
+
+    output = capsys.readouterr().out
+    assert "LocationResolutionError" in output
+    assert "private-weather-token" not in output
+    assert "secret.example" not in output
 
 
 async def test_feishu_send_error_does_not_expose_response_body(monkeypatch):

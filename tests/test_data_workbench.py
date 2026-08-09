@@ -462,6 +462,7 @@ def test_news_digest_and_hydrology_export(tmp_path):
         _env_file=None,
         admin_api_token="test-admin-token",
         global_feishu_send_enabled=True,
+        external_data_workbench_enabled=True,
         local_news_jsonl_path=str(tmp_path / "news.jsonl"),
         local_hydrology_jsonl_path=str(tmp_path / "hydrology.jsonl"),
     )
@@ -487,6 +488,33 @@ def test_news_digest_and_hydrology_export(tmp_path):
     assert hydro_response.status_code == 200
     assert hydro_export.status_code == 200
     assert "station,basin,water_level,flow,observed_at" in hydro_export.text
+
+
+def test_external_news_and_hydrology_workbench_is_disabled_by_default(tmp_path):
+    settings = Settings(
+        _env_file=None,
+        admin_api_token="test-admin-token",
+        local_news_jsonl_path=str(tmp_path / "news.jsonl"),
+        local_hydrology_jsonl_path=str(tmp_path / "hydrology.jsonl"),
+    )
+    client = TestClient(
+        create_app(forecast_service=CapturingForecastService(), settings=settings),
+        headers={"Authorization": "Bearer test-admin-token"},
+    )
+
+    news = client.post(
+        "/api/news/items",
+        json={"title": "unreviewed", "source": "unknown", "url": "https://example.com"},
+    )
+    hydrology = client.post(
+        "/api/hydrology/records",
+        json={"station": "unknown", "basin": "unknown", "observed_at": "2026-08-09"},
+    )
+
+    assert news.status_code == 503
+    assert hydrology.status_code == 503
+    assert not (tmp_path / "news.jsonl").exists()
+    assert not (tmp_path / "hydrology.jsonl").exists()
 
 
 def test_feishu_weather_card_includes_report_and_download_links_when_public_base_url_is_set():

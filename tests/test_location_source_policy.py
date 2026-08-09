@@ -50,6 +50,7 @@ def _policy(
         "timezone": "Asia/Shanghai",
         "max_age_seconds": 86400,
         "retention_policy": "derived_only",
+        "retention_seconds": 86_400,
         "attribution_required": True,
         "attribution_text": "Test geocoder",
     }

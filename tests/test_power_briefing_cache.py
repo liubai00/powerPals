@@ -112,12 +112,17 @@ def test_scheduled_delivery_claim_recovers_after_lease_with_the_same_send_uuid(t
     release_slot = "2026-08-09|09:00"
     target_chat_id = "oc_approved_briefing"
     send_uuid = "5c2a0869-225f-542f-8529-eb721f5030cb"
+    identity = {
+        "cache_key": "2026-08-09:market-v1:power-briefing-3.0",
+        "forecast_run_id": "briefing-run-20260809-0850",
+    }
 
     assert cache.claim_scheduled_delivery(
         release_slot,
         target_chat_id,
         "owner-1",
         send_uuid,
+        **identity,
         lease_seconds=10,
         now=100,
     )
@@ -126,6 +131,7 @@ def test_scheduled_delivery_claim_recovers_after_lease_with_the_same_send_uuid(t
         target_chat_id,
         "owner-2",
         send_uuid,
+        **identity,
         lease_seconds=10,
         now=109,
     )
@@ -134,6 +140,7 @@ def test_scheduled_delivery_claim_recovers_after_lease_with_the_same_send_uuid(t
         target_chat_id,
         "owner-2",
         send_uuid,
+        **identity,
         lease_seconds=10,
         now=111,
     )
@@ -149,8 +156,68 @@ def test_scheduled_delivery_claim_recovers_after_lease_with_the_same_send_uuid(t
         target_chat_id,
         "owner-3",
         send_uuid,
+        **identity,
         lease_seconds=10,
         now=200,
+    )
+
+
+@pytest.mark.parametrize("retry_path", ("failed", "lease_expired"))
+@pytest.mark.parametrize("changed_field", ("cache_key", "forecast_run_id"))
+def test_scheduled_delivery_retry_is_bound_to_the_original_snapshot(
+    tmp_path,
+    retry_path,
+    changed_field,
+):
+    cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=3600)
+    release_slot = "2026-08-09|09:00"
+    target_chat_id = "oc_approved_briefing"
+    send_uuid = "5c2a0869-225f-542f-8529-eb721f5030cb"
+    original = {
+        "cache_key": "2026-08-09:market-v1:power-briefing-3.0",
+        "forecast_run_id": "briefing-run-20260809-0850",
+    }
+
+    assert cache.claim_scheduled_delivery(
+        release_slot,
+        target_chat_id,
+        "owner-1",
+        send_uuid,
+        **original,
+        lease_seconds=10,
+        now=100,
+    )
+    if retry_path == "failed":
+        cache.release_failed_scheduled_delivery(
+            release_slot,
+            target_chat_id,
+            "owner-1",
+        )
+        retry_at = 101
+    else:
+        retry_at = 111
+
+    replacement = dict(original)
+    replacement[changed_field] = f"replacement-{changed_field}"
+    with pytest.raises(ValueError, match="original snapshot"):
+        cache.claim_scheduled_delivery(
+            release_slot,
+            target_chat_id,
+            "owner-2",
+            send_uuid,
+            **replacement,
+            lease_seconds=10,
+            now=retry_at,
+        )
+
+    assert cache.claim_scheduled_delivery(
+        release_slot,
+        target_chat_id,
+        "owner-3",
+        send_uuid,
+        **original,
+        lease_seconds=10,
+        now=retry_at,
     )
 
 
@@ -165,12 +232,26 @@ def test_scheduled_delivery_ledger_is_bounded_by_the_version_retention_window(tm
     target = "oc_approved_briefing"
     old_uuid = "5c2a0869-225f-542f-8529-eb721f5030cb"
     new_uuid = "d184af41-95cc-5667-a109-643499ad3def"
+    old_identity = {
+        "cache_key": "2026-08-09:market-v1:power-briefing-3.0",
+        "forecast_run_id": "briefing-run-20260809-0850",
+    }
+    new_identity = {
+        "cache_key": "2026-08-11:market-v1:power-briefing-3.0",
+        "forecast_run_id": "briefing-run-20260811-0850",
+    }
 
-    assert cache.claim_scheduled_delivery(old_slot, target, "owner-1", old_uuid, now=100)
+    assert cache.claim_scheduled_delivery(
+        old_slot, target, "owner-1", old_uuid, **old_identity, now=100
+    )
     cache.complete_scheduled_delivery(old_slot, target, "owner-1", "message-1", now=101)
-    assert cache.claim_scheduled_delivery(new_slot, target, "owner-2", new_uuid, now=86_502)
+    assert cache.claim_scheduled_delivery(
+        new_slot, target, "owner-2", new_uuid, **new_identity, now=86_502
+    )
 
-    assert cache.claim_scheduled_delivery(old_slot, target, "owner-3", old_uuid, now=86_503)
+    assert cache.claim_scheduled_delivery(
+        old_slot, target, "owner-3", old_uuid, **old_identity, now=86_503
+    )
 
 
 @pytest.mark.asyncio

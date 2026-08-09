@@ -42,6 +42,7 @@ def _policy() -> SourcePolicy:
         timezone="Asia/Shanghai",
         max_age_seconds=3600,
         retention_policy="derived_only",
+        retention_seconds=86_400,
     )
 
 

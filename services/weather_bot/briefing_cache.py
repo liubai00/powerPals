@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Iterator
 from urllib.parse import urlsplit
 
@@ -141,6 +141,11 @@ def _is_valid_v2_metadata(payload: dict[str, Any]) -> bool:
     change = payload.get("version_change")
     if not isinstance(change, dict) or change.get("status") not in {"available", "unavailable"}:
         return False
+    if change.get("status") == "available" and not _is_aligned_available_change(
+        payload,
+        change,
+    ):
+        return False
     if not isinstance(payload.get("market_risk_snapshots"), list):
         return False
     previous_run_id = payload.get("previous_run_id")
@@ -152,6 +157,69 @@ def _is_web_url(value: Any) -> bool:
         return False
     parsed = urlsplit(value)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _valid_time_identity(value: Any) -> tuple[str, str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    timezone_name = value.get("timezone")
+    if not isinstance(timezone_name, str) or not timezone_name.strip():
+        return None
+    parsed: list[datetime] = []
+    for field in ("start", "end"):
+        raw = value.get(field)
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            timestamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            return None
+        parsed.append(timestamp)
+    if parsed[1] < parsed[0]:
+        return None
+    return parsed[0].isoformat(), parsed[1].isoformat(), timezone_name.strip()
+
+
+def _is_aligned_available_change(
+    payload: dict[str, Any],
+    change: dict[str, Any],
+) -> bool:
+    basis = change.get("comparison_basis")
+    if not isinstance(basis, dict):
+        return False
+    current_valid_time = _valid_time_identity(basis.get("current_target_valid_time"))
+    previous_valid_time = _valid_time_identity(basis.get("previous_target_valid_time"))
+    proxy_version = basis.get("proxy_method_version")
+    weight_version = basis.get("weight_version")
+    if (
+        current_valid_time is None
+        or current_valid_time != previous_valid_time
+        or not isinstance(proxy_version, str)
+        or not proxy_version.strip()
+        or not isinstance(weight_version, str)
+        or not weight_version.strip()
+        or payload.get("proxy_method_version") != proxy_version
+        or payload.get("weight_version") != weight_version
+        or payload.get("previous_run_id") != change.get("previous_run_id")
+    ):
+        return False
+    for field in (
+        "comparable_markets",
+        "upgraded_markets",
+        "downgraded_markets",
+        "unchanged_markets",
+    ):
+        if not isinstance(change.get(field), int) or int(change[field]) < 0:
+            return False
+    return (
+        int(change["comparable_markets"]) > 0
+        and int(change["comparable_markets"])
+        == int(change["upgraded_markets"])
+        + int(change["downgraded_markets"])
+        + int(change["unchanged_markets"])
+    )
 
 
 def _version_identity(payload: Any) -> tuple[str, str, str, str, str] | None:
@@ -212,6 +280,7 @@ class BriefingCache:
             "CREATE TABLE IF NOT EXISTS scheduled_briefing_deliveries("
             "release_slot TEXT NOT NULL, target_chat_id TEXT NOT NULL, state TEXT NOT NULL, "
             "owner_token TEXT NOT NULL, send_uuid TEXT NOT NULL, message_id TEXT, "
+            "cache_key TEXT NOT NULL, forecast_run_id TEXT NOT NULL, "
             "lease_until REAL NOT NULL, updated_at REAL NOT NULL, "
             "PRIMARY KEY(release_slot,target_chat_id))"
         )
@@ -223,6 +292,16 @@ class BriefingCache:
             conn.execute(
                 "ALTER TABLE scheduled_briefing_deliveries "
                 "ADD COLUMN lease_until REAL NOT NULL DEFAULT 0"
+            )
+        if "cache_key" not in delivery_columns:
+            conn.execute(
+                "ALTER TABLE scheduled_briefing_deliveries "
+                "ADD COLUMN cache_key TEXT NOT NULL DEFAULT ''"
+            )
+        if "forecast_run_id" not in delivery_columns:
+            conn.execute(
+                "ALTER TABLE scheduled_briefing_deliveries "
+                "ADD COLUMN forecast_run_id TEXT NOT NULL DEFAULT ''"
             )
         return conn
 
@@ -447,11 +526,17 @@ class BriefingCache:
         owner_token: str,
         send_uuid: str,
         *,
+        cache_key: str,
+        forecast_run_id: str,
         lease_seconds: int = 600,
         now: float | None = None,
     ) -> bool:
         """Atomically reserve one scheduled release for one reviewed target."""
 
+        normalized_cache_key = str(cache_key or "").strip()
+        normalized_run_id = str(forecast_run_id or "").strip()
+        if not normalized_cache_key or not normalized_run_id:
+            raise ValueError("scheduled briefing delivery requires a snapshot identity")
         current = time.time() if now is None else float(now)
         lease_until = current + max(1, int(lease_seconds))
         with self._db() as conn:
@@ -461,7 +546,8 @@ class BriefingCache:
                 (current - self.version_retention_seconds,),
             )
             row = conn.execute(
-                "SELECT state,send_uuid,lease_until FROM scheduled_briefing_deliveries "
+                "SELECT state,send_uuid,lease_until,cache_key,forecast_run_id "
+                "FROM scheduled_briefing_deliveries "
                 "WHERE release_slot=? AND target_chat_id=?",
                 (release_slot, target_chat_id),
             ).fetchone()
@@ -469,22 +555,31 @@ class BriefingCache:
                 conn.execute(
                     "INSERT INTO scheduled_briefing_deliveries("
                     "release_slot,target_chat_id,state,owner_token,send_uuid,message_id,"
-                    "lease_until,updated_at) VALUES(?,?,?,?,?,NULL,?,?)",
+                    "cache_key,forecast_run_id,lease_until,updated_at) "
+                    "VALUES(?,?,?,?,?,NULL,?,?,?,?)",
                     (
                         release_slot,
                         target_chat_id,
                         "sending",
                         owner_token,
                         send_uuid,
+                        normalized_cache_key,
+                        normalized_run_id,
                         lease_until,
                         current,
                     ),
                 )
                 return True
+            if (
+                str(row[1]) != send_uuid
+                or str(row[3]) != normalized_cache_key
+                or str(row[4]) != normalized_run_id
+            ):
+                raise ValueError(
+                    "scheduled briefing retry must reuse the original snapshot and send UUID"
+                )
             if str(row[0]) == "sent" or float(row[2]) >= current:
                 return False
-            if str(row[1]) != send_uuid:
-                raise ValueError("scheduled briefing retry must reuse the original send UUID")
             conn.execute(
                 "UPDATE scheduled_briefing_deliveries "
                 "SET state='sending',owner_token=?,lease_until=?,updated_at=? "
@@ -521,9 +616,11 @@ class BriefingCache:
     ) -> None:
         """Release only this process' unfinished claim so the stable UUID can retry."""
 
+        current = time.time()
         with self._db() as conn:
             conn.execute(
-                "DELETE FROM scheduled_briefing_deliveries "
+                "UPDATE scheduled_briefing_deliveries "
+                "SET state='failed',lease_until=0,updated_at=? "
                 "WHERE release_slot=? AND target_chat_id=? AND owner_token=? AND state='sending'",
-                (release_slot, target_chat_id, owner_token),
+                (current, release_slot, target_chat_id, owner_token),
             )

@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import httpx
 
+from services.weather_bot.config import Settings
 from services.weather_bot.decision_boundary import contains_unsafe_weather_only_claim
-from services.weather_bot.llm import LlmClient, explain_weather_with_llm
+from services.weather_bot.llm import (
+    LlmClient,
+    _matches_allowed_https_prefix,
+    _parse_prefix_allowlist,
+    explain_weather_with_llm,
+)
 from services.weather_bot.models import WeatherSubmission
 
 
@@ -14,14 +20,41 @@ class OpenClawExplainer:
         api_key: str | None = None,
         timeout: float = 20.0,
         llm_client: LlmClient | None = None,
+        egress_allowed: bool = True,
     ):
         self.api_url = api_url
         self.api_key = api_key
         self.timeout = timeout
         self.llm_client = llm_client
+        self.egress_allowed = egress_allowed
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        llm_client: LlmClient | None = None,
+    ) -> "OpenClawExplainer":
+        allowed_prefixes = _parse_prefix_allowlist(
+            settings.openclaw_allowed_https_prefixes_json
+        )
+        return cls(
+            settings.openclaw_api_url,
+            settings.openclaw_api_key,
+            llm_client=llm_client,
+            egress_allowed=(
+                settings.openclaw_egress_enabled
+                and not settings.dry_run
+                and bool(allowed_prefixes)
+                and _matches_allowed_https_prefix(
+                    settings.openclaw_api_url or "",
+                    allowed_prefixes,
+                )
+            ),
+        )
 
     async def explain(self, submission: WeatherSubmission) -> dict[str, list[str]]:
-        if not self.api_url:
+        if not self.api_url or not self.egress_allowed:
             return await self._fallback_explanation(submission)
 
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}

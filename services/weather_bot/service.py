@@ -59,9 +59,8 @@ class ForecastService:
         self.settings = settings or Settings()
         self.providers = providers or build_default_providers(self.settings)
         llm_client = LlmClient.from_settings(self.settings) if explicit_settings else None
-        self.explainer = explainer or OpenClawExplainer(
-            self.settings.openclaw_api_url,
-            self.settings.openclaw_api_key,
+        self.explainer = explainer or OpenClawExplainer.from_settings(
+            self.settings,
             llm_client=llm_client,
         )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -174,6 +173,22 @@ class ForecastService:
         submit_time = _submit_time(request.target_date)
         business_submission_deadline = _business_submission_deadline(request.target_date)
         forecast_start, forecast_end = _forecast_window(request.target_date)
+        used_provider_results = [
+            result
+            for result in provider_results
+            if result.provider in aggregated.providers_used
+        ]
+        submission_retention_policy = (
+            "metadata_only"
+            if any(
+                result.retention_policy == "metadata_only"
+                for result in used_provider_results
+            )
+            else "derived_only"
+        )
+        submission_retention_expires_at = _earliest_retention_expiry(
+            used_provider_results
+        )
         submission = WeatherSubmission(
             task_id=_task_id(request.target_date, location_slug(location)),
             region=request.region,
@@ -218,6 +233,8 @@ class ForecastService:
             confidence=_confidence(aggregated.providers_used, request.providers),
             key_factors=["多源气象预报融合"],
             risk_notes=["局地短时天气存在不确定性"],
+            retention_policy=submission_retention_policy,
+            retention_expires_at=submission_retention_expires_at,
             scoring_profile=ScoringProfile(),
         )
         explanation = await self.explainer.explain(submission)
@@ -315,7 +332,13 @@ class ForecastService:
                 else "metadata_only"
             )
             return provider_result.model_copy(
-                update={"retention_policy": effective_retention}
+                update={
+                    "retention_policy": effective_retention,
+                    "retention_expires_at": _retention_expires_at(
+                        provider_result.retrieved_at,
+                        policy.retention_seconds,
+                    ),
+                }
             )
         logger.warning(
             "provider_data_rejected provider=%s reason=%s",
@@ -427,6 +450,40 @@ def _fresh_until(retrieved_at: str | None, max_age_seconds: int | None) -> str |
     if observed.tzinfo is None or observed.utcoffset() is None:
         return None
     return (observed + timedelta(seconds=max_age_seconds)).isoformat()
+
+
+def _retention_expires_at(
+    retrieved_at: str | None,
+    retention_seconds: int | None,
+) -> str | None:
+    if not retrieved_at or retention_seconds is None:
+        return None
+    try:
+        observed = datetime.fromisoformat(retrieved_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        return None
+    return (observed + timedelta(seconds=retention_seconds)).isoformat()
+
+
+def _earliest_retention_expiry(results: list[ProviderForecast]) -> str | None:
+    expiries: list[datetime] = []
+    for result in results:
+        if not result.retention_expires_at:
+            return None
+        try:
+            expiry = datetime.fromisoformat(
+                result.retention_expires_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+        if expiry.tzinfo is None or expiry.utcoffset() is None:
+            return None
+        expiries.append(expiry)
+    if not expiries:
+        return None
+    return min(expiries).isoformat()
 
 
 def _confidence(providers_used: list[str], requested_providers: list[str]) -> dict[str, float | str]:

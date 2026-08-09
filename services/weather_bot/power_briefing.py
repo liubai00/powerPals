@@ -29,6 +29,8 @@ from services.weather_bot.workbench import collect_forecasts_with_errors
 
 
 POWER_BRIEFING_REPORT_VERSION = "power-briefing-3.0"
+POWER_WEATHER_PROXY_VERSION = "power-weather-proxy-v1"
+MARKET_RISK_WEIGHT_VERSION = "market-risk-weight-v1"
 MARKET_POINTS = representative_points()
 PROVINCES = NATIONAL_MARKETS  # 保留旧脚本导入名；实际为 33 个电力气象分析区。
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -141,7 +143,10 @@ async def _fetch(
                 "errors": errors,
             }
         except Exception as exc:  # noqa: BLE001 - 单市场失败不应阻断整份晨报
-            print("FETCH FAIL %s/%s %r" % (market.market_name, point.city, exc))
+            print(
+                "FETCH FAIL %s/%s error_type=%s"
+                % (market.market_name, point.city, type(exc).__name__)
+            )
     return {
         "market_id": market.market_id,
         "market": market.market_name,
@@ -1025,9 +1030,39 @@ def _coverage_text(coverage: dict[str, Any]) -> str:
     )
 
 
-def _market_risk_snapshots(insights: list[MarketInsight]) -> list[dict[str, Any]]:
+def _market_target_valid_time(
+    rows: list[dict[str, Any]],
+    *,
+    market_id: str,
+    target_date: str,
+) -> dict[str, str] | None:
+    windows: set[tuple[str, str, str]] = set()
+    for row in rows:
+        if str(row.get("market_id") or "") != market_id:
+            continue
+        submission = (row.get("submissions") or {}).get(target_date)
+        if submission is None:
+            continue
+        valid_time = getattr(submission.time_info, "valid_time", None)
+        start = str(getattr(valid_time, "start", None) or "").strip()
+        end = str(getattr(valid_time, "end", None) or "").strip()
+        timezone_name = str(getattr(valid_time, "timezone", None) or "").strip()
+        if start and end and timezone_name:
+            windows.add((start, end, timezone_name))
+    if len(windows) != 1:
+        return None
+    start, end, timezone_name = next(iter(windows))
+    return {"start": start, "end": end, "timezone": timezone_name}
+
+
+def _market_risk_snapshots(
+    insights: list[MarketInsight],
+    rows: list[dict[str, Any]],
+    start_date: str,
+) -> list[dict[str, Any]]:
     """Persist derived market features only; provider raw payloads never enter versions."""
 
+    target_date = (date.fromisoformat(start_date) + timedelta(days=1)).isoformat()
     return [
         {
             "market_id": item.market_id,
@@ -1040,6 +1075,13 @@ def _market_risk_snapshots(insights: list[MarketInsight]) -> list[dict[str, Any]
             "confidence": item.confidence,
             "covered_points": item.covered_points,
             "configured_points": item.configured_points,
+            "target_valid_time": _market_target_valid_time(
+                rows,
+                market_id=item.market_id,
+                target_date=target_date,
+            ),
+            "proxy_method_version": POWER_WEATHER_PROXY_VERSION,
+            "weight_version": MARKET_RISK_WEIGHT_VERSION,
         }
         for item in insights
     ]
@@ -1103,17 +1145,53 @@ def _run_quality_text(
     if not issued_lines:
         issued_lines.append("数据源起报时间未提供")
 
+    source_evidence_lines: list[str] = []
+    for item in run_metadata.get("provider_run_metadata") or []:
+        if not isinstance(item, dict):
+            continue
+        provider_label = _provider_label(str(item.get("provider") or "unknown"))
+        urls = [str(value) for value in item.get("source_urls") or [] if str(value).strip()]
+        hashes = [
+            str(value)
+            for value in item.get("content_sha256s") or []
+            if str(value).strip()
+        ]
+        if urls and hashes:
+            source_evidence_lines.append(
+                f"- {provider_label} source_url {urls[0]}｜SHA-256 {hashes[0]}"
+                + (f"｜共 {len(hashes)} 个内容指纹" if len(hashes) > 1 else "")
+            )
+    if not source_evidence_lines:
+        source_evidence_lines.append("- source_url / SHA-256 未提供")
+
     if version_change.get("status") == "available":
+        excluded_markets = int(version_change.get("excluded_markets") or 0)
         version_line = (
             f"较上一同发布时次 {version_change.get('previous_run_id')}："
             f"{version_change.get('upgraded_markets', 0)} 个分析区上调，"
             f"{version_change.get('downgraded_markets', 0)} 个下调，"
             f"{version_change.get('unchanged_markets', 0)} 个不变"
+            + (
+                f"；另 {excluded_markets} 个因有效时间或方法版本不一致未纳入"
+                if excluded_markets
+                else ""
+            )
         )
     else:
-        version_line = (
+        reason = str(version_change.get("reason") or "")
+        version_line = {
+            "target_valid_time_mismatch": "目标有效时间不同，不进行版本升降比较",
+            "proxy_method_version_mismatch": "代理口径版本不同，不进行版本升降比较",
+            "weight_version_mismatch": "权重版本不同，不进行版本升降比较",
+            "current_comparison_provenance_incomplete": "当前版本溯源信息不完整，不进行版本升降比较",
+            "previous_comparison_provenance_incomplete": "上一版本溯源信息不完整，不进行版本升降比较",
+            "market_comparison_metadata_incomplete": "分析区有效时间或方法版本不完整，不进行版本升降比较",
+            "current_methodology_metadata_conflict": "当前分析区方法版本与运行元数据冲突，不进行版本升降比较",
+            "previous_methodology_metadata_conflict": "上一分析区方法版本与运行元数据冲突，不进行版本升降比较",
+        }.get(
+            reason,
             "上一同发布时次版本不可用"
-            "（没有昨日同一发布时次的可比快照）"
+            "（没有可比快照）",
         )
 
     reasons = quality.get("reasons") or []
@@ -1130,6 +1208,10 @@ def _run_quality_text(
     return "\n".join(
         [
             f"- 预报运行 `{run_metadata.get('forecast_run_id')}`｜发布时次 {run_metadata.get('release_slot')}",
+            (
+                f"- 代理口径 {run_metadata.get('proxy_method_version') or '未提供'}｜"
+                f"权重版本 {run_metadata.get('weight_version') or '未提供'}"
+            ),
             f"- 实际抓取 {_display_timestamp(run_metadata.get('retrieved_at'))}",
             f"- 聚合完成 {_display_timestamp(run_metadata.get('aggregation_completed_at'))}",
             (
@@ -1137,6 +1219,7 @@ def _run_quality_text(
                 f"{_display_timestamp(valid_time.get('end'))}｜{valid_time.get('timezone') or '未提供'}"
             ),
             f"- 来源 {' / '.join(_provider_label(str(item)) for item in sources) or '暂无可追溯来源'}",
+            *source_evidence_lines,
             "- " + "；".join(issued_lines),
             (
                 f"- 数据质量 {quality_status}｜"
@@ -1406,22 +1489,28 @@ async def generate_briefing_snapshot(
         start_date,
         market_config=NATIONAL_MARKETS,
     )
-    risk_snapshots = _market_risk_snapshots(insights)
+    risk_snapshots = _market_risk_snapshots(insights, rows, start_date)
     previous = cache.load_previous_same_release(
         report_date=start_date,
         release_slot=declared_release_slot,
         market_config_version=MARKET_CONFIG_VERSION,
         report_version=POWER_BRIEFING_REPORT_VERSION,
     )
-    version_change = compare_market_risk_versions(risk_snapshots, previous)
     run_metadata = build_run_provenance(
         rows,
         coverage,
         forecast_run_id=run_id,
         release_slot=declared_release_slot,
+        proxy_method_version=POWER_WEATHER_PROXY_VERSION,
+        weight_version=MARKET_RISK_WEIGHT_VERSION,
     )
     if run_metadata["quality"]["status"] == "unusable":
         raise RuntimeError("briefing requires traceable external weather provenance")
+    version_change = compare_market_risk_versions(
+        risk_snapshots,
+        previous,
+        current_run_metadata=run_metadata,
+    )
 
     typhoon_block = None
     if typhoon_client is not None:

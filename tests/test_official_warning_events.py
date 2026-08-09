@@ -120,7 +120,8 @@ def test_public_official_warning_query_uses_location_and_normalized_official_met
         "unit_manifest":"warning_id:text;headline:text;original_issuer:text;published_at:iso8601;effective_at:iso8601;expires_at:iso8601;message_type:text;source_tag:text",
         "required_metrics":["warning_id","headline","original_issuer","published_at","effective_at","expires_at","message_type","source_tag"],
         "coverage_model":"latitude-longitude-point","timezone":"Asia/Shanghai","max_age_seconds":600,
-        "retention_policy":"metadata_only","attribution_required":true,"attribution_text":"QWeather"
+        "retention_policy":"metadata_only","retention_seconds":86400,
+        "attribution_required":true,"attribution_text":"QWeather"
       }
     ]"""
     service = _ForbiddenForecastService()

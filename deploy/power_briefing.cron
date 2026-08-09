@@ -1,3 +1,6 @@
-# 电力气象决策晨报（北京时间：08:50 预计算，09:00 计划发送）
-50 0 * * * docker exec -e POWER_BRIEFING_MODE=precompute -i powerpals-weather-bot-1 python - < /data/application/openclaw/powerPals/scripts/daily_power_briefing.py >> /var/log/power_briefing-precompute.log 2>&1
-0 1 * * * docker exec -e POWER_BRIEFING_MODE=send -i powerpals-weather-bot-1 python - < /data/application/openclaw/powerPals/scripts/daily_power_briefing.py >> /var/log/power_briefing.log 2>&1
+# 电力气象决策晨报（显式使用北京时间：08:50 预计算，09:00 只读快照发送）
+SHELL=/bin/sh
+CRON_TZ=Asia/Shanghai
+WEATHER_AGENT_COMPOSE_DIR=/data/application/openclaw/powerPals
+50 8 * * * cd "$WEATHER_AGENT_COMPOSE_DIR" && docker compose exec -T -e POWER_BRIEFING_MODE=precompute weather-bot python -m scripts.daily_power_briefing >> /var/log/power_briefing-precompute.log 2>&1
+0 9 * * * cd "$WEATHER_AGENT_COMPOSE_DIR" && docker compose exec -T -e POWER_BRIEFING_MODE=send weather-bot python -m scripts.daily_power_briefing >> /var/log/power_briefing.log 2>&1
