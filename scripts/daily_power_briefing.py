@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from services.weather_bot.briefing_cache import BriefingCache
 from services.weather_bot.power_briefing import (
@@ -21,15 +25,42 @@ from services.weather_bot.power_briefing import (
     build_briefing_card,
     get_or_generate_briefing,
 )
+from services.weather_bot.send_policy import AdminSendPolicy
 
 
-CHAT_TARGETS = [
-    ("国峰运营-AI 实验群", "oc_8a6645e28915e2eefe7768e41773ec08"),
-    ("小可爱电力社区 Power Pals", "oc_fe8abbef9959e5439c4797c237ad5df8"),
-]
+@dataclass(frozen=True)
+class ApprovedBriefingTarget:
+    name: str
+    chat_id: str
+
+
+def _approved_chat_targets(settings: Any) -> list[ApprovedBriefingTarget]:
+    """Load reviewed targets from configuration; malformed input fails closed."""
+    raw = str(getattr(settings, "power_briefing_targets_json", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+
+    targets: list[ApprovedBriefingTarget] = []
+    seen_chat_ids: set[str] = set()
+    for index, item in enumerate(decoded, start=1):
+        if not isinstance(item, dict):
+            continue
+        chat_id = str(item.get("chat_id") or "").strip()
+        if not chat_id or chat_id in seen_chat_ids:
+            continue
+        name = str(item.get("name") or f"approved-target-{index}").strip()
+        targets.append(ApprovedBriefingTarget(name=name, chat_id=chat_id))
+        seen_chat_ids.add(chat_id)
+    return targets
 
 __all__ = [
-    "CHAT_TARGETS",
+    "ApprovedBriefingTarget",
     "MARKET_POINTS",
     "PROVINCES",
     "MarketInsight",
@@ -63,7 +94,7 @@ def _remember_scheduled_briefing_thread(
         "*",
         "group",
     )
-    weather_memory.save_conversation_state(
+    weather_memory.save_briefing_context(
         state_key,
         {
             "state_version": 1,
@@ -78,8 +109,22 @@ async def go(mode: str | None = None) -> None:
     from services.weather_bot import main as m
 
     settings = m.Settings()
+    source_registry = m.SourceRegistry.from_json(
+        settings.weather_source_policies_json,
+        environment=settings.app_env,
+    )
     service = m.ForecastService(settings=settings)
-    typhoon_client = m.TyphoonClient(settings.qweather_api_key, settings.qweather_api_host)
+    qweather_host = (settings.qweather_api_host or "devapi.qweather.com").strip().rstrip("/")
+    typhoon_policy = source_registry.resolve(
+        m.QWEATHER_TYPHOON_PROVIDER,
+        f"https://{qweather_host}/v7/tropical/storm-list",
+    )
+    typhoon_client = m.TyphoonClient(
+        settings.qweather_api_key,
+        qweather_host,
+        source_registry=source_registry,
+        source_policy=typhoon_policy,
+    )
     cache = BriefingCache(
         settings.power_briefing_cache_db,
         ttl_seconds=settings.power_briefing_cache_ttl_seconds,
@@ -90,6 +135,7 @@ async def go(mode: str | None = None) -> None:
         typhoon_client,
         start_date,
         cache=cache,
+        release_slot="09:00",
     )
     coverage = snapshot["coverage"]
     statistics = snapshot["statistics"]
@@ -128,28 +174,84 @@ async def go(mode: str | None = None) -> None:
         return
     if selected_mode != "send":
         raise ValueError(f"unsupported POWER_BRIEFING_MODE: {selected_mode}")
-    if os.getenv("POWER_BRIEFING_ALLOW_SEND") != "1":
-        print("NO-SEND mode=send reason=POWER_BRIEFING_ALLOW_SEND_disabled")
+    targets = _approved_chat_targets(settings)
+    send_policy = AdminSendPolicy(
+        global_send_enabled=settings.global_feishu_send_enabled,
+        dry_run=settings.dry_run or dry_run,
+    )
+    schedule_send_enabled = bool(settings.power_briefing_allow_send)
+    initial_decision = send_policy.scheduled_card_send_decision(
+        targets[0].chat_id if targets else None,
+        schedule_send_enabled=schedule_send_enabled,
+    )
+    if not initial_decision.allowed:
+        print("NO-SEND mode=send reason=%s" % initial_decision.reason)
         return
 
     legacy = m._legacy_feishu_account(settings, None)
     account = m._role_feishu_account(settings, m.FEISHU_WEATHER_BOT, legacy)
     feishu = m.FeishuClient(settings, account)
-    for chat_name, chat_id in CHAT_TARGETS:
+    report_date = str(snapshot.get("report_date") or start_date)
+    declared_slot = str(snapshot.get("release_slot") or "09:00")
+    release_slot = f"{report_date}|{declared_slot}"
+    for target in targets:
+        decision = send_policy.scheduled_card_send_decision(
+            target.chat_id,
+            schedule_send_enabled=schedule_send_enabled,
+        )
+        if not decision.allowed:
+            print("NO-SEND target=%s reason=%s" % (target.name, decision.reason))
+            continue
+        owner_token = uuid4().hex
+        send_uuid = str(
+            uuid5(
+                NAMESPACE_URL,
+                f"power-briefing:{release_slot}:{target.chat_id}",
+            )
+        )
+        if not cache.claim_scheduled_delivery(
+            release_slot,
+            target.chat_id,
+            owner_token,
+            send_uuid,
+        ):
+            print("NO-SEND target=%s reason=already_sent_or_in_progress" % target.name)
+            continue
         try:
-            message_id = await feishu.send_interactive_card(chat_id, snapshot["summary_card"])
+            message_id = await feishu.send_interactive_card(
+                target.chat_id,
+                snapshot["summary_card"],
+                idempotency_key=send_uuid,
+            )
+            cache.complete_scheduled_delivery(
+                release_slot,
+                target.chat_id,
+                owner_token,
+                message_id,
+            )
             try:
                 _remember_scheduled_briefing_thread(
-                    chat_id,
+                    target.chat_id,
                     message_id,
                     str(snapshot["cache_key"]),
                     str(snapshot.get("generated_at") or ""),
                 )
             except Exception as exc:  # noqa: BLE001 - sent card remains successful
-                print("POINTER FAIL chat=%s err=%r" % (chat_name, exc))
-            print("SENT ok chat=%s msg_id=%s" % (chat_name, message_id))
+                print("POINTER FAIL target=%s err=%s" % (target.name, type(exc).__name__))
+            print("SENT ok target=%s msg_id=%s" % (target.name, message_id))
         except Exception as exc:  # noqa: BLE001
-            print("SEND FAIL chat=%s err=%r" % (chat_name, exc))
+            try:
+                cache.release_failed_scheduled_delivery(
+                    release_slot,
+                    target.chat_id,
+                    owner_token,
+                )
+            except Exception as ledger_exc:  # noqa: BLE001 - preserve the send failure
+                print(
+                    "LEDGER RELEASE FAIL target=%s err=%s"
+                    % (target.name, type(ledger_exc).__name__)
+                )
+            print("SEND FAIL target=%s err=%s" % (target.name, type(exc).__name__))
 
 
 def _parse_args() -> argparse.Namespace:

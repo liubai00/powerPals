@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 import re
 from dataclasses import dataclass
@@ -10,7 +13,24 @@ import httpx
 from pydantic import BaseModel
 
 from services.weather_bot.config import Settings
+from services.weather_bot.data_provenance import DataAvailabilityGate, ExternalDataRecord
 from services.weather_bot.models import ForecastRequest
+from services.weather_bot.source_registry import (
+    SourcePolicy,
+    SourceRegistry,
+    same_source_endpoint,
+)
+
+
+QWEATHER_GEO_PROVIDER = "qweather_geocoding"
+NOMINATIM_GEO_PROVIDER = "nominatim_geocoding"
+OPEN_METEO_GEO_PROVIDER = "open_meteo_geocoding"
+QWEATHER_GEO_PATH = "/geo/v2/city/lookup"
+NOMINATIM_GEO_ENDPOINT = "https://nominatim.openstreetmap.org/search"
+OPEN_METEO_GEO_ENDPOINT = "https://geocoding-api.open-meteo.com/v1/search"
+_REQUIRED_GEOCODING_METRICS = frozenset(
+    {"name", "latitude", "longitude", "country", "province", "city"}
+)
 
 
 PROVINCE_SHORT_NAMES = {
@@ -59,6 +79,12 @@ class ResolvedLocation(BaseModel):
     city: str | None = None
     representation: str = "point"
     representative_city: str | None = None
+    source_provider: str | None = None
+    source_url: str | None = None
+    retrieved_at: str | None = None
+    content_sha256: str | None = None
+    attribution: str | None = None
+    retention_policy: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -66,6 +92,33 @@ class ResolvedLocation(BaseModel):
             city = self.representative_city.removesuffix("市")
             return f"{self.name}（{city}代表点）"
         return self.name
+
+
+class LocationResolutionError(ValueError):
+    """Base error carrying a safe, user-supplied location entity."""
+
+    def __init__(self, region: str, message: str) -> None:
+        self.region = region
+        super().__init__(message)
+
+
+class LocationNotFoundError(LocationResolutionError):
+    def __init__(self, region: str) -> None:
+        super().__init__(region, f"Location could not be resolved: {region}")
+
+
+class AmbiguousLocationError(LocationResolutionError):
+    def __init__(self, region: str, candidates: tuple[str, ...]) -> None:
+        self.candidates = candidates
+        super().__init__(region, f"Location is ambiguous: {region}")
+
+
+# Administrative names that have multiple common Chinese place interpretations.
+# A bare alias is never guessed; province-qualified text continues through the
+# normal resolver chain. The values are labels only, not locally owned facts.
+AMBIGUOUS_LOCATION_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "朝阳": ("北京市朝阳区", "辽宁省朝阳市"),
+}
 
 
 class FavoriteLocation(BaseModel):
@@ -415,9 +468,129 @@ for _aliases, _name, _code, _lat, _lon, _province, _city in MAJOR_CITY_LOCATIONS
 
 
 class LocationResolver:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        source_registry: SourceRegistry | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ):
         self.settings = settings or Settings()
         self.location_book = LocationBook(self.settings)
+        self.source_registry = source_registry
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _source_policy(
+        self,
+        provider: str,
+        endpoint: str,
+    ) -> SourcePolicy | None:
+        registry = self.source_registry
+        if registry is None:
+            return None
+        policy = registry.resolve(provider, endpoint)
+        if (
+            policy.provider != provider
+            or policy.environment != registry.environment
+            or policy.license_status != "verified"
+            or "calculation" not in policy.allowed_uses
+            or policy.retention_policy not in {"derived_only", "metadata_only"}
+            or not policy.attribution_required
+            or not (policy.attribution_text or "").strip()
+            or not _REQUIRED_GEOCODING_METRICS.issubset(policy.required_metrics)
+            or not any(
+                same_source_endpoint(prefix, endpoint)
+                for prefix in policy.source_url_prefixes
+            )
+        ):
+            return None
+        return policy
+
+    def _admit_external_location(
+        self,
+        location: ResolvedLocation,
+        *,
+        provider: str,
+        endpoint: str,
+        policy: SourcePolicy,
+        response: httpx.Response,
+    ) -> ResolvedLocation | None:
+        try:
+            response_endpoint = str(response.request.url.copy_with(query=None))
+            source_url = str(response.request.url)
+        except RuntimeError:
+            return None
+        registry = self.source_registry
+        if (
+            registry is None
+            or response.history
+            or not same_source_endpoint(response_endpoint, endpoint)
+            or registry.resolve(provider, source_url) != policy
+        ):
+            return None
+        retrieved_at = self.clock()
+        if not _timezone_aware(retrieved_at) or policy.max_age_seconds is None:
+            return None
+        normalized_metrics: dict[str, object] = {
+            "name": location.name,
+            "latitude": location.latitude,
+            "longitude": location.longitude,
+            "country": location.country,
+            "province": location.province,
+            "city": location.city,
+        }
+        completeness = sum(
+            _present_metric(normalized_metrics.get(metric))
+            for metric in policy.required_metrics
+        ) / len(policy.required_metrics)
+        content_hash = sha256(response.content).hexdigest()
+        record = ExternalDataRecord(
+            source_id=provider,
+            source_kind="structured_api",
+            source_url=source_url,
+            retrieved_at=retrieved_at,
+            valid_time=retrieved_at.isoformat(),
+            unit=policy.unit_manifest,
+            granularity="place_candidate",
+            coverage=policy.coverage_model,
+            timezone=policy.timezone,
+            license_status=policy.license_status,
+            allowed_uses=policy.allowed_uses,
+            completeness=completeness,
+            quality_status="good" if completeness >= policy.min_completeness else "degraded",
+            degradation_reason=(
+                None
+                if completeness >= policy.min_completeness
+                else "normalized geocoder fields are incomplete"
+            ),
+            fresh_until=retrieved_at + timedelta(seconds=policy.max_age_seconds),
+            content_sha256=content_hash,
+            structured_values=True,
+            retention_policy=policy.retention_policy,
+        )
+        decision = DataAvailabilityGate(
+            min_completeness=policy.min_completeness
+        ).evaluate(record, now=retrieved_at)
+        if decision.status != "allowed_for_calculation":
+            return None
+        effective_retention = (
+            "derived_only"
+            if (
+                policy.retention_policy == "derived_only"
+                and decision.derived_storage_allowed
+            )
+            else "metadata_only"
+        )
+        return location.model_copy(
+            update={
+                "source_provider": provider,
+                "source_url": source_url,
+                "retrieved_at": retrieved_at.isoformat(),
+                "content_sha256": content_hash,
+                "attribution": (policy.attribution_text or "").strip(),
+                "retention_policy": effective_retention,
+            }
+        )
 
     async def resolve(self, request: ForecastRequest) -> ResolvedLocation:
         if request.latitude is not None and request.longitude is not None:
@@ -431,6 +604,9 @@ class LocationResolver:
 
         interpreted = interpret_region_scope(request.region)
         region = interpreted.entity
+        ambiguous_candidates = AMBIGUOUS_LOCATION_CANDIDATES.get(region)
+        if ambiguous_candidates:
+            raise AmbiguousLocationError(region, ambiguous_candidates)
         builtin = BUILTIN_LOCATIONS.get(region)
         if builtin:
             return builtin
@@ -452,15 +628,19 @@ class LocationResolver:
         if open_meteo:
             return open_meteo
 
-        raise ValueError(f"Cannot resolve location: {region}")
+        raise LocationNotFoundError(region)
 
     async def _resolve_with_qweather(self, region: str) -> ResolvedLocation | None:
         host = (self.settings.qweather_api_host or "geoapi.qweather.com").strip().rstrip("/")
+        endpoint = f"https://{host}{QWEATHER_GEO_PATH}"
+        policy = self._source_policy(QWEATHER_GEO_PROVIDER, endpoint)
+        if policy is None:
+            return None
         params = {"location": region, "range": "cn", "number": 5, "lang": "zh"}
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.get(
-                    f"https://{host}/geo/v2/city/lookup",
+                    endpoint,
                     params=params,
                     headers={"X-QW-Api-Key": self.settings.qweather_api_key or ""},
                 )
@@ -477,7 +657,7 @@ class LocationResolver:
             return None
         province = _normalize_china_admin(item.get("adm1"))
         city = item.get("adm2") or item.get("name")
-        return ResolvedLocation(
+        location = ResolvedLocation(
             name=_display_name(province, city, item.get("name")),
             code=item.get("id"),
             latitude=_to_float(item.get("lat")),
@@ -487,8 +667,18 @@ class LocationResolver:
             province=province,
             city=city,
         )
+        return self._admit_external_location(
+            location,
+            provider=QWEATHER_GEO_PROVIDER,
+            endpoint=endpoint,
+            policy=policy,
+            response=response,
+        )
 
     async def _resolve_with_nominatim(self, region: str) -> ResolvedLocation | None:
+        policy = self._source_policy(NOMINATIM_GEO_PROVIDER, NOMINATIM_GEO_ENDPOINT)
+        if policy is None:
+            return None
         params = {
             "q": f"{region}, 中国",
             "format": "jsonv2",
@@ -499,7 +689,7 @@ class LocationResolver:
         headers = {"User-Agent": "powerpals-weather-agent/0.1"}
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers)
+                response = await client.get(NOMINATIM_GEO_ENDPOINT, params=params, headers=headers)
                 response.raise_for_status()
                 results = response.json()
         except (httpx.HTTPError, ValueError):
@@ -511,7 +701,7 @@ class LocationResolver:
             return None
         name = item.get("name") or region
         province = _nominatim_province(item.get("display_name"))
-        return ResolvedLocation(
+        location = ResolvedLocation(
             name=_display_name(province, name, None),
             code=None,
             latitude=float(item["lat"]),
@@ -521,21 +711,35 @@ class LocationResolver:
             province=province,
             city=name,
         )
+        return self._admit_external_location(
+            location,
+            provider=NOMINATIM_GEO_PROVIDER,
+            endpoint=NOMINATIM_GEO_ENDPOINT,
+            policy=policy,
+            response=response,
+        )
 
     async def _resolve_with_open_meteo(self, region: str) -> ResolvedLocation | None:
+        policy = self._source_policy(OPEN_METEO_GEO_PROVIDER, OPEN_METEO_GEO_ENDPOINT)
+        if policy is None:
+            return None
         results: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=20.0) as client:
             for search_name in _open_meteo_search_terms(region):
                 params = {"name": search_name, "count": 10, "language": "zh", "format": "json"}
                 try:
-                    response = await client.get("https://geocoding-api.open-meteo.com/v1/search", params=params)
+                    response = await client.get(OPEN_METEO_GEO_ENDPOINT, params=params)
                     response.raise_for_status()
                     body = response.json()
                 except (httpx.HTTPError, ValueError):
                     continue
                 for item in body.get("results") or []:
-                    item["_query"] = search_name
-                    results.append(item)
+                    if not isinstance(item, dict):
+                        continue
+                    candidate = dict(item)
+                    candidate["_query"] = search_name
+                    candidate["_source_response"] = response
+                    results.append(candidate)
         if not results:
             return None
         item = _best_open_meteo_result(results, region)
@@ -543,7 +747,10 @@ class LocationResolver:
             return None
         admin = _normalize_china_admin(item.get("admin1"))
         name = item.get("name") or region
-        return ResolvedLocation(
+        source_response = item.get("_source_response")
+        if not isinstance(source_response, httpx.Response):
+            return None
+        location = ResolvedLocation(
             name=_display_name(admin, name, None),
             code=None,
             latitude=float(item["latitude"]),
@@ -552,6 +759,13 @@ class LocationResolver:
             country=item.get("country") or "中国",
             province=admin,
             city=name,
+        )
+        return self._admit_external_location(
+            location,
+            provider=OPEN_METEO_GEO_PROVIDER,
+            endpoint=OPEN_METEO_GEO_ENDPOINT,
+            policy=policy,
+            response=source_response,
         )
 
 
@@ -579,6 +793,12 @@ def location_payload(location: ResolvedLocation) -> dict[str, Any]:
         "city": location.city,
         "representation": location.representation,
         "representative_city": location.representative_city,
+        "source_provider": location.source_provider,
+        "source_url": location.source_url,
+        "retrieved_at": location.retrieved_at,
+        "content_sha256": location.content_sha256,
+        "attribution": location.attribution,
+        "retention_policy": location.retention_policy,
     }
 
 
@@ -788,3 +1008,15 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _timezone_aware(value: datetime) -> bool:
+    return value.tzinfo is not None and value.utcoffset() is not None
+
+
+def _present_metric(value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return int(bool(value.strip()))
+    return 1

@@ -183,7 +183,8 @@ def test_feishu_task_command_without_region_asks_for_region():
     assert body["bot_role"] == "weather_task_bot"
     assert body["mode"] == "clarification"
     assert body["days"] == 4
-    assert "缺少城市或区域" in body["text"]
+    assert "还差一个地点" in body["text"]
+    assert "城市 / 区县 / 经纬度" in body["text"]
     assert body.get("card") is None
 
 
@@ -255,7 +256,8 @@ def test_feishu_weather_command_without_region_asks_for_region():
     assert body["bot_role"] == "weather_forecast_bot"
     assert body["mode"] == "clarification"
     assert body["days"] == 4
-    assert "缺少城市或区域" in body["text"]
+    assert "还差一个地点" in body["text"]
+    assert "城市 / 区县 / 经纬度" in body["text"]
     assert body.get("card") is None
     assert service.seen_requests == []
 
@@ -305,7 +307,8 @@ def test_feishu_weather_region_clarification_can_continue_from_city_reply(monkey
 
     assert first.status_code == 200
     assert first.json()["status"] == "needs_region"
-    assert sent_texts and "缺少城市或区域" in sent_texts[0][1]
+    assert sent_texts and "还差一个地点" in sent_texts[0][1]
+    assert "城市 / 区县 / 经纬度" in sent_texts[0][1]
     assert second.status_code == 200
     body = second.json()
     assert body["status"] == "handled"
@@ -349,8 +352,8 @@ def test_weather_feishu_event_focuses_on_requested_metric():
     assert body["status"] == "handled"
     assert body["metrics"] == ["rain"]
     assert "metrics=rain" in body["report_url"]
-    assert "小时降水概率" in str(body["card"])
-    assert "小时温度趋势" not in str(body["card"])
+    assert "降水概率 %" in str(body["card"])
+    assert "温度 ℃" not in str(body["card"])
 
 
 def test_weather_feishu_event_compares_multiple_regions():
@@ -404,7 +407,7 @@ def test_weather_feishu_event_rejects_more_than_four_comparison_regions():
     assert body["mode"] == "weather_comparison"
     assert body["max_regions"] == 4
     assert len(body["regions"]) == 5
-    assert "一次最多支持 4 个地区" in body["text"]
+    assert "一次最多对比 4 个地区" in body["text"]
     assert service.seen_requests == []
 
 
@@ -450,7 +453,7 @@ def test_weather_feishu_event_rejects_unsupported_metric_without_forecast_call()
     body = response.json()
     assert body["status"] == "unsupported_metric"
     assert body["unsupported_metrics"] == ["湿度"]
-    assert "还没有真正接入数据模型" in body["text"]
+    assert "暂时还没接入" in body["text"]
     assert service.seen_requests == []
 
 
@@ -465,8 +468,41 @@ def test_feishu_help_describes_two_weather_bots():
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "handled"
-    assert "全国气象预测机器人" in body["text"]
-    assert "气象任务发布机器人" in body["text"]
+    assert "我是云云" in body["text"]
+    assert "发布共测任务请找「点点」" in body["text"]
+    assert "我是点点" in body["text"]
+
+
+def test_weather_help_advertises_current_briefing_version(tmp_path):
+    settings = Settings(
+        feishu_weather_verification_token=None,
+        subscriptions_db=str(tmp_path / "subscriptions.db"),
+    )
+    client = TestClient(
+        create_app(forecast_service=CapturingForecastService(), settings=settings)
+    )
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "event": {
+                "sender": {"sender_id": {"open_id": "help-user"}},
+                "message": {
+                    "message_id": "help-current-version",
+                    "chat_id": "help-private-chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": '{"text":"云云能做什么"}',
+                },
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "handled"
+    assert "电力气象决策晨报 3.0" in body["text"]
+    assert "电力气象决策晨报 2.0" not in body["text"]
 
 
 def test_weather_feishu_endpoint_only_handles_forecast_commands():
@@ -476,7 +512,14 @@ def test_weather_feishu_endpoint_only_handles_forecast_commands():
 
     response = client.post(
         "/feishu/events/weather",
-        json={"event": {"message": {"content": "@AI气象预测小助手 今日广州气象任务"}}},
+        json={
+            "event": {
+                "message": {
+                    "chat_type": "p2p",
+                    "content": "@AI气象预测小助手 今日广州气象任务",
+                }
+            }
+        },
     )
 
     assert response.status_code == 200
@@ -484,9 +527,9 @@ def test_weather_feishu_endpoint_only_handles_forecast_commands():
     assert body["status"] == "redirect"
     assert body["bot_role"] == "weather_forecast_bot"
     assert body["suggested_bot_role"] == "weather_task_bot"
-    assert body["suggested_bot_name"] == "气象任务发布机器人"
+    assert body["suggested_bot_name"] == "任务小助手点点"
     assert body["suggested_event_path"] == "/feishu/events/task"
-    assert "请找气象任务发布机器人" in body["text"]
+    assert "点点" in body["text"]
     assert service.seen_request is None
 
 
@@ -497,7 +540,14 @@ def test_task_feishu_endpoint_only_handles_task_commands():
 
     response = client.post(
         "/feishu/events/task",
-        json={"event": {"message": {"content": "@AI任务小助手 广州明天天气"}}},
+        json={
+            "event": {
+                "message": {
+                    "chat_type": "p2p",
+                    "content": "@AI任务小助手 广州明天天气",
+                }
+            }
+        },
     )
 
     assert response.status_code == 200
@@ -505,9 +555,9 @@ def test_task_feishu_endpoint_only_handles_task_commands():
     assert body["status"] == "redirect"
     assert body["bot_role"] == "weather_task_bot"
     assert body["suggested_bot_role"] == "weather_forecast_bot"
-    assert body["suggested_bot_name"] == "全国气象预测机器人"
+    assert body["suggested_bot_name"] == "气象小助手云云"
     assert body["suggested_event_path"] == "/feishu/events/weather"
-    assert "请找全国气象预测机器人" in body["text"]
+    assert "云云" in body["text"]
     assert service.seen_request is None
 
 
@@ -558,6 +608,7 @@ def test_weather_feishu_event_sends_card_to_event_chat(monkeypatch):
             "event": {
                 "message": {
                     "chat_id": "oc_test_chat",
+                    "chat_type": "p2p",
                     "content": '{"text":"@AI气象预测小助手 广州明天天气"}',
                 }
             }
@@ -674,7 +725,14 @@ def test_multi_day_weather_task_submission_records_all_days(monkeypatch, tmp_pat
 
     published = client.post(
         "/feishu/events/task",
-        json={"event": {"message": {"content": "@AI任务小助手 发布广州未来3天气象任务 2026-06-10"}}},
+        json={
+            "event": {
+                "message": {
+                    "chat_type": "p2p",
+                    "content": "@AI任务小助手 发布广州未来3天气象任务 2026-06-10",
+                }
+            }
+        },
     )
     assert published.status_code == 200
     assert published.json()["task"]["forecast_days"] == 3
@@ -919,7 +977,10 @@ def test_weather_feishu_endpoint_handles_explicit_group_mention(monkeypatch):
     monkeypatch.setattr(FeishuClient, "send_text_message", fake_send)
     monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
     service = CapturingForecastService()
-    settings = Settings(feishu_weather_verification_token=None)
+    settings = Settings(
+        feishu_weather_verification_token=None,
+        feishu_weather_bot_open_id="ou_weather_bot",
+    )
     client = TestClient(create_app(forecast_service=service, settings=settings))
     suffix = uuid4().hex
 
@@ -939,7 +1000,13 @@ def test_weather_feishu_endpoint_handles_explicit_group_mention(monkeypatch):
                     "chat_type": "group",
                     "message_type": "text",
                     "content": json.dumps({"text": "@_user_1 广州明天天气"}, ensure_ascii=False),
-                    "mentions": [{"key": "@_user_1", "name": "云云"}],
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": {"open_id": "ou_weather_bot"},
+                            "name": "云云",
+                        }
+                    ],
                 },
             },
         },
@@ -948,6 +1015,61 @@ def test_weather_feishu_endpoint_handles_explicit_group_mention(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "handled"
     assert service.seen_request is not None
+
+
+def test_weather_feishu_endpoint_rejects_same_name_user_mention_with_wrong_open_id(monkeypatch):
+    sent_messages: list[str] = []
+
+    async def fake_send(*args, **kwargs):
+        sent_messages.append("sent")
+        return "unexpected-message-id"
+
+    monkeypatch.setattr(FeishuClient, "send_text_message", fake_send)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    service = CapturingForecastService()
+    settings = Settings(
+        feishu_weather_verification_token=None,
+        feishu_weather_bot_open_id="ou_weather_bot",
+    )
+    client = TestClient(create_app(forecast_service=service, settings=settings))
+    suffix = uuid4().hex
+
+    response = client.post(
+        "/feishu/events/weather",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": f"event-same-name-user-{suffix}",
+                "event_type": "im.message.receive_v1",
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_author"}},
+                "message": {
+                    "message_id": f"om_same_name_user_{suffix}",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": json.dumps({"text": "@_user_1 广州明天天气"}, ensure_ascii=False),
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": {"open_id": "ou_same_name_user"},
+                            "name": "云云",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ignored",
+        "bot_role": "weather_forecast_bot",
+        "reason": "group_message_not_addressed",
+    }
+    assert service.seen_requests == []
+    assert sent_messages == []
 
 
 def test_unaddressed_group_stays_silent_when_reply_marker_storage_fails(monkeypatch):
@@ -999,7 +1121,10 @@ def test_unaddressed_group_stays_silent_when_reply_marker_storage_fails(monkeypa
 
 
 def test_task_feishu_endpoint_uses_mentions_to_detect_help_question():
-    settings = Settings(feishu_task_verification_token=None)
+    settings = Settings(
+        feishu_task_verification_token=None,
+        feishu_task_bot_open_id="ou_task_bot",
+    )
     client = TestClient(create_app(forecast_service=CapturingForecastService(), settings=settings))
 
     response = client.post(
@@ -1008,7 +1133,13 @@ def test_task_feishu_endpoint_uses_mentions_to_detect_help_question():
             "event": {
                 "message": {
                     "content": '{"text":"@_user_1 你有什么作用"}',
-                    "mentions": [{"key": "@_user_1", "name": "AI任务小助手"}],
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": {"open_id": "ou_task_bot"},
+                            "name": "AI任务小助手",
+                        }
+                    ],
                 }
             }
         },
@@ -1018,7 +1149,7 @@ def test_task_feishu_endpoint_uses_mentions_to_detect_help_question():
     body = response.json()
     assert body["status"] == "handled"
     assert body["bot_role"] == "weather_task_bot"
-    assert "气象任务发布机器人" in body["text"]
+    assert "气象任务小助手" in body["text"]
 
 
 def test_feishu_endpoint_deduplicates_retried_message_id():

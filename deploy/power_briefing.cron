@@ -1,3 +1,3 @@
 # 电力气象决策晨报（北京时间：08:50 预计算，09:00 计划发送）
 50 0 * * * docker exec -e POWER_BRIEFING_MODE=precompute -i powerpals-weather-bot-1 python - < /data/application/openclaw/powerPals/scripts/daily_power_briefing.py >> /var/log/power_briefing-precompute.log 2>&1
-0 1 * * * docker exec -e POWER_BRIEFING_MODE=send -e POWER_BRIEFING_ALLOW_SEND=1 -i powerpals-weather-bot-1 python - < /data/application/openclaw/powerPals/scripts/daily_power_briefing.py >> /var/log/power_briefing.log 2>&1
+0 1 * * * docker exec -e POWER_BRIEFING_MODE=send -i powerpals-weather-bot-1 python - < /data/application/openclaw/powerPals/scripts/daily_power_briefing.py >> /var/log/power_briefing.log 2>&1

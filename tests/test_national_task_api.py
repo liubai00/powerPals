@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from services.weather_bot.config import Settings
 from services.weather_bot.main import create_app
 
 
@@ -7,8 +8,20 @@ class FakeForecastService:
     pass
 
 
+def _admin_client() -> TestClient:
+    settings = Settings(
+        _env_file=None,
+        admin_api_token="test-admin-token",
+        global_feishu_send_enabled=True,
+    )
+    return TestClient(
+        create_app(forecast_service=FakeForecastService(), settings=settings),
+        headers={"Authorization": "Bearer test-admin-token"},
+    )
+
+
 def test_publish_weather_task_endpoint_supports_city_region():
-    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    client = _admin_client()
 
     response = client.post(
         "/api/tasks/weather/publish",
@@ -25,7 +38,7 @@ def test_publish_weather_task_endpoint_supports_city_region():
 
 
 def test_publish_weather_task_endpoint_supports_coordinates():
-    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    client = _admin_client()
 
     response = client.post(
         "/api/tasks/weather/publish",

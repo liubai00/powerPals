@@ -10,6 +10,7 @@ from typing import Any
 
 from services.weather_bot.config import Settings
 from services.weather_bot.controlled_learning import (
+    OPEN_METEO_ARCHIVE_TRUTH_PROVIDER,
     LEARNING_VERSION,
     ControlledLearningStore,
     OpenMeteoTruthClient,
@@ -20,6 +21,8 @@ from services.weather_bot.controlled_learning import (
     write_learning_report,
 )
 from services.weather_bot.controlled_learning_replay import run_deterministic_replay
+from services.weather_bot.core_replay_gate import run_core_replay_gate
+from services.weather_bot.source_registry import SourceRegistry
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,11 +62,25 @@ async def run_cycle(settings: Settings, *, skip_truth: bool, truth_limit: int) -
     store = ControlledLearningStore(settings.controlled_learning_db)
     run_id, replay_results = run_deterministic_replay(store)
     failed = [item for item in replay_results if not item.passed]
+    core_gate = run_core_replay_gate()
+    source_registry = SourceRegistry.from_json(
+        settings.weather_source_policies_json,
+        environment=settings.app_env,
+    )
+    truth_policy = source_registry.resolve(
+        OPEN_METEO_ARCHIVE_TRUTH_PROVIDER,
+        settings.controlled_learning_archive_api_url,
+    )
+    truth_client = OpenMeteoTruthClient(
+        settings.controlled_learning_archive_api_url,
+        source_registry=source_registry,
+        source_policy=truth_policy,
+    )
     verification = {"due": 0, "evaluated": 0, "deferred": 0, "skipped": 0}
     if not skip_truth:
         verification = await verify_due_snapshots(
             store,
-            OpenMeteoTruthClient(settings.controlled_learning_archive_api_url),
+            truth_client,
             truth_delay_days=settings.controlled_learning_truth_delay_days,
             limit=truth_limit,
         )
@@ -96,9 +113,16 @@ async def run_cycle(settings: Settings, *, skip_truth: bool, truth_limit: int) -
             "failed": len(failed),
             "failed_cases": [item.model_dump(mode="json") for item in failed],
         },
+        "core_gate": core_gate,
         "verification": verification,
         "reference_data": {
-            "source": "Open-Meteo Historical Weather API",
+            "source": (
+                "Open-Meteo Historical Weather API"
+                if truth_client.enabled
+                else "未启用"
+            ),
+            "availability": "eligible" if truth_client.enabled else "policy_rejected",
+            "used_for_scoring": int(verification.get("evaluated") or 0) > 0,
             "kind": "historical_grid_or_reanalysis_reference",
             "station_observation": False,
         },
@@ -131,7 +155,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         _print_json(report)
-        return 2 if args.strict and report["replay"]["failed"] else 0
+        return (
+            2
+            if args.strict
+            and (
+                report["replay"]["failed"]
+                or not report["core_gate"]["gate_passed"]
+            )
+            else 0
+        )
 
     if args.command == "add-case":
         path = Path(args.file)

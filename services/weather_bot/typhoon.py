@@ -1,12 +1,66 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
 import logging
-from datetime import date
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
+from services.weather_bot.data_provenance import DataAvailabilityGate, ExternalDataRecord
+from services.weather_bot.logging_safety import safe_error_summary
+from services.weather_bot.source_registry import (
+    SourcePolicy,
+    SourceRegistry,
+    same_source_endpoint,
+)
+
 logger = logging.getLogger(__name__)
+
+QWEATHER_TYPHOON_PROVIDER = "qweather_tropical_cyclone"
+_TYPHOON_PATHS = (
+    "/v7/tropical/storm-list",
+    "/v7/tropical/storm-track",
+    "/v7/tropical/storm-forecast",
+)
+_REQUIRED_POLICY_METRICS = frozenset(
+    {
+        "storm_id",
+        "storm_name",
+        "is_active",
+        "observation_time",
+        "latitude",
+        "longitude",
+        "wind_speed",
+        "forecast_time",
+    }
+)
+_STORM_FIELDS = ("id", "name", "basin", "year", "isActive")
+_NOW_FIELDS = (
+    "pubTime",
+    "type",
+    "lat",
+    "lon",
+    "pressure",
+    "windSpeed",
+    "moveSpeed",
+    "moveDir",
+)
+_FORECAST_FIELDS = ("fxTime", "type", "lat", "lon", "windSpeed")
+
+
+class TyphoonDataUnavailable(RuntimeError):
+    """The tropical-cyclone source did not pass its explicit data gate."""
+
+
+@dataclass(frozen=True)
+class _AdmittedTyphoonResponse:
+    body: dict[str, Any]
+    provenance: dict[str, str]
 
 # 台风强度英文代码 → 中文
 _STORM_TYPE_CN = {
@@ -70,27 +124,129 @@ def typhoon_years() -> list[str]:
 class TyphoonClient:
     """和风气象台风(热带气旋)接口: 台风名 → 实时路径 + 预报, 给 LLM 做权威 grounding。"""
 
-    def __init__(self, api_key: str | None, api_host: str | None = None, timeout: float = 10.0):
+    def __init__(
+        self,
+        api_key: str | None,
+        api_host: str | None = None,
+        timeout: float = 10.0,
+        *,
+        source_registry: SourceRegistry | None = None,
+        source_policy: SourcePolicy | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ):
         self.api_key = api_key
         self.api_host = (api_host or "devapi.qweather.com").strip().rstrip("/")
         self.timeout = timeout
+        self.source_registry = source_registry
+        self.source_policy = source_policy
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key)
+        return bool((self.api_key or "").strip() and self._source_policy_allows_all_endpoints())
 
-    async def _get(self, client: httpx.AsyncClient, path: str, **params: Any) -> dict[str, Any]:
-        url = f"https://{self.api_host}{path}"
+    def _source_policy_allows_all_endpoints(self) -> bool:
+        registry = self.source_registry
+        policy = self.source_policy
+        if registry is None or policy is None:
+            return False
+        endpoints = tuple(self._endpoint(path) for path in _TYPHOON_PATHS)
+        if any(endpoint is None for endpoint in endpoints):
+            return False
+        if (
+            policy.provider != QWEATHER_TYPHOON_PROVIDER
+            or policy.environment != registry.environment
+            or policy.license_status != "verified"
+            or "text_reference" not in policy.allowed_uses
+            or policy.retention_policy not in {"derived_only", "metadata_only"}
+            or not policy.attribution_required
+            or not (policy.attribution_text or "").strip()
+            or not _REQUIRED_POLICY_METRICS.issubset(policy.required_metrics)
+        ):
+            return False
+        for endpoint in endpoints:
+            assert endpoint is not None
+            if registry.resolve(QWEATHER_TYPHOON_PROVIDER, endpoint) != policy:
+                return False
+            if not any(
+                same_source_endpoint(prefix, endpoint)
+                for prefix in policy.source_url_prefixes
+            ):
+                return False
+        return True
+
+    def _endpoint(self, path: str) -> str | None:
+        candidate = f"https://{self.api_host}{path}"
+        return candidate if same_source_endpoint(candidate, candidate) else None
+
+    async def _get(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        **params: Any,
+    ) -> _AdmittedTyphoonResponse:
+        url = self._endpoint(path)
+        if not self.enabled or path not in _TYPHOON_PATHS or url is None:
+            raise TyphoonDataUnavailable("source_policy_rejected")
         response = await client.get(url, params=params, headers={"X-QW-Api-Key": self.api_key or ""})
         response.raise_for_status()
+        response_endpoint = str(response.request.url.copy_with(query=None))
+        if response.history or not same_source_endpoint(response_endpoint, url):
+            raise TyphoonDataUnavailable("endpoint_mismatch")
         body = response.json()
-        return body if isinstance(body, dict) else {}
+        if not isinstance(body, dict):
+            raise TyphoonDataUnavailable("provider_response_rejected")
+        retrieved_at = self.clock()
+        provider_issued_at = _provider_timestamp(body.get("updateTime"))
+        policy = self.source_policy
+        if (
+            policy is None
+            or not _timezone_aware(retrieved_at)
+            or provider_issued_at is None
+            or policy.max_age_seconds is None
+            or retrieved_at >= provider_issued_at + timedelta(seconds=policy.max_age_seconds)
+        ):
+            raise TyphoonDataUnavailable("runtime_provenance_rejected")
+        content_hash = sha256(response.content).hexdigest()
+        source_url = str(response.request.url)
+        record = ExternalDataRecord(
+            source_id=QWEATHER_TYPHOON_PROVIDER,
+            source_kind="structured_api",
+            source_url=source_url,
+            retrieved_at=retrieved_at,
+            provider_issued_at=provider_issued_at,
+            license_status=policy.license_status,
+            allowed_uses={"text_reference"},
+            content_sha256=content_hash,
+            structured_values=True,
+            retention_policy=policy.retention_policy,
+        )
+        decision = DataAvailabilityGate().evaluate(record, now=retrieved_at)
+        if decision.status != "text_only":
+            raise TyphoonDataUnavailable(f"data_availability_rejected:{decision.reason}")
+        return _AdmittedTyphoonResponse(
+            body=body,
+            provenance={
+                "provider": QWEATHER_TYPHOON_PROVIDER,
+                "source_url": source_url,
+                "retrieved_at": retrieved_at.isoformat(),
+                "provider_issued_at": provider_issued_at.isoformat(),
+                "content_sha256": content_hash,
+                "attribution": (policy.attribution_text or "").strip(),
+                "retention_policy": policy.retention_policy,
+            },
+        )
 
     async def list_storms(self, client: httpx.AsyncClient, basin: str, year: str) -> list[dict[str, Any]]:
-        body = await self._get(client, "/v7/tropical/storm-list", basin=basin, year=year)
+        admitted = await self._get(client, "/v7/tropical/storm-list", basin=basin, year=year)
+        body = admitted.body
         if str(body.get("code")) != "200":
             return []
-        return [s for s in (body.get("storm") or []) if isinstance(s, dict)]
+        return [
+            _minimal_item(storm, _STORM_FIELDS, admitted.provenance)
+            for storm in (body.get("storm") or [])
+            if isinstance(storm, dict)
+        ]
 
     async def _match_in(self, client: httpx.AsyncClient, basin: str, year: str, text: str) -> dict[str, Any] | None:
         try:
@@ -117,13 +273,23 @@ class TyphoonClient:
         return None
 
     async def storm_now(self, client: httpx.AsyncClient, stormid: str) -> dict[str, Any]:
-        body = await self._get(client, "/v7/tropical/storm-track", stormid=stormid)
+        admitted = await self._get(client, "/v7/tropical/storm-track", stormid=stormid)
+        body = admitted.body
         now = body.get("now")
-        return now if isinstance(now, dict) else {}
+        return (
+            _minimal_item(now, _NOW_FIELDS, admitted.provenance)
+            if isinstance(now, dict)
+            else {}
+        )
 
     async def storm_forecast(self, client: httpx.AsyncClient, stormid: str) -> list[dict[str, Any]]:
-        body = await self._get(client, "/v7/tropical/storm-forecast", stormid=stormid)
-        return [p for p in (body.get("forecast") or []) if isinstance(p, dict)]
+        admitted = await self._get(client, "/v7/tropical/storm-forecast", stormid=stormid)
+        body = admitted.body
+        return [
+            _minimal_item(point, _FORECAST_FIELDS, admitted.provenance)
+            for point in (body.get("forecast") or [])
+            if isinstance(point, dict)
+        ]
 
     async def brief_for_text(self, text: str, years: list[str] | None = None) -> str | None:
         """文本提到某个(当年/上年)台风 → 返回中文实时数据块; 否则 None。"""
@@ -138,8 +304,8 @@ class TyphoonClient:
                 stormid = str(storm.get("id") or "")
                 now = await self.storm_now(client, stormid)
                 forecast = await self.storm_forecast(client, stormid)
-        except httpx.HTTPError as exc:
-            logger.warning("typhoon brief failed: %s", exc)
+        except (httpx.HTTPError, TyphoonDataUnavailable, ValueError) as exc:
+            logger.warning("typhoon brief failed error_type=%s", safe_error_summary(exc))
             return None
         return _format_brief(storm, now, forecast)
 
@@ -157,9 +323,35 @@ class TyphoonClient:
                             continue
                         now = await self.storm_now(client, str(storm.get("id") or ""))
                         out.append({"storm": storm, "now": now})
-        except httpx.HTTPError as exc:
-            logger.warning("active storms failed: %s", exc)
+        except (httpx.HTTPError, TyphoonDataUnavailable, ValueError) as exc:
+            logger.warning("active storms failed error_type=%s", safe_error_summary(exc))
+            raise TyphoonDataUnavailable("provider_unavailable") from None
         return out
+
+
+def _minimal_item(
+    item: dict[str, Any],
+    fields: tuple[str, ...],
+    provenance: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        **{field: item[field] for field in fields if field in item},
+        "_provenance": dict(provenance),
+    }
+
+
+def _provider_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if _timezone_aware(parsed) else None
+
+
+def _timezone_aware(value: datetime) -> bool:
+    return value.tzinfo is not None and value.utcoffset() is not None
 
 
 def _storm_number(stormid: str, year: str) -> str:
@@ -171,12 +363,18 @@ def _storm_number(stormid: str, year: str) -> str:
 
 
 def _format_brief(storm: dict[str, Any], now: dict[str, Any], forecast: list[dict[str, Any]]) -> str:
+    evidence_items = [storm, now, *forecast]
+    if any(not _verified_provenance(item.get("_provenance")) for item in evidence_items):
+        return (
+            "【台风实时数据不可用】来源或可追溯性校验未通过，不展示台风事实；"
+            "这不代表无活跃台风。"
+        )
     name = str(storm.get("name") or "该台风")
     stormid = str(storm.get("id") or "")
     year = str(storm.get("year") or "")
     active = str(storm.get("isActive")) in ("1", "true", "True")
 
-    lines = ["【实时台风数据·来自和风气象，是最新权威事实，请以此为准】"]
+    lines = ["【可追溯台风接口数据·QWeather】"]
     head = f"台风：{name}（{_storm_number(stormid, year)}编号{stormid}）"
     head += "，当前状态：活跃" if active else "，当前状态：已停止编号/历史台风"
     lines.append(head)
@@ -198,7 +396,7 @@ def _format_brief(storm: dict[str, Any], now: dict[str, Any], forecast: list[dic
         lines.append(cur)
 
     if forecast:
-        lines.append("未来路径预报（和风，取每日节点）：")
+        lines.append("未来路径预报（QWeather 接口，取前5个节点）：")
         for point in forecast[:5]:
             typ = _STORM_TYPE_CN.get(str(point.get("type")), str(point.get("type") or ""))
             wind = _to_float(point.get("windSpeed"))
@@ -207,9 +405,17 @@ def _format_brief(storm: dict[str, Any], now: dict[str, Any], forecast: list[dic
                 seg += f"，风{int(wind)}m/s"
             lines.append(seg)
 
+    provenance = [item["_provenance"] for item in evidence_items]
+    latest_retrieval = max(str(item["retrieved_at"]) for item in provenance)
+    attributions = sorted({str(item["attribution"]) for item in provenance})
+    source_urls = sorted({str(item["source_url"]) for item in provenance})
     lines.append(
-        "说明：以上是最新监测与官方预报路径，属权威实时数据；若用户假设的登陆地点/时间/情景与该预报路径不一致，"
-        "请明确指出那是情景假设，并给出台风目前的真实位置与最新预报路径，不要把用户举例里往年的历史台风数据当成当前事实。"
+        "来源：%s｜抓取：%s｜可追溯接口：%s"
+        % (" / ".join(attributions), latest_retrieval, "、".join(source_urls))
+    )
+    lines.append(
+        "边界：台风路径、近中心风和气压仅为气象侧证据；登陆影响、场站出力、负荷及交易影响"
+        "须结合官方预警与电力业务数据另行判断。"
     )
     return "\n".join(lines)
 
@@ -218,6 +424,11 @@ def format_active_for_briefing(active: list[dict[str, Any]]) -> str | None:
     """晨报用: 把活跃台风列成一段 lark_md; 无活跃台风返回 None(晨报当天不显示该段)。"""
     if not active:
         return None
+    if any(not _verified_active_item(item) for item in active):
+        return (
+            "**🌀 台风实时数据不可用**\n"
+            "台风数据未通过来源与可追溯性校验，本期不展示相关事实；这不代表无活跃台风。"
+        )
     lines = ["**🌀 当前活跃台风**"]
     for item in active:
         storm = item.get("storm") or {}
@@ -234,5 +445,56 @@ def format_active_for_briefing(active: list[dict[str, Any]]) -> str | None:
         if now.get("moveDir"):
             seg += f"、向{_DIR_CN.get(str(now.get('moveDir')), now.get('moveDir'))}移动"
         lines.append(seg)
-    lines.append("沿海省份关注：大风致风电切出、云雨压制光伏、登陆前后负荷扰动；查具体路径 @云云 报台风名。")
+    provenance = [
+        item[part]["_provenance"]
+        for item in active
+        for part in ("storm", "now")
+    ]
+    latest_retrieval = max(str(item["retrieved_at"]) for item in provenance)
+    attributions = sorted({str(item["attribution"]) for item in provenance})
+    source_urls = sorted({str(item["source_url"]) for item in provenance})
+    lines.append(
+        "来源：%s｜抓取：%s｜可追溯接口：%s"
+        % (" / ".join(attributions), latest_retrieval, "、".join(source_urls))
+    )
+    lines.append(
+        "边界：台风路径与10米近中心风仅为气象侧证据；风电切出、光伏出力、负荷及交易影响"
+        "须结合场站和电力数据另行判断。"
+    )
     return "\n".join(lines)
+
+
+def _verified_active_item(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    storm = item.get("storm")
+    now = item.get("now")
+    return bool(
+        isinstance(storm, dict)
+        and isinstance(now, dict)
+        and _verified_provenance(storm.get("_provenance"))
+        and _verified_provenance(now.get("_provenance"))
+    )
+
+
+def _verified_provenance(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("provider") != QWEATHER_TYPHOON_PROVIDER:
+        return False
+    if value.get("retention_policy") not in {"metadata_only", "derived_only"}:
+        return False
+    if not isinstance(value.get("attribution"), str) or not str(value["attribution"]).strip():
+        return False
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", str(value.get("content_sha256") or "")):
+        return False
+    source_url = str(value.get("source_url") or "")
+    parsed = urlsplit(source_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return False
+    return _provider_timestamp(value.get("retrieved_at")) is not None

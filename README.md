@@ -61,8 +61,8 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 
 1. 显式经纬度优先。
 2. 内置常用城市表优先解析深圳、广州、北京、上海等城市。
-3. 配置 `QWEATHER_API_KEY` 后，可用和风天气 GeoAPI 做全国城市解析。
-4. 无和风 Key 时，尝试 Open-Meteo Geocoding 兜底。
+3. 只有和风 Geo、Nominatim 或 Open-Meteo Geocoding 的精确 endpoint 与生产 `SourcePolicy` 同时通过许可、用途、署名和留存审查时，才按配置顺序调用外部解析。
+4. 仅有 API Key、服务名称或可访问 URL 不会触发外部请求；所有外部定位来源都未获准时返回澄清/不可用，不静默联网或猜坐标。
 
 ## 核心接口
 
@@ -90,6 +90,27 @@ PowerPals 是小可爱电力社区面向电力行业 AI Bot 共建、共测、�
 | `POST` | `/feishu/events` | 旧版单机器人飞书事件回调入口 |
 | `POST` | `/feishu/events/weather` | 气象预测机器人飞书事件回调入口，只处理预测能力 |
 | `POST` | `/feishu/events/task` | 气象任务发布机器人飞书事件回调入口，只处理任务能力 |
+
+### 管理写接口安全
+
+所有会写入本地业务数据或主动发布内容的 `/api/*` 管理接口都必须携带
+`Authorization: Bearer <ADMIN_API_TOKEN>`。未配置 Token、未携带凭证或凭证错误时均默认拒绝，
+且不会调用预测、飞书或本地写入逻辑。天气查询、报告读取和飞书事件回调不使用这个管理凭证。
+
+即使鉴权成功，`/api/weather/publish`、`/api/tasks/weather/publish` 和
+`/api/tasks/weather/remind` 也只有在 `GLOBAL_FEISHU_SEND_ENABLED=true` 且
+`DRY_RUN=false` 时才允许产生飞书外部写入；否则只生成预览并在响应的 `delivery.reason`
+中说明 `global_send_disabled` 或 `dry_run`。生产环境不应把 Token 写入日志或提交到仓库。
+
+### 外部数据事实边界
+
+本项目不拥有、也不在本地提供气象原始数据，以及负荷、出力、机组、联络线、价格、持仓或用户资产事实。业务事实只能来自许可和用途已经人工审核的第三方 API、官方公开数据或可回溯到原始发布方的公开材料；本地数据库仅保存必要的有限期缓存、不可变版本与来源元数据、派生结果和审计/回放记录，不是自有业务数据仓库。
+
+- `SourceRegistry` 按运行环境、provider 和 URL 前缀匹配人工审核的来源策略。`WEATHER_SOURCE_POLICIES_JSON=[]` 是生产默认值，表示所有第三方事实均拒绝进入计算；存在 API Key 不等于取得生产使用许可。
+- `DataAvailabilityGate` 继续检查来源、真实抓取时间、有效时间、单位、粒度、覆盖范围、时区、新鲜度、完整率、质量和内容哈希。缺失、过期、来源不匹配或许可不允许时必须返回“数据不可用”，不得用另一个来源、大模型记忆或历史缓存静默补值。
+- 搜索服务只用于发现官方原文入口。搜索摘要、转载内容和模型总结不能成为结构化数值、预警、负荷、出力、机组或价格真值；无法定位原始来源时只可作为待核查线索。
+- 和风天气当前官方预警适配器使用经纬度接口 `/weatheralert/v1/current/{latitude}/{longitude}`。只有 endpoint、许可、文字引用用途、署名和元数据策略全部匹配时才返回最小化的预警标题、原始发布机构、发布时间、有效/失效时间、来源标记和署名；不持久化第三方预警正文或处置说明。
+- 第三方原始响应不支持长期落库。版本与回放只保存许可允许的最小元数据和派生结果，并遵守保留期。
 
 ## 快速启动
 
@@ -138,6 +159,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/weather/forecast/range 
 
 ```powershell
 Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/tasks/weather/publish `
+  -Headers @{ Authorization = "Bearer $env:ADMIN_API_TOKEN" } `
   -ContentType "application/json" `
   -Body '{"region":"广州南沙","latitude":22.8016,"longitude":113.5252,"target_date":"2026-06-10"}'
 ```
@@ -256,9 +278,9 @@ examples/weather_submission_shenzhen.json
 schemas/weather_submission_v1.schema.json
 ```
 
-## 受控持续学习 1.0
+## 受控持续学习 2.0
 
-云云支持离线、可审计的“受控持续学习”，但不会自行修改代码、配置或数据源权重，也不会通过学习任务发送飞书消息。学习输入来自自动生成的解析案例、管理员补充的结构化案例，以及预报到期后的公开历史参考天气评分。当前参考源是 Open-Meteo 历史格点/再分析数据，不等同于官方气象站实况。
+云云支持离线、可审计的“受控持续学习”，但不会自行修改代码、配置或数据源权重，也不会通过学习任务发送飞书消息。学习输入来自自动生成的解析案例、管理员补充的结构化案例，以及在独立来源策略获准后执行的到期参考天气评分。当前实现可适配 Open-Meteo 历史格点/再分析数据（不等同于官方气象站实况），但生产默认不启用；缺少 `open_meteo_archive_truth` 的审核策略时为 0 次外部请求，也不宣称已完成真实评分。
 
 本地运行完整周期（回放 + 到期实况评分 + 候选报告）：
 
@@ -322,9 +344,13 @@ summary
 | D-1 17:05 | 关闭任务 |
 | D 00:00-23:00 | 预测窗口 |
 
-当前 scheduler 会读取 `.env` 中的 `DEFAULT_WEATHER_REGION`、`DEFAULT_WEATHER_LATITUDE`、`DEFAULT_WEATHER_LONGITUDE`。不配置时默认使用深圳，配置城市名或经纬度后，可自动发布对应地区的任务和官方预测。后续如果要做“每天多个城市自动任务”，建议增加任务配置表，由 scheduler 读取城市列表和日期策略。
+旧版社区节奏 scheduler 只有在 `LEGACY_WEATHER_SCHEDULER_ENABLED=true` 时才会运行，并读取 `.env` 中的 `DEFAULT_WEATHER_REGION`、`DEFAULT_WEATHER_LATITUDE`、`DEFAULT_WEATHER_LONGITUDE`；该开关默认关闭，不能因开启晨报的全局发送开关而被连带启用。不配置地点时默认使用深圳。后续如果要做“每天多个城市自动任务”，建议增加独立审核的任务配置表、发送开关和目标白名单。
 
-电力气象晨报使用独立入口 `scripts/daily_power_briefing.py`，生产定时配置保存在 `deploy/power_briefing.cron`。全国版本覆盖 31 个省级地区、33 个电力气象分析区和 75 个代表点。生产环境在北京时间 08:50 运行 `--mode precompute` 写入共享 SQLite 快照，09:00 的计划发送任务单独注入 `POWER_BRIEFING_ALLOW_SEND=1` 后读取快照发送；生产全局仍保持 `POWER_BRIEFING_ALLOW_SEND=0`，防止其他误调用产生群发。`DRY_RUN=1` 时始终只生成/读取缓存并打印结果。快照默认保留 24 小时；用户在群内真实 @云云手动生成晨报后，可回复该机器人消息并发送“展开全部分析区”读取同一快照，不会重复抓取。覆盖率分别展示明日预测与今日对比基线；只有 1 个代表点成功的分析区会标为“不可外推全区”，且不会进入全区资源排行。每条风险的方向、城市、时段、驱动和变化都来自同一个结构化信号事件，不跨角色或跨点拼接。
+电力气象晨报使用独立入口 `scripts/daily_power_briefing.py`，生产定时配置保存在 `deploy/power_briefing.cron`。全国版本覆盖 31 个省级地区、33 个电力气象分析区和 75 个代表点。现有任务保持北京时间 08:50 运行 `--mode precompute` 写入共享 SQLite 快照，09:00 的计划发送任务读取同一快照；升级和回滚都不得删除这两个定时定义。
+
+计划发送采用三重门禁：`GLOBAL_FEISHU_SEND_ENABLED=true`、`POWER_BRIEFING_ALLOW_SEND=true`、目标 `chat_id` 存在于人工审核的 `POWER_BRIEFING_TARGETS_JSON`。cron 只选择 `send` 模式，不再覆盖计划开关。`DRY_RUN=true` 是无条件否决开关；任一条件不满足都只生成、不发送，也不会占用发送幂等键。每个“日期化发布时次 + 目标”使用 SQLite 持久化发送账本和稳定飞书 UUID；重复或并发运行最多产生一次外部消息，明确失败或过期租约使用同一 UUID 安全重试，账本按晨报版本保留窗口默认清理 90 天前记录。代码中不保存群 ID。快照默认保留 24 小时；用户在群内真实 @云云手动生成晨报后，可回复该机器人消息并发送“展开全部分析区”读取同一快照，不会重复抓取。覆盖率分别展示明日预测与今日对比基线；只有 1 个代表点成功的分析区会标为“不可外推全区”，且不会进入全区资源排行。每条风险的方向、城市、时段、驱动和变化都来自同一个结构化信号事件，不跨角色或跨点拼接。
+
+订阅本身不是发送授权：私聊必须明确回复“确认订阅”，群聊还必须由配置的审核管理员在同一群、同一线程二次明确确认，“可以”“好的”等模糊回复不会激活。订阅状态即使成为 `ACTIVE` 也不能绕过全局发送开关、告警发送开关、目标范围和 `DRY_RUN`；当前生产应保持 `ALERT_SEND_ENABLED=false`，直至主动通知发送链、来源许可和目标白名单全部独立验收。
 
 ## 飞书多维表格
 
@@ -363,7 +389,12 @@ notes
 复制 `.env.example` 为 `.env` 后按需填写：
 
 ```text
+APP_ENV=production
+ADMIN_API_TOKEN=
+GLOBAL_FEISHU_SEND_ENABLED=false
+DRY_RUN=false
 QWEATHER_API_KEY=
+QWEATHER_API_HOST=
 CAIYUN_API_KEY=
 OPENCLAW_API_URL=
 OPENCLAW_API_KEY=
@@ -379,6 +410,11 @@ FEISHU_TASK_APP_ID=
 FEISHU_TASK_APP_SECRET=
 FEISHU_TASK_VERIFICATION_TOKEN=
 FEISHU_TASK_DEFAULT_CHAT_ID=
+FEISHU_BOT_OPEN_ID=
+FEISHU_WEATHER_BOT_OPEN_ID=
+FEISHU_TASK_BOT_OPEN_ID=
+FEISHU_ALLOW_LEGACY_NAME_MENTIONS=false
+FEISHU_ALLOW_UNSIGNED_EVENTS=false
 FEISHU_BITABLE_APP_TOKEN=
 FEISHU_BITABLE_TABLE_ID=
 FEISHU_TASK_BITABLE_TABLE_ID=
@@ -387,10 +423,29 @@ LOCAL_TASK_JSONL_PATH=data/weather_tasks.jsonl
 LOCAL_LOCATIONS_PATH=data/locations.json
 LOCAL_NEWS_JSONL_PATH=data/news_items.jsonl
 LOCAL_HYDROLOGY_JSONL_PATH=data/hydrology_records.jsonl
+POWER_BRIEFING_ALLOW_SEND=false
+POWER_BRIEFING_TARGETS_JSON=[]
+LEGACY_WEATHER_SCHEDULER_ENABLED=false
+WEATHER_SOURCE_POLICIES_JSON=[]
+ALERT_SEND_ENABLED=false
+SUBSCRIPTION_ADMIN_OPEN_IDS_JSON=[]
 PUBLIC_BASE_URL=
 ```
 
-群聊采用严格触发策略：只处理飞书事件中带有机器人结构化 `mentions` 的文本消息，或对机器人已发送消息的精确回复；普通群消息、手打的“@云云”文本以及卡片、文件、图片等非文本消息一律静默忽略。私聊无需 `@`。
+群聊采用严格触发策略：只处理飞书事件中带有机器人结构化 `mentions`、且 mention `open_id` 与当前机器人配置完全一致的文本消息，或对机器人已发送消息的精确回复；普通群消息、同名普通用户、手打的“@云云”文本以及卡片、文件、图片等非文本消息一律静默忽略。生产必须配置 `FEISHU_WEATHER_BOT_OPEN_ID`、`FEISHU_TASK_BOT_OPEN_ID`（单机器人兼容入口使用 `FEISHU_BOT_OPEN_ID`），并保持 `FEISHU_ALLOW_LEGACY_NAME_MENTIONS=false`。私聊无需 `@`。
+
+### 生产发布硬阻断
+
+当前默认配置是有意设计的 fail-closed 状态：`WEATHER_SOURCE_POLICIES_JSON=[]`、`POWER_BRIEFING_TARGETS_JSON=[]` 且发送开关关闭。在以下人工清单完成之前，不得部署为会抓取真实业务事实或向飞书主动发送的生产版本，也不得为了“先跑起来”而填入猜测的许可或目标：
+
+1. 每个外部来源逐项记录 provider、精确 endpoint 前缀、合同/条款版本、商业使用范围、允许用途、署名要求、缓存与保留期、配额/成本、责任人和复核日期。
+2. 将审核结论转换为与生产环境精确匹配的 `SourcePolicy`，核对 required metrics、单位、覆盖模型、时区、最大数据年龄、最低完整率和 `derived_only`/`metadata_only` 保留策略；禁止 `raw_storage`。
+3. 对每个飞书目标记录真实 `chat_id`、授权人、用途、频率、静默时段、紧急停发责任人和复核日期，再生成最小 `POWER_BRIEFING_TARGETS_JSON`。群管理员 open_id 和机器人 open_id 也必须独立复核。
+4. 密钥、Token、chat_id 和内部许可材料只能通过生产密钥/配置系统注入，不写入仓库、镜像、日志、报告或测试 fixture。
+5. 先在 `DRY_RUN=true`、全局发送关闭时通过 96 条事件回放、全量测试、配置解析和同一快照晨报校验；保存上一稳定镜像/提交、配置哈希和数据库备份。
+6. 灰度先只计算不回复/不发送，再开放内部私聊，最后仅对一个已审核晨报目标观察一个完整发布周期；不得补发灰度前积压消息。异常时立即关闭 `ALERT_SEND_ENABLED` 和 `GLOBAL_FEISHU_SEND_ENABLED`，冻结 outbox，恢复上一稳定镜像/配置，并保留审计数据排查。
+
+现有 08:50/09:00 任务定义在灰度和回滚中都保留；只有重新核对来源、目标、幂等和快照后才可恢复 09:00 发送。更完整的检查表见 `docs/weather_power_trading_assistant_upgrade_plan.md`。
 
 ## Docker
 
@@ -404,7 +459,7 @@ Compose 包含两个服务：
 | 服务 | 说明 |
 |---|---|
 | `weather-bot` | FastAPI、飞书事件回调、手动接口 |
-| `weather-scheduler` | 按社区节奏自动发布任务、提醒、发布预测、关闭窗口 |
+| `weather-scheduler` | 旧版社区节奏；默认保持空闲，仅在 `LEGACY_WEATHER_SCHEDULER_ENABLED=true` 时发布任务、提醒、预测和关闭窗口 |
 
 ## 测试
 

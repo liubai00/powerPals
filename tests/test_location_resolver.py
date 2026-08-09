@@ -6,6 +6,8 @@ from pydantic import ValidationError
 from services.weather_bot.config import Settings
 from services.weather_bot.main import create_app
 from services.weather_bot.location import (
+    QWEATHER_GEO_PROVIDER,
+    QWEATHER_GEO_PATH,
     LocationResolver,
     PROVINCE_LEVEL_LOCATIONS,
     ResolvedLocation,
@@ -19,6 +21,7 @@ from services.weather_bot.location import (
 )
 from services.weather_bot.models import ForecastPoint, ForecastRequest, ProviderForecast
 from services.weather_bot.service import ForecastService
+from services.weather_bot.source_registry import SourcePolicy, SourceRegistry
 
 
 async def test_location_resolver_keeps_shenzhen_as_default():
@@ -59,9 +62,14 @@ async def test_location_resolver_supports_province_level_aliases():
     assert location.city == "沈阳市"
 
 
-def test_forecast_api_regression_for_liaoning_whole_region_request():
+def test_forecast_api_regression_for_liaoning_whole_region_request(
+    external_source_metadata,
+    verified_test_source_registry,
+    test_source_clock,
+):
     class FakeProvider:
         name = "open_meteo"
+        source_endpoints = ("https://open_meteo.weather.test/v1/forecast",)
 
         async def fetch(self, request):
             return ProviderForecast(
@@ -69,18 +77,29 @@ def test_forecast_api_regression_for_liaoning_whole_region_request():
                 status="ok",
                 points=[
                     ForecastPoint(
-                        time=f"{request.target_date}T12:00:00+08:00",
+                        time=f"{request.target_date}T{hour:02d}:00:00+08:00",
                         temperature=28.0,
                         precipitation_probability=20.0,
                         wind_speed=3.0,
                         cloud_cover=40.0,
                     )
+                    for hour in range(24)
                 ],
+                **external_source_metadata("open_meteo"),
             )
 
-    resolver = LocationResolver(Settings(qweather_api_key=""))
-    service = ForecastService(providers={"open_meteo": FakeProvider()}, location_resolver=resolver)
-    client = TestClient(create_app(forecast_service=service))
+    settings = Settings(_env_file=None, app_env="test", qweather_api_key="")
+    resolver = LocationResolver(settings)
+    service = ForecastService(
+        providers={"open_meteo": FakeProvider()},
+        location_resolver=resolver,
+        settings=settings,
+        source_registry=verified_test_source_registry(
+            {"open_meteo": "https://open_meteo.weather.test/v1/forecast"}
+        ),
+        clock=test_source_clock,
+    )
+    client = TestClient(create_app(forecast_service=service, settings=settings))
 
     response = client.post(
         "/api/weather/forecast",
@@ -151,7 +170,38 @@ async def test_qweather_candidate_selection_rejects_wrong_province(monkeypatch):
         return original_client(transport=httpx.MockTransport(handler))
 
     monkeypatch.setattr("services.weather_bot.location.httpx.AsyncClient", fake_client)
-    resolver = LocationResolver(Settings(qweather_api_key="test-key"))
+    endpoint = f"https://geoapi.qweather.com{QWEATHER_GEO_PATH}"
+    policy = SourcePolicy(
+        provider=QWEATHER_GEO_PROVIDER,
+        environment="test",
+        profile="verified-qweather-geocoder-test",
+        license_status="verified",
+        allowed_uses={"calculation", "derived_storage"},
+        terms_version="test-only",
+        source_url_prefixes=(endpoint,),
+        unit_manifest=(
+            "name:text;latitude:degree;longitude:degree;country:text;"
+            "province:text;city:text"
+        ),
+        required_metrics=(
+            "name",
+            "latitude",
+            "longitude",
+            "country",
+            "province",
+            "city",
+        ),
+        coverage_model="place-candidate",
+        timezone="Asia/Shanghai",
+        max_age_seconds=86400,
+        retention_policy="derived_only",
+        attribution_required=True,
+        attribution_text="QWeather",
+    )
+    resolver = LocationResolver(
+        Settings(_env_file=None, app_env="test", qweather_api_key="test-key"),
+        source_registry=SourceRegistry([policy], environment="test"),
+    )
 
     location = await resolver._resolve_with_qweather("辽宁盘锦")
 
@@ -294,14 +344,14 @@ def test_open_meteo_scoring_prefers_city_variant_for_bare_city_name():
 
 async def test_location_resolver_uses_nominatim_before_open_meteo_for_arbitrary_city(monkeypatch):
     async def fake_nominatim(self, region):
-        assert region == "珠海"
+        assert region == "漠河"
         return ResolvedLocation(
-            name="广东省珠海市",
-            latitude=22.273734,
-            longitude=113.572133,
+            name="黑龙江省漠河市",
+            latitude=52.972272,
+            longitude=122.538592,
             source="nominatim_geo",
-            province="广东省",
-            city="珠海市",
+            province="黑龙江省",
+            city="漠河市",
         )
 
     async def fail_open_meteo(self, region):
@@ -310,10 +360,10 @@ async def test_location_resolver_uses_nominatim_before_open_meteo_for_arbitrary_
     monkeypatch.setattr(LocationResolver, "_resolve_with_nominatim", fake_nominatim)
     monkeypatch.setattr(LocationResolver, "_resolve_with_open_meteo", fail_open_meteo)
 
-    location = await LocationResolver().resolve(ForecastRequest(region="珠海", target_date="2026-06-10"))
+    location = await LocationResolver().resolve(ForecastRequest(region="漠河", target_date="2026-06-10"))
 
-    assert location.name == "广东省珠海市"
-    assert location.latitude == 22.273734
+    assert location.name == "黑龙江省漠河市"
+    assert location.latitude == 52.972272
     assert location.source == "nominatim_geo"
 
 

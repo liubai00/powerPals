@@ -1,7 +1,8 @@
-"""轻量长期记忆: SQLite 落盘(data/memory.db, 挂载在容器外)。
+"""轻量持久记忆，默认落盘到容器外的 ``data/memory.db``。
 
-L1 用户画像: 每人常查城市/天数; L2 对话记忆: 最近几轮, TTL 7 天。
-所有读写由调用方 try 包裹, 失败降级为无记忆。
+对话轮次最多保留 7 天；待澄清和失败请求重试状态保留 10 分钟；成功天气查询按会话类型
+分类保留（群聊 30 分钟、私聊 24 小时）。其他兼容状态仍使用默认 TTL。
+调用方应在存储失败时降级为无记忆，不能影响业务主流程。
 """
 from __future__ import annotations
 
@@ -12,10 +13,17 @@ import sqlite3
 import time
 from typing import Any, Iterator
 
+from services.weather_bot.logging_safety import redact_sensitive_text
+
 DB_PATH = os.getenv("WEATHER_MEMORY_DB", "data/memory.db")
 TURN_TTL_SECONDS = 7 * 24 * 3600
 TURN_MAX_PER_KEY = 12
 STATE_TTL_SECONDS = 7 * 24 * 3600
+PENDING_CLARIFICATION_TTL_SECONDS = 10 * 60
+RETRY_REQUEST_TTL_SECONDS = 10 * 60
+GROUP_QUERY_TTL_SECONDS = 30 * 60
+DIRECT_QUERY_TTL_SECONDS = 24 * 3600
+BRIEFING_CONTEXT_TTL_SECONDS = 36 * 3600
 EVENT_TTL_SECONDS = 7 * 24 * 3600
 # 全国晨报的单次生成/等待上限是 600 秒。事件处理租期必须覆盖该窗口，
 # 否则飞书重投同一 event_id 时可能产生第二个回复处理者。
@@ -60,8 +68,9 @@ def _db() -> Iterator[sqlite3.Connection]:
 
 def record_turn(key: str, role: str, content: str) -> None:
     now = time.time()
+    safe_content = redact_sensitive_text(content)[:400]
     with _db() as conn:
-        conn.execute("INSERT INTO turns VALUES(?,?,?,?)", (key, role, (content or "")[:400], now))
+        conn.execute("INSERT INTO turns VALUES(?,?,?,?)", (key, role, safe_content, now))
         conn.execute("DELETE FROM turns WHERE ts < ?", (now - TURN_TTL_SECONDS,))
         conn.execute(
             "DELETE FROM turns WHERE rowid IN ("
@@ -123,10 +132,10 @@ def load_conversation_state(key: str) -> dict[str, Any] | None:
     now = time.time()
     with _db() as conn:
         row = conn.execute(
-            "SELECT payload FROM conversation_state WHERE k=? AND expires_at>=?",
+            "SELECT payload FROM conversation_state WHERE k=? AND expires_at>?",
             (key, now),
         ).fetchone()
-        conn.execute("DELETE FROM conversation_state WHERE expires_at<?", (now,))
+        conn.execute("DELETE FROM conversation_state WHERE expires_at<=?", (now,))
     if not row:
         return None
     try:
@@ -158,6 +167,74 @@ def save_conversation_state(
 def clear_conversation_state(key: str) -> None:
     with _db() as conn:
         conn.execute("DELETE FROM conversation_state WHERE k=?", (key,))
+
+
+def conversation_query_ttl_seconds(chat_type: str) -> int:
+    """Return the lifetime for an ordinary successful query context."""
+    if str(chat_type or "").strip().lower() in {"group", "group_chat"}:
+        return GROUP_QUERY_TTL_SECONDS
+    return DIRECT_QUERY_TTL_SECONDS
+
+
+def save_pending_clarification(key: str, payload: dict[str, Any]) -> None:
+    """Persist privacy-minimized clarification state independently of query state."""
+    save_conversation_state(
+        f"pending-clarification|{key}",
+        {
+            "state_version": 2,
+            "pending_clarification": payload,
+        },
+        ttl_seconds=PENDING_CLARIFICATION_TTL_SECONDS,
+    )
+
+
+def load_pending_clarification(key: str) -> dict[str, Any] | None:
+    state = load_conversation_state(f"pending-clarification|{key}")
+    pending = state.get("pending_clarification") if state else None
+    return pending if isinstance(pending, dict) else None
+
+
+def clear_pending_clarification(key: str) -> None:
+    clear_conversation_state(f"pending-clarification|{key}")
+
+
+def save_retry_request(key: str, payload: dict[str, Any]) -> None:
+    """Persist only the structured, retryable weather turn for a short window."""
+    save_conversation_state(
+        f"retry-request|{key}",
+        {
+            "state_version": 2,
+            "retry_request": payload,
+        },
+        ttl_seconds=RETRY_REQUEST_TTL_SECONDS,
+    )
+
+
+def load_retry_request(key: str) -> dict[str, Any] | None:
+    state = load_conversation_state(f"retry-request|{key}")
+    retry_request = state.get("retry_request") if state else None
+    return retry_request if isinstance(retry_request, dict) else None
+
+
+def clear_retry_request(key: str) -> None:
+    clear_conversation_state(f"retry-request|{key}")
+
+
+def save_briefing_context(key: str, payload: dict[str, Any]) -> None:
+    """Persist a published briefing pointer without extending query context."""
+    save_conversation_state(
+        f"briefing-context|{key}",
+        payload,
+        ttl_seconds=BRIEFING_CONTEXT_TTL_SECONDS,
+    )
+
+
+def load_briefing_context(key: str) -> dict[str, Any] | None:
+    return load_conversation_state(f"briefing-context|{key}")
+
+
+def clear_briefing_context(key: str) -> None:
+    clear_conversation_state(f"briefing-context|{key}")
 
 
 def claim_event(bot_scope: str, event_id: str) -> bool:
@@ -200,7 +277,16 @@ def complete_event(bot_scope: str, event_id: str, response: dict[str, Any] | Non
     if not event_id:
         return
     now = time.time()
-    encoded = json.dumps(response or {}, ensure_ascii=False, default=str)[:8000]
+    result = response if isinstance(response, dict) else {}
+    # Duplicate suppression needs only completion metadata.  Storing cards,
+    # user text or provider point series would turn the ledger into an
+    # unnecessary seven-day data copy without improving idempotency.
+    safe_result = {
+        key: result[key]
+        for key in ("status", "bot_role", "mode")
+        if isinstance(result.get(key), (str, int, float, bool))
+    }
+    encoded = json.dumps(safe_result, ensure_ascii=False, default=str)
     with _db() as conn:
         conn.execute(
             "UPDATE event_ledger SET status='succeeded', response=?, updated_at=?, expires_at=? "

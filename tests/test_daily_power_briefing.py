@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 import json
 
@@ -22,6 +23,15 @@ from services.weather_bot.power_briefing_markets import (
     representative_points,
     validate_market_config,
 )
+
+
+def test_scheduled_briefing_has_no_source_code_chat_targets() -> None:
+    assert not hasattr(daily_power_briefing, "CHAT_TARGETS")
+
+
+def test_scheduled_briefing_targets_fail_closed_on_invalid_configuration() -> None:
+    settings = Settings(power_briefing_targets_json="not-json")
+    assert daily_power_briefing._approved_chat_targets(settings) == []
 
 
 def _points(
@@ -190,7 +200,7 @@ def test_confidence_uses_provider_disagreement_not_only_provider_count():
     assert _confidence_label(submission) == "偏低（数据源分歧较大）"
 
 
-def test_briefing_reports_risks_beyond_top_five_and_does_not_fold_zero_stable_markets():
+def test_briefing_reports_risks_beyond_top_five_and_omits_zero_stable_count():
     rows = [
         {
             "market": f"市场{index}",
@@ -212,7 +222,7 @@ def test_briefing_reports_risks_beyond_top_five_and_does_not_fold_zero_stable_ma
     )
 
     assert "另有 2 个较低优先级风险分析区未在卡片展开" in text
-    assert "稳定分析区 0 个" in text
+    assert "稳定分析区 0 个" not in text
     assert "稳定市场 0 个，已折叠" not in text
 
     detail_text = _card_text(
@@ -225,6 +235,35 @@ def test_briefing_reports_risks_beyond_top_five_and_does_not_fold_zero_stable_ma
     )
     assert "市场6·城市6代表点" in detail_text
     assert "市场7·城市7代表点" in detail_text
+
+
+def test_same_severity_top_five_uses_strength_then_duration_before_input_order():
+    rows = [
+        {
+            "market": "较弱同级市场",
+            "city": "较弱点",
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission("2026-07-28", hot_hours={17, 18}),
+            },
+        },
+        {
+            "market": "较强同级市场",
+            "city": "较强点",
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission(
+                    "2026-07-28",
+                    hot_hours={17, 18, 19, 20, 21, 22},
+                ),
+            },
+        },
+    ]
+
+    card = build_briefing_card(rows, "2026-07-27")
+    top_five = _card_section(card, "Top 5 气象侧风险")
+
+    assert top_five.index("较强同级市场") < top_five.index("较弱同级市场")
 
 
 def test_briefing_coverage_distinguishes_market_count_from_representative_points():
@@ -652,6 +691,49 @@ async def test_dry_run_generates_cache_without_sending_feishu(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_scheduled_entry_generates_the_shared_snapshot_for_the_0900_release_slot(
+    monkeypatch,
+    tmp_path,
+):
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+    )
+    snapshot = {
+        "cache_key": "2026-08-09:test:test",
+        "report_date": "2026-08-09",
+        "release_slot": "09:00",
+        "generated_at": "2026-08-09T08:50:00+08:00",
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "summary_card": {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"content": "测试晨报"}},
+                "elements": [],
+            },
+        },
+    }
+    requested_slots: list[str | None] = []
+
+    async def fake_snapshot(*args, **kwargs):
+        requested_slots.append(kwargs.get("release_slot"))
+        return snapshot, False
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+
+    await daily_power_briefing.go("precompute")
+
+    assert requested_slots == ["09:00"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("requested_mode", [None, "send"])
 async def test_briefing_requires_explicit_send_opt_in(
     monkeypatch,
@@ -685,7 +767,7 @@ async def test_briefing_requires_explicit_send_opt_in(
     async def fake_snapshot(*args, **kwargs):
         return snapshot, True
 
-    async def fake_send(self, chat_id, card):
+    async def fake_send(self, chat_id, card, *, idempotency_key=None):
         sent.append(chat_id)
         return f"message-{chat_id}"
 
@@ -704,10 +786,16 @@ async def test_briefing_requires_explicit_send_opt_in(
 
 @pytest.mark.asyncio
 async def test_scheduled_send_records_each_card_thread_pointer(monkeypatch, tmp_path):
+    approved_targets = [
+        {"name": "已审核晨报群", "chat_id": "oc_approved_briefing"},
+    ]
     settings = Settings(
         power_briefing_cache_db=str(tmp_path / "briefing.db"),
         feishu_app_id=None,
         feishu_app_secret=None,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(approved_targets, ensure_ascii=False),
     )
     snapshot = {
         "cache_key": "2026-07-27:test:test",
@@ -732,7 +820,7 @@ async def test_scheduled_send_records_each_card_thread_pointer(monkeypatch, tmp_
     async def fake_snapshot(*args, **kwargs):
         return snapshot, True
 
-    async def fake_send(self, chat_id, card):
+    async def fake_send(self, chat_id, card, *, idempotency_key=None):
         sent.append(chat_id)
         return f"message-{chat_id}"
 
@@ -752,7 +840,311 @@ async def test_scheduled_send_records_each_card_thread_pointer(monkeypatch, tmp_
 
     await daily_power_briefing.go("send")
 
-    expected_chats = [chat_id for _name, chat_id in daily_power_briefing.CHAT_TARGETS]
+    expected_chats = [item["chat_id"] for item in approved_targets]
     assert sent == expected_chats
     assert [item[0] for item in pointers] == expected_chats
     assert all(item[2] == snapshot["cache_key"] for item in pointers)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_obeys_global_kill_switch_even_with_local_opt_in(
+    monkeypatch,
+    tmp_path,
+):
+    settings = Settings(
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+        global_feishu_send_enabled=False,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "已审核晨报群", "chat_id": "oc_approved_briefing"}],
+            ensure_ascii=False,
+        ),
+    )
+    snapshot = {
+        "cache_key": "2026-07-27:test:test",
+        "generated_at": "2026-07-27T09:00:00+08:00",
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "summary_card": {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"content": "测试晨报"}},
+                "elements": [],
+            },
+        },
+    }
+    sent: list[str] = []
+
+    async def fake_snapshot(*args, **kwargs):
+        return snapshot, True
+
+    async def fake_send(self, chat_id, card, *, idempotency_key=None):
+        sent.append(chat_id)
+        return f"message-{chat_id}"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.setenv("POWER_BRIEFING_ALLOW_SEND", "1")
+
+    await daily_power_briefing.go("send")
+
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_briefing_sends_each_release_target_at_most_once_across_runs(
+    monkeypatch,
+    tmp_path,
+):
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "已审核晨报群", "chat_id": "oc_approved_briefing"}],
+            ensure_ascii=False,
+        ),
+    )
+    snapshot = {
+        "cache_key": "2026-08-09:test:test",
+        "report_date": "2026-08-09",
+        "release_slot": "09:00",
+        "generated_at": "2026-08-09T08:50:00+08:00",
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "summary_card": {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"content": "测试晨报"}},
+                "elements": [],
+            },
+        },
+    }
+    sends: list[tuple[str, str | None]] = []
+
+    async def fake_snapshot(*args, **kwargs):
+        return snapshot, True
+
+    async def fake_send(self, chat_id, card, *, idempotency_key=None):
+        sends.append((chat_id, idempotency_key))
+        return "message-1"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    await daily_power_briefing.go("send")
+    await daily_power_briefing.go("send")
+
+    assert len(sends) == 1
+    assert sends[0][0] == "oc_approved_briefing"
+    assert sends[0][1]
+
+
+@pytest.mark.asyncio
+async def test_failed_scheduled_briefing_delivery_can_retry_with_the_same_idempotency_key(
+    monkeypatch,
+    tmp_path,
+):
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "已审核晨报群", "chat_id": "oc_approved_briefing"}],
+            ensure_ascii=False,
+        ),
+    )
+    snapshot = {
+        "cache_key": "2026-08-09:test:test",
+        "report_date": "2026-08-09",
+        "release_slot": "09:00",
+        "generated_at": "2026-08-09T08:50:00+08:00",
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "summary_card": {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"content": "测试晨报"}},
+                "elements": [],
+            },
+        },
+    }
+    attempts: list[str | None] = []
+
+    async def fake_snapshot(*args, **kwargs):
+        return snapshot, True
+
+    async def flaky_send(self, chat_id, card, *, idempotency_key=None):
+        attempts.append(idempotency_key)
+        if len(attempts) == 1:
+            raise RuntimeError("simulated boundary failure")
+        return "message-after-retry"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", flaky_send)
+    monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    await daily_power_briefing.go("send")
+    await daily_power_briefing.go("send")
+
+    assert len(attempts) == 2
+    assert attempts[0]
+    assert attempts[1] == attempts[0]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_scheduled_briefing_runs_send_one_card_per_release_target(
+    monkeypatch,
+    tmp_path,
+):
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "已审核晨报群", "chat_id": "oc_approved_briefing"}],
+            ensure_ascii=False,
+        ),
+    )
+    snapshot = {
+        "cache_key": "2026-08-09:test:test",
+        "report_date": "2026-08-09",
+        "release_slot": "09:00",
+        "generated_at": "2026-08-09T08:50:00+08:00",
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "summary_card": {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"content": "测试晨报"}},
+                "elements": [],
+            },
+        },
+    }
+    send_started = asyncio.Event()
+    finish_send = asyncio.Event()
+    sends: list[str | None] = []
+
+    async def fake_snapshot(*args, **kwargs):
+        return snapshot, True
+
+    async def blocking_send(self, chat_id, card, *, idempotency_key=None):
+        sends.append(idempotency_key)
+        send_started.set()
+        await finish_send.wait()
+        return "message-1"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", blocking_send)
+    monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    first = asyncio.create_task(daily_power_briefing.go("send"))
+    await send_started.wait()
+    second = asyncio.create_task(daily_power_briefing.go("send"))
+    await asyncio.sleep(0)
+    finish_send.set()
+    await asyncio.gather(first, second)
+
+    assert len(sends) == 1
+    assert sends[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_gate", ["schedule_disabled", "dry_run"])
+async def test_suppressed_scheduled_run_does_not_consume_the_release_target_key(
+    monkeypatch,
+    tmp_path,
+    initial_gate,
+):
+    common = {
+        "_env_file": None,
+        "power_briefing_cache_db": str(tmp_path / "briefing.db"),
+        "global_feishu_send_enabled": True,
+        "power_briefing_targets_json": json.dumps(
+            [{"name": "已审核晨报群", "chat_id": "oc_approved_briefing"}],
+            ensure_ascii=False,
+        ),
+    }
+    settings_ref = {
+        "current": Settings(
+            **common,
+            power_briefing_allow_send=initial_gate != "schedule_disabled",
+            dry_run=initial_gate == "dry_run",
+        )
+    }
+    snapshot = {
+        "cache_key": "2026-08-09:test:test",
+        "report_date": "2026-08-09",
+        "release_slot": "09:00",
+        "generated_at": "2026-08-09T08:50:00+08:00",
+        "coverage": {
+            "provincial_areas": {"covered": 31, "total": 31},
+            "markets": {"covered": 33, "total": 33},
+            "points": {"covered": 75, "total": 75},
+        },
+        "statistics": {"classified_markets": 33, "configured_markets": 33},
+        "summary_card": {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"content": "测试晨报"}},
+                "elements": [],
+            },
+        },
+    }
+    sends: list[str] = []
+
+    async def fake_snapshot(*args, **kwargs):
+        return snapshot, True
+
+    async def fake_send(self, chat_id, card, *, idempotency_key=None):
+        sends.append(chat_id)
+        return "message-1"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings_ref["current"])
+    monkeypatch.setattr(weather_main, "ForecastService", lambda settings: object())
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fake_snapshot)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    monkeypatch.setattr(daily_power_briefing, "_remember_scheduled_briefing_thread", lambda *args: None)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    await daily_power_briefing.go("send")
+    settings_ref["current"] = Settings(
+        **common,
+        power_briefing_allow_send=True,
+        dry_run=False,
+    )
+    await daily_power_briefing.go("send")
+
+    assert sends == ["oc_approved_briefing"]

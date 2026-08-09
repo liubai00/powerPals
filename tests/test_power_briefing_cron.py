@@ -19,6 +19,6 @@ def test_power_briefing_cron_keeps_precompute_and_scheduled_send_separate():
     assert precompute.startswith("50 0 * * * ")
     assert "POWER_BRIEFING_ALLOW_SEND=1" not in precompute
     assert scheduled_send.startswith("0 1 * * * ")
-    assert "POWER_BRIEFING_ALLOW_SEND=1" in scheduled_send
+    assert "POWER_BRIEFING_ALLOW_SEND=1" not in scheduled_send
     assert "scripts/daily_power_briefing.py" in precompute
     assert "scripts/daily_power_briefing.py" in scheduled_send

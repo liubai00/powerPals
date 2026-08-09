@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
-"""电力气象决策晨报 2.0：异常市场、关键时段、变化和置信度优先。"""
+"""电力气象决策晨报 3.0：版本、来源、质量和代理边界优先。"""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import re
 from statistics import mean
 from typing import Any, Callable
 from uuid import uuid4
 
 from services.weather_bot.briefing_cache import BriefingCache
+from services.weather_bot.briefing_versions import (
+    build_run_provenance,
+    compare_market_risk_versions,
+)
 from services.weather_bot.models import ForecastRequest
 from services.weather_bot.power_briefing_markets import (
     MARKET_CONFIG_VERSION,
@@ -23,7 +28,7 @@ from services.weather_bot.typhoon import TyphoonClient, format_active_for_briefi
 from services.weather_bot.workbench import collect_forecasts_with_errors
 
 
-POWER_BRIEFING_REPORT_VERSION = "power-briefing-2.1"
+POWER_BRIEFING_REPORT_VERSION = "power-briefing-3.0"
 MARKET_POINTS = representative_points()
 PROVINCES = NATIONAL_MARKETS  # 保留旧脚本导入名；实际为 33 个电力气象分析区。
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -229,7 +234,22 @@ def _day_metrics(submission: Any) -> dict[str, Any]:
     heating = sum(max(18.0 - value, 0.0) for value in temperatures)
     daylight_cloud = _mean_metric(daylight, "cloud_cover")
     daylight_rain = _max_metric(daylight, "precipitation_probability")
-    solar_stress = min(100.0, daylight_cloud * 0.75 + daylight_rain * 0.25)
+    daylight_radiation = [
+        value
+        for point in daylight
+        if (value := _value(point, "shortwave_radiation")) is not None
+    ]
+    radiation_integral = sum(daylight_radiation) if daylight_radiation else None
+    if radiation_integral is not None:
+        # Hourly Open-Meteo values are W/m². Summing one-hour samples yields a
+        # transparent Wh/m² weather-resource proxy; it is never plant output.
+        solar_stress = min(100.0, max(0.0, (3000.0 - radiation_integral) / 30.0))
+        solar_proxy_method = "shortwave_radiation"
+        solar_proxy_quality_reason = None
+    else:
+        solar_stress = min(100.0, daylight_cloud * 0.75 + daylight_rain * 0.25)
+        solar_proxy_method = "cloud_rain_fallback"
+        solar_proxy_quality_reason = "短波辐射缺失，降级为云量+降水代理"
     wind_peak = _max_metric(points, "wind_speed")
     wind_mean = _mean_metric(points, "wind_speed")
     max_feels = max(temperatures) if temperatures else 0.0
@@ -254,6 +274,9 @@ def _day_metrics(submission: Any) -> dict[str, Any]:
         "cooling": cooling,
         "heating": heating,
         "solar_stress": solar_stress,
+        "solar_radiation_integral": radiation_integral,
+        "solar_proxy_method": solar_proxy_method,
+        "solar_proxy_quality_reason": solar_proxy_quality_reason,
         "daylight_cloud": daylight_cloud,
         "daylight_rain": daylight_rain,
         "wind_peak": wind_peak,
@@ -319,6 +342,8 @@ def _change_for_signal(
         if load_today - load_tomorrow >= 12:
             return "负荷天气压力代理下调"
     elif signal_type == "solar":
+        if today["solar_proxy_method"] != tomorrow["solar_proxy_method"]:
+            return "代理口径变化，不作同比"
         if tomorrow["solar_stress"] - today["solar_stress"] >= 12:
             return "光资源代理转弱"
         if today["solar_stress"] - tomorrow["solar_stress"] >= 12:
@@ -405,7 +430,55 @@ def _analyze_row(row: dict[str, Any], start_date: str) -> PointInsight | None:
                 change=_change_for_signal(today, tomorrow, "load"),
             )
         )
-    if "solar" in roles and (
+    if (
+        "solar" in roles
+        and tomorrow["solar_proxy_method"] == "shortwave_radiation"
+        and tomorrow["solar_radiation_integral"] < 2000
+    ):
+        signal_events.append(
+            SignalEvent(
+                signal_type="solar",
+                direction="光伏资源代理↓",
+                severity=2,
+                window=_continuous_windows(
+                    daylight,
+                    lambda point: (
+                        (value := _value(point, "shortwave_radiation")) is not None
+                        and value < 150
+                    ),
+                ),
+                driver=(
+                    f"日照时段短波辐射积分 {tomorrow['solar_radiation_integral']:.0f} Wh/m²"
+                    "（气象辐射代理，非实际光伏出力）"
+                ),
+                change=_change_for_signal(today, tomorrow, "solar"),
+            )
+        )
+    elif (
+        "solar" in roles
+        and tomorrow["solar_proxy_method"] == "shortwave_radiation"
+        and tomorrow["solar_radiation_integral"] >= 4000
+    ):
+        signal_events.append(
+            SignalEvent(
+                signal_type="solar",
+                direction="光伏资源代理↑",
+                severity=0,
+                window=_continuous_windows(
+                    daylight,
+                    lambda point: (
+                        (value := _value(point, "shortwave_radiation")) is not None
+                        and value >= 300
+                    ),
+                ),
+                driver=(
+                    f"日照时段短波辐射积分 {tomorrow['solar_radiation_integral']:.0f} Wh/m²"
+                    "（气象辐射代理，非实际光伏出力）"
+                ),
+                change=_change_for_signal(today, tomorrow, "solar"),
+            )
+        )
+    elif "solar" in roles and tomorrow["solar_proxy_method"] == "cloud_rain_fallback" and (
         tomorrow["daylight_rain"] >= 60 or tomorrow["daylight_cloud"] >= 75
     ):
         signal_events.append(
@@ -423,12 +496,14 @@ def _analyze_row(row: dict[str, Any], start_date: str) -> PointInsight | None:
                 driver=(
                     f"日照时段云量 {tomorrow['daylight_cloud']:.0f}% / "
                     f"降水概率 {tomorrow['daylight_rain']:.0f}%"
+                    "（短波辐射缺失，降级为云量+降水代理，非实际光伏出力）"
                 ),
                 change=_change_for_signal(today, tomorrow, "solar"),
             )
         )
     elif (
         "solar" in roles
+        and tomorrow["solar_proxy_method"] == "cloud_rain_fallback"
         and tomorrow["daylight_cloud"] <= 35
         and tomorrow["daylight_rain"] < 30
     ):
@@ -444,7 +519,10 @@ def _analyze_row(row: dict[str, Any], start_date: str) -> PointInsight | None:
                         and (_value(point, "cloud_cover") or 0.0) <= 35
                     ),
                 ),
-                driver="日照时段云量和降水概率较低",
+                driver=(
+                    "日照时段云量和降水概率较低"
+                    "（短波辐射缺失，降级为云量+降水代理，非实际光伏出力）"
+                ),
                 change=_change_for_signal(today, tomorrow, "solar"),
             )
         )
@@ -758,6 +836,63 @@ def _ranking_lines(insights: list[MarketInsight]) -> list[str]:
     ]
 
 
+def _risk_window_duration_hours(window: str) -> float:
+    total = 0.0
+    for start_hour, start_minute, end_hour, end_minute in re.findall(
+        r"(\d{2}):(\d{2})[–-](\d{2}):(\d{2})",
+        window or "",
+    ):
+        start = int(start_hour) * 60 + int(start_minute)
+        end = int(end_hour) * 60 + int(end_minute)
+        if end < start:
+            end += 24 * 60
+        total += max(0, end - start) / 60.0
+    return total
+
+
+def _risk_relative_strength(insight: MarketInsight) -> float:
+    """Compare unlike proxy signals against their transparent trigger scale."""
+
+    candidates = [
+        float(insight.cooling_degree_hours or 0.0) / 24.0,
+        float(insight.heating_degree_hours or 0.0) / 36.0,
+        float(insight.solar_stress or 0.0) / 75.0,
+        float(insight.wind_peak or 0.0) / 10.0,
+    ]
+    return max(candidates)
+
+
+def _risk_change_priority(change: str) -> int:
+    if re.search(r"新增|上调|增强|转弱", change or ""):
+        return 2
+    if re.search(r"变化不大|持平", change or ""):
+        return 1
+    if re.search(r"缓解|下调|减弱|改善", change or ""):
+        return 0
+    return -1
+
+
+def _risk_confidence_priority(confidence: str) -> int:
+    if str(confidence).startswith("较高"):
+        return 3
+    if str(confidence).startswith("中等"):
+        return 2
+    if str(confidence).startswith("偏低"):
+        return 1
+    return 0
+
+
+def _risk_priority_key(insight: MarketInsight) -> tuple[float, float, int, float, int, str]:
+    return (
+        -float(insight.severity),
+        -_risk_relative_strength(insight),
+        -_risk_change_priority(insight.change),
+        -_risk_window_duration_hours(insight.window),
+        -_risk_confidence_priority(insight.confidence),
+        insight.market,
+    )
+
+
 def _source_summary(rows: list[dict[str, Any]]) -> str:
     sources = {
         provider
@@ -890,6 +1025,129 @@ def _coverage_text(coverage: dict[str, Any]) -> str:
     )
 
 
+def _market_risk_snapshots(insights: list[MarketInsight]) -> list[dict[str, Any]]:
+    """Persist derived market features only; provider raw payloads never enter versions."""
+
+    return [
+        {
+            "market_id": item.market_id,
+            "market": item.market,
+            "province": item.province,
+            "representative_point": item.city,
+            "severity": item.severity,
+            "window": item.window,
+            "directions": list(item.directions),
+            "confidence": item.confidence,
+            "covered_points": item.covered_points,
+            "configured_points": item.configured_points,
+        }
+        for item in insights
+    ]
+
+
+def _display_timestamp(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return "未提供"
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return "未提供"
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return "未提供"
+    return timestamp.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _provider_label(provider: str) -> str:
+    return {
+        "open_meteo": "Open-Meteo",
+        "qweather": "和风天气",
+        "caiyun": "彩云天气",
+    }.get(provider, provider)
+
+
+def _quality_reason_label(reason: str) -> str:
+    if ":" in reason:
+        code, provider = reason.split(":", 1)
+        if code == "provider_issued_at_missing":
+            return f"{_provider_label(provider)}起报时间未提供"
+        if code == "source_url_missing":
+            return f"{_provider_label(provider)}来源链接不可追溯"
+        if code == "content_sha256_missing":
+            return f"{_provider_label(provider)}内容指纹不可用"
+    return {
+        "retrieved_at_missing": "实际抓取时间未提供",
+        "valid_time_missing": "预报有效时间未提供",
+        "representative_point_coverage_incomplete": "代表点覆盖不完整",
+        "today_baseline_coverage_incomplete": "今日对比基线不完整",
+        "external_provider_missing": "没有可用外部气象源",
+        "single_external_provider": "仅单一外部气象源",
+    }.get(reason, "质量信息降级")
+
+
+def _run_quality_text(
+    run_metadata: dict[str, Any],
+    version_change: dict[str, Any],
+) -> str:
+    valid_time = run_metadata.get("valid_time") or {}
+    sources = run_metadata.get("sources") or []
+    quality = run_metadata.get("quality") or {}
+    confidence = run_metadata.get("confidence") or {}
+    coverage = run_metadata.get("metric_coverage") or {}
+    point_coverage = coverage.get("weather_points") or {}
+    issued_lines = []
+    for provider, issued_at in (run_metadata.get("provider_issued_at") or {}).items():
+        if issued_at:
+            issued_lines.append(f"{_provider_label(str(provider))} 起报 {_display_timestamp(issued_at)}")
+        else:
+            issued_lines.append(f"{_provider_label(str(provider))} 起报时间未提供")
+    if not issued_lines:
+        issued_lines.append("数据源起报时间未提供")
+
+    if version_change.get("status") == "available":
+        version_line = (
+            f"较上一同发布时次 {version_change.get('previous_run_id')}："
+            f"{version_change.get('upgraded_markets', 0)} 个分析区上调，"
+            f"{version_change.get('downgraded_markets', 0)} 个下调，"
+            f"{version_change.get('unchanged_markets', 0)} 个不变"
+        )
+    else:
+        version_line = (
+            "上一同发布时次版本不可用"
+            "（没有昨日同一发布时次的可比快照）"
+        )
+
+    reasons = quality.get("reasons") or []
+    quality_reason = (
+        "、".join(_quality_reason_label(str(reason)) for reason in reasons)
+        if reasons
+        else "元数据与覆盖完整"
+    )
+    quality_status = {
+        "good": "良好",
+        "degraded": "降级",
+        "unusable": "不可用",
+    }.get(str(quality.get("status")), "不可用")
+    return "\n".join(
+        [
+            f"- 预报运行 `{run_metadata.get('forecast_run_id')}`｜发布时次 {run_metadata.get('release_slot')}",
+            f"- 实际抓取 {_display_timestamp(run_metadata.get('retrieved_at'))}",
+            f"- 聚合完成 {_display_timestamp(run_metadata.get('aggregation_completed_at'))}",
+            (
+                f"- 有效时间 {_display_timestamp(valid_time.get('start'))} 至 "
+                f"{_display_timestamp(valid_time.get('end'))}｜{valid_time.get('timezone') or '未提供'}"
+            ),
+            f"- 来源 {' / '.join(_provider_label(str(item)) for item in sources) or '暂无可追溯来源'}",
+            "- " + "；".join(issued_lines),
+            (
+                f"- 数据质量 {quality_status}｜"
+                f"代表点 {point_coverage.get('covered', 0)}/{point_coverage.get('total', 0)}｜"
+                f"置信度 {confidence.get('level') or '不可用'}｜{quality_reason}"
+            ),
+            f"- {version_line}",
+        ]
+    )
+
+
 def build_briefing_card(
     rows: list[dict[str, Any]],
     start_date: str,
@@ -898,6 +1156,8 @@ def build_briefing_card(
     *,
     expanded: bool = False,
     market_config: tuple[MarketZone, ...] | None = None,
+    run_metadata: dict[str, Any] | None = None,
+    version_change: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     generated = generated_at or datetime.now(SHANGHAI_TZ)
     tomorrow_date = (date.fromisoformat(start_date) + timedelta(days=1)).isoformat()
@@ -906,7 +1166,10 @@ def build_briefing_card(
         start_date,
         market_config=market_config,
     )
-    risks = sorted((item for item in insights if item.severity > 0), key=lambda item: -item.severity)
+    risks = sorted(
+        (item for item in insights if item.severity > 0),
+        key=_risk_priority_key,
+    )
     top_risks = risks[:5]
     remaining_risks = risks[5:]
     stable = sorted((item for item in insights if item.severity == 0), key=lambda item: item.market)
@@ -946,8 +1209,6 @@ def build_briefing_card(
     if stable:
         if not expanded:
             other_lines.append(f"稳定分析区 {len(stable)} 个，精简卡未逐一列出")
-    elif not expanded:
-        other_lines.append("稳定分析区 0 个（本次所有已覆盖分析区均达到风险阈值）")
     if coverage["markets"]["partial"]:
         other_lines.append(f"部分覆盖分析区 {coverage['markets']['partial']} 个")
     if missing_markets:
@@ -958,10 +1219,40 @@ def build_briefing_card(
         other_lines.append(f"明日缺失代表点 {coverage['points']['missing']} 个")
     if coverage["baseline_points"]["missing"]:
         other_lines.append(f"今日对比基线缺失代表点 {coverage['baseline_points']['missing']} 个")
+    fallback_points = 0
+    for row in rows:
+        if "solar" not in tuple(row.get("roles") or ("load", "solar", "wind")):
+            continue
+        submission = (row.get("submissions") or {}).get(tomorrow_date)
+        if submission is None:
+            continue
+        if _day_metrics(submission)["solar_proxy_method"] == "cloud_rain_fallback":
+            fallback_points += 1
+    if fallback_points:
+        other_lines.append(
+            "光资源代理质量：短波辐射缺失，"
+            f"{fallback_points} 个代表点降级为云量+降水代理"
+        )
 
     elements: list[dict[str, Any]] = [
         {"tag": "note", "elements": [{"tag": "plain_text", "content": health}]},
     ]
+    if run_metadata is not None:
+        elements.extend(
+            [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            "**预报版本与数据质量**\n"
+                            + _run_quality_text(run_metadata, version_change or {})
+                        ),
+                    },
+                },
+                {"tag": "hr"},
+            ]
+        )
     if typhoon_block:
         elements.extend(
             [
@@ -1022,7 +1313,8 @@ def build_briefing_card(
                         "content": (
                             "当前为多城市代表点样本扫描，不等于全省实况、调度口径或交易市场结论；"
                             "资源排行为角色内代表点等权样本，单点覆盖分析区不参与全区排行；"
-                            "云量/降水仅作光伏资源代理，10米风仅作地面风资源代理。"
+                            "光资源优先采用日照时段短波辐射积分；辐射缺失时云量/降水仅作降级代理，"
+                            "均非实际光伏出力。10米风仅作地面风资源代理。"
                             "未接入负荷、出力、机组、联络线及价格数据，不构成交易或报价建议。"
                         ),
                     }
@@ -1039,7 +1331,7 @@ def build_briefing_card(
                 "title": {
                     "tag": "plain_text",
                     "content": (
-                        f"⚡ 电力气象决策晨报 2.0"
+                        f"⚡ 电力气象决策晨报 {'3.0' if run_metadata is not None else '2.0'}"
                         f"{'·全部明细' if expanded else ''}｜"
                         f"{start_date[5:].replace('-', '/')}–{tomorrow_date[5:].replace('-', '/')}"
                     ),
@@ -1087,8 +1379,12 @@ async def generate_briefing_snapshot(
     *,
     cache: BriefingCache,
     generated_at: datetime | None = None,
+    forecast_run_id: str | None = None,
+    release_slot: str | None = None,
 ) -> dict[str, Any]:
     generated = generated_at or datetime.now(SHANGHAI_TZ)
+    run_id = forecast_run_id or f"briefing-{uuid4().hex}"
+    declared_release_slot = release_slot or generated.strftime("%H:00")
     rows = list(
         await asyncio.gather(
             *[
@@ -1105,35 +1401,74 @@ async def generate_briefing_snapshot(
     if coverage["points"]["covered"] == 0:
         raise RuntimeError("全部代表点均无明日数据，晨报未生成")
 
+    insights = _aggregate_market_insights(
+        rows,
+        start_date,
+        market_config=NATIONAL_MARKETS,
+    )
+    risk_snapshots = _market_risk_snapshots(insights)
+    previous = cache.load_previous_same_release(
+        report_date=start_date,
+        release_slot=declared_release_slot,
+        market_config_version=MARKET_CONFIG_VERSION,
+        report_version=POWER_BRIEFING_REPORT_VERSION,
+    )
+    version_change = compare_market_risk_versions(risk_snapshots, previous)
+    run_metadata = build_run_provenance(
+        rows,
+        coverage,
+        forecast_run_id=run_id,
+        release_slot=declared_release_slot,
+    )
+    if run_metadata["quality"]["status"] == "unusable":
+        raise RuntimeError("briefing requires traceable external weather provenance")
+
     typhoon_block = None
-    if typhoon_client is not None and typhoon_client.enabled:
-        try:
-            typhoon_block = format_active_for_briefing(await typhoon_client.active_storms())
-        except Exception as exc:  # noqa: BLE001 - 台风段失败不影响晨报主体
-            print("TYPHOON FETCH FAIL %r" % exc)
+    if typhoon_client is not None:
+        if not typhoon_client.enabled:
+            typhoon_block = (
+                "**🌀 台风实时数据不可用**\n"
+                "来源许可或数据门禁未通过，本期不展示台风事实；这不代表无活跃台风。"
+            )
+        else:
+            try:
+                typhoon_block = format_active_for_briefing(
+                    await typhoon_client.active_storms()
+                )
+            except Exception:  # noqa: BLE001 - fail closed without leaking provider details
+                typhoon_block = (
+                    "**🌀 台风实时数据不可用**\n"
+                    "已许可来源本次未返回可用数据，本期不展示台风事实；这不代表无活跃台风。"
+                )
 
     cache_key = briefing_cache_key(start_date)
     expires = generated + timedelta(seconds=cache.ttl_seconds)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "cache_key": cache_key,
         "report_date": start_date,
         "market_config_version": MARKET_CONFIG_VERSION,
         "report_version": POWER_BRIEFING_REPORT_VERSION,
         "generated_at": generated.isoformat(),
         "expires_at": expires.isoformat(),
+        **run_metadata,
+        "previous_run_id": version_change.get("previous_run_id"),
+        "version_change": version_change,
         "coverage": coverage,
         "statistics": briefing_statistics(
             rows,
             start_date,
             market_config=NATIONAL_MARKETS,
         ),
+        "market_risk_snapshots": risk_snapshots,
         "summary_card": build_briefing_card(
             rows,
             start_date,
             typhoon_block=typhoon_block,
             generated_at=generated,
             market_config=NATIONAL_MARKETS,
+            run_metadata=run_metadata,
+            version_change=version_change,
         ),
         "detail_card": build_briefing_card(
             rows,
@@ -1142,6 +1477,8 @@ async def generate_briefing_snapshot(
             generated_at=generated,
             expanded=True,
             market_config=NATIONAL_MARKETS,
+            run_metadata=run_metadata,
+            version_change=version_change,
         ),
     }
 
@@ -1153,17 +1490,22 @@ async def get_or_generate_briefing(
     *,
     cache: BriefingCache,
     wait_seconds: float = 600.0,
+    release_slot: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     cache_key = briefing_cache_key(start_date)
     cached = cache.load_fresh(cache_key)
-    if cached is not None:
+    if cached is not None and (
+        release_slot is None or str(cached.get("release_slot") or "") == release_slot
+    ):
         return cached, True
 
     owner = uuid4().hex
     deadline = asyncio.get_running_loop().time() + max(1.0, wait_seconds)
     while True:
         cached = cache.load_fresh(cache_key)
-        if cached is not None:
+        if cached is not None and (
+            release_slot is None or str(cached.get("release_slot") or "") == release_slot
+        ):
             return cached, True
         if cache.claim_generation(cache_key, owner, lease_seconds=max(60, int(wait_seconds))):
             break
@@ -1178,6 +1520,7 @@ async def get_or_generate_briefing(
             typhoon_client,
             start_date,
             cache=cache,
+            release_slot=release_slot,
         )
         generated_at = datetime.fromisoformat(str(snapshot["generated_at"])).timestamp()
         cache.save_and_release(

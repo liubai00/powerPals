@@ -16,8 +16,11 @@ from services.weather_bot.controlled_learning import (
     ReplayExpectation,
     ReplayStateSeed,
 )
+from services.weather_bot.feishu import FeishuBotAccount
 from services.weather_bot.main import (
     FEISHU_TASK_BOT,
+    WEATHER_FORECAST_BOT_ROLE,
+    WEATHER_TASK_BOT_ROLE,
     _comparison_regions_from_text,
     _contextual_weather_text,
     _conversation_state_key,
@@ -31,6 +34,7 @@ from services.weather_bot.main import (
     _is_task_command,
     _is_task_submission_command,
     _is_weather_command,
+    _is_weather_knowledge_question,
     _normalize_event_text,
     _target_date_from_text,
 )
@@ -39,6 +43,10 @@ from services.weather_bot.weather_metrics import (
     unsupported_weather_metric_labels,
     weather_metrics_from_text,
 )
+
+
+_REPLAY_WEATHER_BOT_OPEN_ID = "ou_replay_weather_bot"
+_REPLAY_TASK_BOT_OPEN_ID = "ou_replay_task_bot"
 
 
 def generate_replay_cases(today: date | None = None) -> list[ReplayCase]:
@@ -189,29 +197,6 @@ def generate_replay_cases(today: date | None = None) -> list[ReplayCase]:
             expectation=ReplayExpectation(should_reply=False, intent="ignored"),
         ),
     ]
-
-    location_matrix = [
-        ("广州", "广东省广州市"),
-        ("深圳", "广东省深圳市"),
-        ("北京", "北京市"),
-        ("上海", "上海市"),
-        ("盘锦", "辽宁盘锦"),
-        ("杭州", "浙江省杭州市"),
-    ]
-    for index, (token, normalized) in enumerate(location_matrix, start=1):
-        for days in (1, 3, 7):
-            phrase = f"{token}天气" if days == 1 else f"{token}未来{days}天天气"
-            cases.append(
-                _case(
-                    f"generated-location-{index}-{days}d",
-                    "location",
-                    phrase,
-                    intent="weather",
-                    region=normalized,
-                    days=days,
-                    tags=["synthetic_matrix"],
-                )
-            )
 
     seed_guangzhou = ReplayStateSeed(
         last_successful_request={
@@ -386,6 +371,7 @@ def run_deterministic_replay(
 
 def run_replay_case(case: ReplayCase, *, today: date | None = None) -> ReplayCaseResult:
     event = _event_for_case(case)
+    account = _replay_bot_account(case.bot_scope)
     for seed in case.state_seeds:
         seed_event = _event_for_seed(seed)
         key = _conversation_state_key(seed_event, seed.bot_role)
@@ -401,12 +387,26 @@ def run_replay_case(case: ReplayCase, *, today: date | None = None) -> ReplayCas
     if _is_group_chat(event) and not _is_supported_group_message_type(event):
         actual = ReplayActual(should_reply=False, intent="ignored")
         return _compare(case, actual, today=today)
-    if _is_group_chat(event) and not _is_addressed_to_bot(case.text, event, case.bot_scope):
+    if _is_group_chat(event) and not _is_addressed_to_bot(
+        case.text,
+        event,
+        case.bot_scope,
+        account,
+    ):
         actual = ReplayActual(should_reply=False, intent="ignored")
         return _compare(case, actual, today=today)
 
     normalized = _normalize_event_text(case.text, event, case.bot_scope)
-    contextual, action = _contextual_weather_text(normalized, event)
+    context_bot_role = (
+        WEATHER_TASK_BOT_ROLE
+        if case.bot_scope == FEISHU_TASK_BOT
+        else WEATHER_FORECAST_BOT_ROLE
+    )
+    contextual, action = _contextual_weather_text(
+        normalized,
+        event,
+        bot_role=context_bot_role,
+    )
     if action == "reset":
         actual = ReplayActual(
             should_reply=True,
@@ -417,6 +417,23 @@ def run_replay_case(case: ReplayCase, *, today: date | None = None) -> ReplayCas
         return _compare(case, actual, today=today)
 
     intent = _diagnostic_intent(contextual)
+    if (
+        _is_group_chat(event)
+        and intent not in {"help", "power_briefing"}
+        and not (
+            _is_task_submission_command(contextual)
+            or _is_task_command(contextual)
+            or _is_weather_command(contextual)
+            or _is_weather_knowledge_question(contextual)
+        )
+    ):
+        actual = ReplayActual(
+            should_reply=False,
+            intent="ignored",
+            normalized_text=normalized,
+            contextual_text=contextual,
+        )
+        return _compare(case, actual, today=today)
     regions = _comparison_regions_from_text(contextual)
     explicit_region = _explicit_region_from_text(contextual)
     metrics = weather_metrics_from_text(contextual) or []
@@ -552,7 +569,16 @@ def _group_case(
 
 def _event_for_case(case: ReplayCase) -> dict[str, Any]:
     alias = "点点" if case.bot_scope == FEISHU_TASK_BOT else "云云"
-    mentions = [{"key": "@_user_1", "name": alias}] if case.addressed and case.chat_type == "group" else []
+    bot_open_id = (
+        _REPLAY_TASK_BOT_OPEN_ID
+        if case.bot_scope == FEISHU_TASK_BOT
+        else _REPLAY_WEATHER_BOT_OPEN_ID
+    )
+    mentions = (
+        [{"key": "@_user_1", "name": alias, "id": {"open_id": bot_open_id}}]
+        if case.addressed and case.chat_type == "group"
+        else []
+    )
     message: dict[str, Any] = {
         "message_id": f"replay-{case.case_id}",
         "chat_id": case.chat_id,
@@ -567,6 +593,15 @@ def _event_for_case(case: ReplayCase) -> dict[str, Any]:
         "sender": {"sender_id": {"open_id": case.user_id}},
         "message": message,
     }
+
+
+def _replay_bot_account(bot_scope: str) -> FeishuBotAccount:
+    bot_open_id = (
+        _REPLAY_TASK_BOT_OPEN_ID
+        if bot_scope == FEISHU_TASK_BOT
+        else _REPLAY_WEATHER_BOT_OPEN_ID
+    )
+    return FeishuBotAccount(bot_open_id=bot_open_id)
 
 
 def _event_for_seed(seed: ReplayStateSeed) -> dict[str, Any]:

@@ -45,6 +45,10 @@ class ForecastPoint(BaseModel):
     apparent_temperature: float | None = None
     wind_direction: float | None = None
     uv_index: float | None = None
+    shortwave_radiation: float | None = Field(
+        default=None,
+        description="Surface shortwave radiation in W/m²; a weather resource proxy, not photovoltaic output.",
+    )
 
 
 class ProviderForecast(BaseModel):
@@ -52,7 +56,19 @@ class ProviderForecast(BaseModel):
     status: Literal["ok", "disabled", "error"] = "ok"
     points: list[ForecastPoint] = Field(default_factory=list)
     error_message: str | None = None
-    raw: dict[str, Any] | None = None
+    retrieved_at: str | None = None
+    provider_issued_at: str | None = None
+    source_url: str | None = None
+    content_sha256: str | None = None
+    retention_policy: Literal["derived_only", "metadata_only"] = "derived_only"
+    raw: dict[str, Any] | None = Field(
+        default=None,
+        exclude=True,
+        json_schema_extra={
+            "deprecated": True,
+            "description": "Ephemeral adapter-only payload; excluded from serialization and persistence.",
+        },
+    )
     daily: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -95,11 +111,29 @@ class ScopeProfile(BaseModel):
     )
 
 
+class ForecastWindow(BaseModel):
+    start: str = ""
+    end: str = ""
+    timezone: str = "Asia/Shanghai"
+
+
 class TimeInfo(BaseModel):
     submit_time: str = ""
-    data_cutoff_time: str = ""
+    data_cutoff_time: str = Field(
+        default="",
+        json_schema_extra={
+            "deprecated": True,
+            "description": "Legacy alias for business_submission_deadline; not a provider data timestamp.",
+        },
+    )
     forecast_start: str = ""
     forecast_end: str = ""
+    retrieved_at: str = ""
+    provider_issued_at: dict[str, str | None] = Field(default_factory=dict)
+    aggregation_completed_at: str = ""
+    valid_time: ForecastWindow = Field(default_factory=ForecastWindow)
+    forecast_run_id: str = ""
+    business_submission_deadline: str = ""
 
 
 class DataProfile(BaseModel):
@@ -117,6 +151,7 @@ class WeatherPayload(BaseModel):
             "precipitation_probability": "%",
             "wind_speed": "m/s",
             "cloud_cover": "%",
+            "shortwave_radiation": "W/m²",
         }
     )
     values: list[ForecastPoint] = Field(default_factory=list)
@@ -149,7 +184,12 @@ class WeatherSubmission(BaseModel):
     scoring_profile: ScoringProfile = Field(default_factory=ScoringProfile)
     region: str
     target_date: str
-    data_cutoff_time: str
+    data_cutoff_time: str = Field(
+        json_schema_extra={
+            "deprecated": True,
+            "description": "Legacy alias for time_info.business_submission_deadline; not a provider data timestamp.",
+        }
+    )
     provider_results: list[ProviderForecast]
     aggregated_forecast: AggregatedForecast
     confidence: dict[str, Any]

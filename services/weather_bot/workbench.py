@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 
 from pydantic import BaseModel, Field
 
+from services.weather_bot.location import LocationResolutionError
 from services.weather_bot.models import ForecastRequest, WeatherSubmission
 from services.weather_bot.weather_metrics import normalize_weather_metrics
 
@@ -56,8 +57,14 @@ async def collect_forecasts_with_errors(service: Any, request: ForecastRequest) 
         current = request.model_copy(update={"target_date": target_date})
         try:
             submissions.append(await service.forecast(current))
-        except Exception as exc:  # noqa: BLE001 - range reports should preserve usable dates
-            errors.append({"target_date": target_date, "error": str(exc)})
+        except LocationResolutionError:
+            # A location error applies to the complete request, not one date in
+            # the range.  Preserve the typed error so the public event adapter
+            # can ask the user to clarify instead of labelling it a provider
+            # outage for every requested day.
+            raise
+        except Exception:  # noqa: BLE001 - range reports should preserve usable dates
+            errors.append({"target_date": target_date, "error": "forecast_unavailable"})
     return submissions, errors
 
 

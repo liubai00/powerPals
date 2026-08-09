@@ -1,17 +1,34 @@
+from services.weather_bot.config import Settings
 from services.weather_bot.models import ForecastPoint, ForecastRequest, ProviderForecast
 from services.weather_bot.service import ForecastService
 
 
 class FakeProvider:
-    def __init__(self, name: str, point: ForecastPoint):
+    def __init__(self, name: str, point: ForecastPoint, source_metadata: dict[str, str]):
         self.name = name
         self._point = point
+        self._source_metadata = source_metadata
+        self.source_endpoints = (source_metadata["source_url"],)
 
     async def fetch(self, request: ForecastRequest) -> ProviderForecast:
-        return ProviderForecast(provider=self.name, status="ok", points=[self._point])
+        return ProviderForecast(
+            provider=self.name,
+            status="ok",
+            points=[
+                self._point.model_copy(
+                    update={"time": f"{request.target_date}T{hour:02d}:00:00+08:00"}
+                )
+                for hour in range(24)
+            ],
+            **self._source_metadata,
+        )
 
 
-async def test_forecast_service_builds_standard_weather_submission():
+async def test_forecast_service_builds_standard_weather_submission(
+    external_source_metadata,
+    verified_test_source_registry,
+    test_source_clock,
+):
     service = ForecastService(
         providers={
             "open_meteo": FakeProvider(
@@ -23,6 +40,7 @@ async def test_forecast_service_builds_standard_weather_submission():
                     wind_speed=2.0,
                     cloud_cover=60.0,
                 ),
+                external_source_metadata("open_meteo"),
             ),
             "qweather": FakeProvider(
                 "qweather",
@@ -33,8 +51,17 @@ async def test_forecast_service_builds_standard_weather_submission():
                     wind_speed=4.0,
                     cloud_cover=80.0,
                 ),
+                external_source_metadata("qweather"),
             ),
-        }
+        },
+        settings=Settings(_env_file=None, app_env="test"),
+        source_registry=verified_test_source_registry(
+            {
+                "open_meteo": "https://open_meteo.weather.test/v1/forecast",
+                "qweather": "https://qweather.weather.test/v1/forecast",
+            }
+        ),
+        clock=test_source_clock,
     )
 
     result = await service.forecast(

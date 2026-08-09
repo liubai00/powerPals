@@ -17,9 +17,12 @@ from services.weather_bot.main import (
 )
 from services.weather_bot.models import (
     AggregatedForecast,
+    ForecastWindow,
     ForecastPoint,
     ForecastRequest,
     ForecastSummary,
+    ProviderForecast,
+    TimeInfo,
     WeatherSubmission,
 )
 from services.weather_bot.power_briefing import MARKET_POINTS
@@ -35,23 +38,43 @@ class CapturingForecastService:
         if self.failures_remaining:
             self.failures_remaining -= 1
             raise RuntimeError("simulated weather provider failure")
+        points = [
+            ForecastPoint(
+                time=f"{request.target_date}T12:00:00+08:00",
+                temperature=25.0,
+                precipitation_probability=10.0,
+                wind_speed=2.0,
+                cloud_cover=20.0,
+            )
+        ]
         return WeatherSubmission(
             task_id=f"task-{len(self.requests)}",
             region=request.region,
             target_date=request.target_date,
             data_cutoff_time="2026-07-27T08:00:00+08:00",
-            provider_results=[],
+            time_info=TimeInfo(
+                retrieved_at="2026-07-27T08:00:00+08:00",
+                provider_issued_at={"test": "2026-07-27T07:00:00+08:00"},
+                aggregation_completed_at="2026-07-27T08:00:01+08:00",
+                valid_time=ForecastWindow(
+                    start=f"{request.target_date}T00:00:00+08:00",
+                    end=f"{request.target_date}T23:00:00+08:00",
+                ),
+                forecast_run_id=f"source-run-{len(self.requests)}",
+            ),
+            provider_results=[
+                ProviderForecast(
+                    provider="test",
+                    points=points,
+                    retrieved_at="2026-07-27T08:00:00+08:00",
+                    provider_issued_at="2026-07-27T07:00:00+08:00",
+                    source_url="https://example.test/weather",
+                    content_sha256="a" * 64,
+                )
+            ],
             aggregated_forecast=AggregatedForecast(
                 providers_used=["test"],
-                points=[
-                    ForecastPoint(
-                        time=f"{request.target_date}T12:00:00+08:00",
-                        temperature=25.0,
-                        precipitation_probability=10.0,
-                        wind_speed=2.0,
-                        cloud_cover=20.0,
-                    )
-                ],
+                points=points,
                 summary=ForecastSummary(
                     max_temperature=28.0,
                     min_temperature=20.0,
@@ -74,6 +97,7 @@ def _settings() -> Settings:
         feishu_app_secret=None,
         feishu_verification_token=None,
         feishu_encrypt_key=None,
+        feishu_bot_open_id="ou_weather_bot",
         llm_api_key=None,
         power_briefing_cache_db=str(
             Path("data") / ".test-memory" / f"briefing-{uuid4().hex}.db"
@@ -99,7 +123,13 @@ def _event(
         "content": f'{{"text": "{text}"}}',
     }
     if chat_type == "group" and text.lstrip().startswith("@云云"):
-        message["mentions"] = [{"key": "@_user_1", "name": "云云"}]
+        message["mentions"] = [
+            {
+                "key": "@_user_1",
+                "id": {"open_id": "ou_weather_bot"},
+                "name": "云云",
+            }
+        ]
     if thread_id:
         message["thread_id"] = thread_id
     if root_id:
@@ -315,6 +345,38 @@ def test_group_reply_without_mention_only_works_for_recorded_bot_message(
     }
 
 
+def test_private_out_of_scope_chat_returns_capability_boundary_without_external_calls(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    sent_messages: list[str] = []
+
+    async def fail_external(*args, **kwargs):
+        raise AssertionError("out-of-scope chat must not call LLM, search, or typhoon APIs")
+
+    async def capture_text(_client, _chat_id: str, text: str, *args, **kwargs) -> str:
+        sent_messages.append(text)
+        return "boundary-message-id"
+
+    monkeypatch.setattr("services.weather_bot.llm.LlmClient.chat", fail_external)
+    monkeypatch.setattr("services.weather_bot.search.TavilySearchClient.search", fail_external)
+    monkeypatch.setattr("services.weather_bot.typhoon.TyphoonClient.brief_for_text", fail_external)
+    monkeypatch.setattr(FeishuClient, "send_text_message", capture_text)
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        result = _post(client, _event("讲个笑话", message_id="private-boundary"))
+
+    assert result["status"] == "handled"
+    assert result["mode"] == "capability_boundary"
+    assert "天气" in result["text"]
+    assert len(result["text"]) <= 120
+    assert service.requests == []
+    assert sent_messages == [result["text"]]
+
+
 def test_group_reply_marker_is_isolated_by_bot_role(
     monkeypatch,
     isolated_db_path,
@@ -349,6 +411,55 @@ def test_group_reply_marker_is_isolated_by_bot_role(
     }
 
 
+def test_reply_to_recorded_briefing_explains_from_the_same_snapshot_without_refetch(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+
+    async def fail_external(*args, **kwargs):
+        raise AssertionError("briefing explanation must not call LLM, search, or live weather")
+
+    monkeypatch.setattr("services.weather_bot.llm.LlmClient.chat", fail_external)
+    monkeypatch.setattr("services.weather_bot.search.TavilySearchClient.search", fail_external)
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    def post_weather(client: TestClient, payload: dict) -> dict:
+        response = client.post("/feishu/events/weather", json=payload)
+        assert response.status_code == 200
+        return response.json()
+
+    with TestClient(app) as client:
+        generated = post_weather(
+            client,
+            _event(
+                "@云云 生成今天的电力气象决策晨报 2.0",
+                message_id="briefing-explain-seed",
+                chat_type="group",
+            ),
+        )
+        requests_after_generation = len(service.requests)
+        explained = post_weather(
+            client,
+            _event(
+                "为什么风险升高",
+                message_id="briefing-explain-question",
+                chat_type="group",
+                root_id=generated["event_reply_message_id"],
+            ),
+        )
+
+    assert generated["status"] == "handled"
+    assert explained["status"] == "handled"
+    assert explained["mode"] == "power_briefing_explain"
+    assert explained["cache_hit"] is True
+    assert explained["briefing_cache_key"] == generated["briefing_cache_key"]
+    assert explained["generated_at"] == generated["generated_at"]
+    assert "同一份晨报快照" in explained["text"]
+    assert len(service.requests) == requests_after_generation
+
+
 def test_duplicate_event_is_deduplicated_across_app_restart(monkeypatch, isolated_db_path) -> None:
     _patch_isolated_memory(monkeypatch, isolated_db_path)
     service = CapturingForecastService()
@@ -381,6 +492,33 @@ def test_event_processing_lease_covers_nationwide_briefing_window(
     assert weather_memory.claim_event("weather", "long-briefing")
 
 
+def test_briefing_context_has_independent_36_hour_ttl(monkeypatch, tmp_path):
+    monkeypatch.setattr(weather_memory, "DB_PATH", str(tmp_path / "memory.db"))
+    now = [1_000_000.0]
+    monkeypatch.setattr(weather_memory.time, "time", lambda: now[0])
+    conversation_key = "weather_forecast_bot|group|chat-a|main|user-a"
+    weather_memory.save_conversation_state(
+        conversation_key,
+        {"state_version": 2, "last_successful_request": {"region": "广州"}},
+        ttl_seconds=weather_memory.GROUP_QUERY_TTL_SECONDS,
+    )
+    weather_memory.save_briefing_context(
+        conversation_key,
+        {"last_power_briefing_cache_key": "briefing-cache-key"},
+    )
+
+    now[0] += weather_memory.GROUP_QUERY_TTL_SECONDS + 1
+
+    assert weather_memory.load_conversation_state(conversation_key) is None
+    assert weather_memory.load_briefing_context(conversation_key) == {
+        "last_power_briefing_cache_key": "briefing-cache-key"
+    }
+
+    now[0] = 1_000_000.0 + weather_memory.BRIEFING_CONTEXT_TTL_SECONDS
+
+    assert weather_memory.load_briefing_context(conversation_key) is None
+
+
 def test_failed_event_can_be_retried_with_same_event_id(monkeypatch, isolated_db_path) -> None:
     _patch_isolated_memory(monkeypatch, isolated_db_path)
     service = CapturingForecastService()
@@ -395,6 +533,458 @@ def test_failed_event_can_be_retried_with_same_event_id(monkeypatch, isolated_db
     assert first["status"] == "error_fallback"
     assert second["status"] == "handled"
     assert len(service.requests) == 2
+
+
+def test_pending_region_clarification_survives_app_restart(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+
+    app1 = create_app(settings=_settings(), forecast_service=service)
+    with TestClient(app1) as client:
+        first = _post(
+            client,
+            _event("预测下最近四天的气象数据", message_id="clarify-before-restart"),
+        )
+
+    app2 = create_app(settings=_settings(), forecast_service=service)
+    with TestClient(app2) as client:
+        second = _post(
+            client,
+            _event("广州", message_id="clarify-after-restart"),
+        )
+
+    assert first["status"] == "needs_region"
+    assert second["status"] == "handled"
+    assert second["days"] == 4
+    assert [request.region for request in service.requests] == ["广州"] * 4
+
+
+def test_pending_region_clarification_expires_at_ten_minutes(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(weather_memory.time, "time", lambda: clock["now"])
+
+    weather_memory.save_pending_clarification(
+        "weather_forecast_bot|p2p|chat-a|main|user-a",
+        {"command_type": "forecast", "days": 4},
+    )
+    clock["now"] += 600
+
+    assert (
+        weather_memory.load_pending_clarification(
+            "weather_forecast_bot|p2p|chat-a|main|user-a"
+        )
+        is None
+    )
+
+
+def test_group_weather_context_expires_at_thirty_minutes(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(weather_memory.time, "time", lambda: clock["now"])
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        _post(
+            client,
+            _event(
+                "@云云 广州天气",
+                message_id="group-context-before-expiry",
+                chat_type="group",
+            ),
+        )
+        requests_before_followup = len(service.requests)
+        clock["now"] += 30 * 60
+        result = _post(
+            client,
+            _event(
+                "@云云 明天呢",
+                message_id="group-context-at-expiry",
+                chat_type="group",
+            ),
+        )
+
+    assert len(service.requests) == requests_before_followup
+    assert result.get("region") is None
+
+
+def test_direct_weather_context_lasts_until_twenty_four_hour_boundary(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(weather_memory.time, "time", lambda: clock["now"])
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        _post(
+            client,
+            _event("广州天气", message_id="direct-a-seed", sender_id="user-a"),
+        )
+        _post(
+            client,
+            _event("上海天气", message_id="direct-b-seed", sender_id="user-b"),
+        )
+        clock["now"] += 24 * 3600 - 1
+        _post(
+            client,
+            _event("那明天呢", message_id="direct-a-before-expiry", sender_id="user-a"),
+        )
+        requests_before_expired_followup = len(service.requests)
+        clock["now"] += 1
+        expired = _post(
+            client,
+            _event("那明天呢", message_id="direct-b-at-expiry", sender_id="user-b"),
+        )
+
+    assert service.requests[-1].region == "广州"
+    assert len(service.requests) == requests_before_expired_followup
+    assert expired.get("region") is None
+
+
+def test_cancel_clears_pending_region_clarification(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        _post(
+            client,
+            _event("预测下最近四天的气象数据", message_id="cancel-pending-seed"),
+        )
+        cancelled = _post(
+            client,
+            _event("取消", message_id="cancel-pending-command"),
+        )
+        city_after_cancel = _post(
+            client,
+            _event("广州", message_id="cancel-pending-city"),
+        )
+
+    assert cancelled["status"] == "handled"
+    assert cancelled["mode"] == "clarification_cancelled"
+    assert service.requests == []
+    assert city_after_cancel.get("days") is None
+
+
+@pytest.mark.parametrize(
+    "interrupting_text",
+    ["重新查，不要沿用刚才的", "云云能做什么"],
+)
+def test_reset_or_help_clears_pending_region_clarification(
+    monkeypatch,
+    isolated_db_path,
+    interrupting_text: str,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        _post(
+            client,
+            _event("预测下最近四天的气象数据", message_id="interrupt-pending-seed"),
+        )
+        _post(
+            client,
+            _event(interrupting_text, message_id="interrupt-pending-command"),
+        )
+        city_after_interrupt = _post(
+            client,
+            _event("广州", message_id="interrupt-pending-city"),
+        )
+
+    assert service.requests == []
+    assert city_after_interrupt.get("days") is None
+
+
+def test_pending_clarification_is_isolated_by_full_conversation_scope(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    def post_to(client: TestClient, path: str, payload: dict) -> dict:
+        response = client.post(path, json=payload)
+        assert response.status_code == 200
+        return response.json()
+
+    with TestClient(app) as client:
+        seed = post_to(
+            client,
+            "/feishu/events/weather",
+            _event(
+                "预测下最近四天的气象数据",
+                message_id="scope-seed",
+                chat_id="chat-a",
+                sender_id="user-a",
+                thread_id="thread-a",
+            ),
+        )
+        post_to(
+            client,
+            "/feishu/events/weather",
+            _event(
+                "广州",
+                message_id="scope-other-user",
+                chat_id="chat-a",
+                sender_id="user-b",
+                thread_id="thread-a",
+            ),
+        )
+        post_to(
+            client,
+            "/feishu/events/weather",
+            _event(
+                "广州",
+                message_id="scope-other-chat",
+                chat_id="chat-b",
+                sender_id="user-a",
+                thread_id="thread-a",
+            ),
+        )
+        post_to(
+            client,
+            "/feishu/events/weather",
+            _event(
+                "广州",
+                message_id="scope-other-thread",
+                chat_id="chat-a",
+                sender_id="user-a",
+                thread_id="thread-b",
+            ),
+        )
+        post_to(
+            client,
+            "/feishu/events/weather",
+            _event(
+                "@云云 广州",
+                message_id="scope-other-chat-type",
+                chat_id="chat-a",
+                sender_id="user-a",
+                chat_type="group",
+                thread_id="thread-a",
+            ),
+        )
+        post_to(
+            client,
+            "/feishu/events/task",
+            _event(
+                "广州",
+                message_id="scope-other-bot-role",
+                chat_id="chat-a",
+                sender_id="user-a",
+                thread_id="thread-a",
+            ),
+        )
+        matching = post_to(
+            client,
+            "/feishu/events/weather",
+            _event(
+                "广州",
+                message_id="scope-matching",
+                chat_id="chat-a",
+                sender_id="user-a",
+                thread_id="thread-a",
+            ),
+        )
+
+    assert seed["status"] == "needs_region"
+    assert matching["status"] == "handled"
+    assert matching["days"] == 4
+    assert [request.region for request in service.requests] == ["广州"] * 4
+
+
+def test_help_clears_only_the_matching_five_dimension_pending_state(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    def post_weather(client: TestClient, payload: dict) -> dict:
+        response = client.post("/feishu/events/weather", json=payload)
+        assert response.status_code == 200
+        return response.json()
+
+    with TestClient(app) as client:
+        first_a = post_weather(
+            client,
+            _event(
+                "@云云 预测下最近四天的气象数据",
+                message_id="pending-a",
+                chat_type="group",
+                thread_id="thread-a",
+                sender_id="user-a",
+            ),
+        )
+        first_b = post_weather(
+            client,
+            _event(
+                "@云云 预测下最近四天的气象数据",
+                message_id="pending-b",
+                chat_type="group",
+                thread_id="thread-a",
+                sender_id="user-b",
+            ),
+        )
+        help_a = post_weather(
+            client,
+            _event(
+                "@云云 云云能做什么",
+                message_id="help-a",
+                chat_type="group",
+                thread_id="thread-a",
+                sender_id="user-a",
+            ),
+        )
+        after_help_a = post_weather(
+            client,
+            _event(
+                "@云云 广州",
+                message_id="city-a",
+                chat_type="group",
+                thread_id="thread-a",
+                sender_id="user-a",
+            ),
+        )
+        still_pending_b = post_weather(
+            client,
+            _event(
+                "@云云 广州",
+                message_id="city-b",
+                chat_type="group",
+                thread_id="thread-a",
+                sender_id="user-b",
+            ),
+        )
+
+    assert first_a["status"] == "needs_region"
+    assert first_b["status"] == "needs_region"
+    assert help_a["status"] == "handled"
+    assert after_help_a["status"] == "ignored"
+    assert still_pending_b["status"] == "handled"
+    assert still_pending_b["days"] == 4
+    assert [request.region for request in service.requests] == ["广州"] * 4
+
+
+def test_failed_provider_request_does_not_replace_last_successful_context(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        _post(client, _event("广州天气", message_id="success-before-failure"))
+        service.failures_remaining = 1
+        failed = _post(client, _event("换成北京", message_id="provider-failure"))
+        _post(client, _event("那明天呢", message_id="followup-after-failure"))
+
+    assert failed["status"] == "error_fallback"
+    assert [request.region for request in service.requests] == ["广州", "北京", "广州"]
+
+
+def test_retry_replays_the_failed_request_without_overwriting_last_successful_context(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        _post(client, _event("广州天气", message_id="retry-success-seed"))
+        service.failures_remaining = 2
+        failed = _post(client, _event("换成北京", message_id="retry-failed-request"))
+        retried = _post(client, _event("重试一下", message_id="retry-pending-request"))
+        inherited = _post(client, _event("那明天呢", message_id="retry-last-success"))
+
+    assert failed["status"] == "error_fallback"
+    assert retried["status"] == "error_fallback"
+    assert inherited["status"] == "handled"
+    assert [request.region for request in service.requests] == ["广州", "北京", "北京", "广州"]
+
+
+def test_failed_request_retry_expires_after_ten_minutes(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(weather_memory.time, "time", lambda: clock["now"])
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        _post(client, _event("广州天气", message_id="retry-expiry-success"))
+        service.failures_remaining = 1
+        _post(client, _event("换成北京", message_id="retry-expiry-failure"))
+        requests_before_expired_retry = len(service.requests)
+        clock["now"] += weather_memory.RETRY_REQUEST_TTL_SECONDS
+        expired = _post(client, _event("重试一下", message_id="retry-expired"))
+        inherited = _post(client, _event("那明天呢", message_id="retry-expiry-followup"))
+
+    assert expired["status"] == "handled"
+    assert expired["mode"] == "retry_unavailable"
+    assert inherited["status"] == "handled"
+    assert len(service.requests) == requests_before_expired_retry + 1
+    assert service.requests[-1].region == "广州"
+
+
+def test_addressed_group_can_complete_its_own_pending_clarification(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/feishu/events/weather",
+            json=_event(
+                "@云云 预测下最近四天的气象数据",
+                message_id="group-pending-seed",
+                chat_type="group",
+                thread_id="thread-a",
+            ),
+        )
+        second = client.post(
+            "/feishu/events/weather",
+            json=_event(
+                "@云云 广州",
+                message_id="group-pending-city",
+                chat_type="group",
+                thread_id="thread-a",
+            ),
+        )
+
+    assert first.status_code == 200
+    assert first.json()["status"] == "needs_region"
+    assert second.status_code == 200
+    assert second.json()["status"] == "handled"
+    assert second.json()["days"] == 4
+    assert [request.region for request in service.requests] == ["广州"] * 4
 
 
 def test_root_message_id_is_used_as_thread_fallback() -> None:
@@ -461,7 +1051,7 @@ def test_manual_power_briefing_command_returns_card_without_region_clarification
     assert result["coverage"]["provincial_areas"] == {"covered": 31, "total": 31}
     assert result["coverage"]["markets"]["covered"] == 33
     assert result["coverage"]["points"] == {"covered": 75, "total": 75, "missing": 0}
-    assert result["card"]["card"]["header"]["title"]["content"].startswith("⚡ 电力气象决策晨报 2.0")
+    assert result["card"]["card"]["header"]["title"]["content"].startswith("⚡ 电力气象决策晨报 3.0")
     assert len(service.requests) == len(MARKET_POINTS) * 2
 
 
@@ -469,6 +1059,8 @@ def test_manual_power_briefing_command_returns_card_without_region_clarification
     ("text", "expected"),
     [
         ("生成今天的电力气象决策晨报 2.0", True),
+        ("生成今天的电力气象决策晨报 3.0", True),
+        ("晨报3.0", True),
         ("今天的电力气象晨报", True),
         ("预览晨报2.0", True),
         ("电力气象晨报应该包含什么", False),
@@ -703,3 +1295,28 @@ def test_explicit_start_date_keeps_requested_window() -> None:
     assert days == 3
     assert requested_days == 3
     assert status == "ok"
+
+
+def test_task_bot_followup_never_inherits_weather_bot_location(
+    monkeypatch,
+    isolated_db_path,
+) -> None:
+    """The five-dimensional context key must include the addressed bot role."""
+    _patch_isolated_memory(monkeypatch, isolated_db_path)
+    service = CapturingForecastService()
+    app = create_app(settings=_settings(), forecast_service=service)
+
+    with TestClient(app) as client:
+        weather_result = client.post(
+            "/feishu/events/weather",
+            json=_event("广州天气", message_id="cross-bot-weather-seed"),
+        ).json()
+        task_result = client.post(
+            "/feishu/events/task",
+            json=_event("明天呢", message_id="cross-bot-task-followup"),
+        ).json()
+
+    assert weather_result["status"] == "handled"
+    assert len(service.requests) == 1
+    assert task_result.get("mode") != "redirect"
+    assert task_result["bot_role"] == "weather_task_bot"

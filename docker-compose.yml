@@ -9,7 +9,7 @@ services:
       - path: .env
         required: false
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     volumes:
       - ./data:/app/data
     restart: unless-stopped

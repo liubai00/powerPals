@@ -8,8 +8,27 @@ class FakeForecastService:
     pass
 
 
+ADMIN_HEADERS = {"Authorization": "Bearer test-admin-token"}
+
+
+def _admin_settings(**overrides) -> Settings:
+    return Settings(
+        _env_file=None,
+        admin_api_token="test-admin-token",
+        global_feishu_send_enabled=True,
+        **overrides,
+    )
+
+
+def _admin_client(settings: Settings | None = None) -> TestClient:
+    return TestClient(
+        create_app(forecast_service=FakeForecastService(), settings=settings or _admin_settings()),
+        headers=ADMIN_HEADERS,
+    )
+
+
 def test_create_weather_task_endpoint_returns_task_contract():
-    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    client = _admin_client()
 
     response = client.post("/api/tasks/weather/create", json={"target_date": "2026-06-10"})
 
@@ -21,7 +40,7 @@ def test_create_weather_task_endpoint_returns_task_contract():
 
 
 def test_publish_weather_task_endpoint_returns_task_card():
-    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    client = _admin_client()
 
     response = client.post("/api/tasks/weather/publish", json={"target_date": "2026-06-10"})
 
@@ -33,7 +52,7 @@ def test_publish_weather_task_endpoint_returns_task_card():
 
 
 def test_publish_weather_task_endpoint_supports_multi_day_task():
-    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    client = _admin_client()
 
     response = client.post("/api/tasks/weather/publish", json={"target_date": "2026-06-10", "days": 3})
 
@@ -47,8 +66,8 @@ def test_publish_weather_task_endpoint_supports_multi_day_task():
 
 def test_publish_weather_task_records_local_task_jsonl(tmp_path):
     task_log = tmp_path / "weather_tasks.jsonl"
-    settings = Settings(local_task_jsonl_path=str(task_log))
-    client = TestClient(create_app(forecast_service=FakeForecastService(), settings=settings))
+    settings = _admin_settings(local_task_jsonl_path=str(task_log))
+    client = _admin_client(settings)
 
     response = client.post("/api/tasks/weather/publish", json={"target_date": "2026-06-10"})
 
@@ -58,7 +77,7 @@ def test_publish_weather_task_records_local_task_jsonl(tmp_path):
 
 
 def test_get_weather_task_returns_created_national_task():
-    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    client = _admin_client()
     created = client.post("/api/tasks/weather/create", json={"region": "广州", "target_date": "2026-06-10"}).json()
 
     response = client.get(f"/api/tasks/weather/{created['task_id']}")
@@ -71,7 +90,7 @@ def test_get_weather_task_returns_created_national_task():
 
 
 def test_get_weather_task_returns_created_coordinate_task():
-    client = TestClient(create_app(forecast_service=FakeForecastService()))
+    client = _admin_client()
     created = client.post(
         "/api/tasks/weather/create",
         json={
@@ -94,8 +113,8 @@ def test_get_weather_task_returns_created_coordinate_task():
 
 def test_get_weather_task_loads_published_coordinate_task_from_local_jsonl_after_restart(tmp_path):
     task_log = tmp_path / "weather_tasks.jsonl"
-    settings = Settings(local_task_jsonl_path=str(task_log))
-    client = TestClient(create_app(forecast_service=FakeForecastService(), settings=settings))
+    settings = _admin_settings(local_task_jsonl_path=str(task_log))
+    client = _admin_client(settings)
     published = client.post(
         "/api/tasks/weather/publish",
         json={
@@ -131,4 +150,5 @@ def test_feishu_event_today_weather_task_without_region_asks_for_region():
     assert body["status"] == "needs_region"
     assert body["bot_role"] == "weather_task_bot"
     assert body["mode"] == "clarification"
-    assert "缺少城市或区域" in body["text"]
+    assert "还差一个地点" in body["text"]
+    assert "城市 / 区县 / 经纬度" in body["text"]

@@ -90,3 +90,24 @@ async def test_send_message_refreshes_token_after_invalid_token() -> None:
     message_calls = [kwargs for url, kwargs in FakeAsyncClient.calls if "/im/v1/messages" in url]
     assert message_calls[0]["headers"]["Authorization"] == "Bearer stale-token"
     assert message_calls[1]["headers"]["Authorization"] == "Bearer fresh-token"
+
+
+async def test_send_message_forwards_the_caller_idempotency_key_as_feishu_uuid() -> None:
+    FakeAsyncClient.responses = [
+        FakeResponse({"code": 0, "tenant_access_token": "token-1", "expire": 7200}),
+        FakeResponse({"code": 0, "data": {"message_id": "om_1"}}),
+    ]
+    client = _client()
+    stable_uuid = "5c2a0869-225f-542f-8529-eb721f5030cb"
+
+    await client.send_message(
+        "oc_chat",
+        "text",
+        {"text": "hi"},
+        idempotency_key=stable_uuid,
+    )
+
+    message_call = next(
+        kwargs for url, kwargs in FakeAsyncClient.calls if "/im/v1/messages" in url
+    )
+    assert message_call["json"]["uuid"] == stable_uuid

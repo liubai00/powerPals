@@ -1,5 +1,10 @@
+import asyncio
+from contextlib import suppress
 from datetime import date
 
+import pytest
+
+from services.weather_bot import scheduler
 from services.weather_bot.config import Settings
 from services.weather_bot.scheduler import build_daily_action_plan
 from services.weather_bot.scheduler import _forecast_request, _task_request
@@ -50,3 +55,59 @@ def test_scheduler_uses_configured_default_coordinates():
     assert task_request.longitude == 113.5252
     assert forecast_request.latitude == 22.8016
     assert forecast_request.longitude == 113.5252
+
+
+@pytest.mark.asyncio
+async def test_legacy_weather_scheduler_is_inert_by_default_even_when_global_send_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, global_feishu_send_enabled=True)
+    app_creations: list[str] = []
+
+    class InertApp:
+        routes: list[object] = []
+
+    monkeypatch.setattr(scheduler, "Settings", lambda: settings)
+    monkeypatch.setattr(
+        scheduler,
+        "create_app",
+        lambda: app_creations.append("created") or InertApp(),
+    )
+
+    task = asyncio.create_task(scheduler.run_community_rhythm_loop())
+    try:
+        await asyncio.sleep(0)
+        assert app_creations == []
+        assert not task.done()
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_legacy_daily_publish_loop_uses_the_same_independent_default_off_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, global_feishu_send_enabled=True)
+    app_creations: list[str] = []
+
+    class InertApp:
+        routes: list[object] = []
+
+    monkeypatch.setattr(scheduler, "Settings", lambda: settings)
+    monkeypatch.setattr(
+        scheduler,
+        "create_app",
+        lambda: app_creations.append("created") or InertApp(),
+    )
+
+    task = asyncio.create_task(scheduler.run_daily_publish_loop())
+    try:
+        await asyncio.sleep(0)
+        assert app_creations == []
+        assert not task.done()
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, RuntimeError):
+            await task

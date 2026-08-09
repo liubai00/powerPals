@@ -33,6 +33,9 @@ def build_daily_action_plan(run_date: date) -> list[ScheduledAction]:
 
 async def run_daily_publish_loop() -> None:
     settings = Settings()
+    if not settings.legacy_weather_scheduler_enabled:
+        await asyncio.Future()
+        return
     app = create_app()
     publish = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/api/weather/publish")
     while True:
@@ -43,6 +46,11 @@ async def run_daily_publish_loop() -> None:
 
 async def run_community_rhythm_loop() -> None:
     settings = Settings()
+    if not settings.legacy_weather_scheduler_enabled:
+        # Compose may keep this legacy service running for rollback compatibility,
+        # but it must remain inert until its own opt-in is explicitly reviewed.
+        await asyncio.Future()
+        return
     app = create_app()
     endpoints = {getattr(route, "path", ""): route.endpoint for route in app.routes}
     while True:

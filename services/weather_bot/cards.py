@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlencode
 
 from services.weather_bot.models import WeatherSubmission
 from services.weather_bot.weather_metrics import SUPPORTED_WEATHER_METRIC_ORDER, normalize_weather_metrics
+
+
+SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 
 def to_feishu_lark_md(text: str) -> str:
@@ -39,6 +43,10 @@ def build_text_reply_card(text: str) -> dict:
 
 def build_text_summary(submission: WeatherSubmission) -> str:
     summary = submission.aggregated_forecast.summary
+    retrieved_at = submission.time_info.retrieved_at or "未记录"
+    business_submission_deadline = (
+        submission.time_info.business_submission_deadline or submission.data_cutoff_time
+    )
     return "\n".join(
         [
             f"【正式提交｜{submission.region}气象预测】",
@@ -46,7 +54,8 @@ def build_text_summary(submission: WeatherSubmission) -> str:
             f"任务 ID：{submission.task_id}",
             f"区域：{submission.region}",
             f"预测日：{submission.target_date}",
-            f"数据截止：{submission.data_cutoff_time}",
+            f"数据抓取时间：{retrieved_at}",
+            f"业务提交截止：{business_submission_deadline}",
             f"数据来源：{' / '.join(submission.aggregated_forecast.providers_used)}",
             "",
             "核心结果：",
@@ -188,7 +197,7 @@ def _risk_banner(chart_items) -> str | None:
 
 
 def _insight_text(chart_items) -> str:
-    """电力视角解读: 负荷 / 风电 / 光伏 三要素, 最多三条一行。"""
+    """只描述气象侧代理，不将天气直接解释为真实供需、出力或价格。"""
     summaries = [item.aggregated_forecast.summary for item in chart_items]
     rains = [s.rain_probability or 0 for s in summaries]
     temps = [s.max_temperature or 0 for s in summaries]
@@ -196,25 +205,26 @@ def _insight_text(chart_items) -> str:
     clouds = [s.cloud_cover or 0 for s in summaries]
     bits = []
     if max(temps) >= 35:
-        bits.append("高温拉动制冷负荷，晚峰供需偏紧")
+        bits.append("高温使负荷天气压力代理升高")
     elif max(temps) >= 32:
-        bits.append("气温偏高，制冷负荷有支撑")
+        bits.append("气温偏高，负荷天气压力代理偏强")
     elif len(temps) >= 2 and temps[0] - temps[-1] >= 5:
-        bits.append("显著降温，负荷结构生变")
+        bits.append("显著降温，负荷天气压力代理发生变化")
     peak_wind = max(winds)
     if peak_wind >= 12:
-        bits.append("风资源强，风电出力预计偏高、现货或承压")
+        bits.append("10米地面风资源代理偏强")
     elif peak_wind >= 8:
-        bits.append("风电出力中等偏上")
+        bits.append("10米地面风资源代理中等偏强")
     elif peak_wind <= 4:
-        bits.append("风资源弱，风电出力有限")
+        bits.append("10米地面风资源代理偏弱")
     if max(rains) >= 60 or min(clouds) >= 80:
-        bits.append("阴雨压制光伏出力，午间电价有支撑")
+        bits.append("云量和降水使光资源代理转弱")
     elif max(clouds) <= 40:
-        bits.append("晴多云为主，光伏大发压低午间")
+        bits.append("少云条件下光资源代理偏强")
     if not bits:
-        bits.append("气象面平稳，供需扰动有限")
-    return "💡 " + "，".join(bits[:3])
+        bits.append("负荷天气压力代理、10米地面风资源代理和光资源代理整体平稳")
+    boundary = "实际负荷、风光出力、供需和价格方向待结合电力数据核查"
+    return "💡 " + "；".join([*bits[:3], boundary])
 
 
 def build_feishu_card(
@@ -241,7 +251,12 @@ def build_feishu_card(
         first_lines.append(f"**任务 ID**：{submission.task_id}")
     first_lines.append(_glance_line(chart_items[0]))
     scope_bits = [date_label if len(date_labels) > 1 else f"预测日 {date_label}"]
-    scope_bits.append(f"数据截止 {_fmt_cutoff(submission.data_cutoff_time)}")
+    retrieved_at = submission.time_info.retrieved_at
+    scope_bits.append(f"抓取时间 {_fmt_cutoff(retrieved_at) if retrieved_at else '未记录'}")
+    business_submission_deadline = (
+        submission.time_info.business_submission_deadline or submission.data_cutoff_time
+    )
+    scope_bits.append(f"业务提交截止 {_fmt_cutoff(business_submission_deadline)}")
     scope_bits.append("来源 " + " / ".join(submission.aggregated_forecast.providers_used))
     _sm = submission.aggregated_forecast.summary
     if _sm.sunrise and _sm.sunset:
@@ -481,6 +496,13 @@ def _forecast_detail_content(submission: WeatherSubmission, metrics: list[str] |
 
 def _fmt_cutoff(value: object) -> str:
     v = str(value or "")
+    if v:
+        try:
+            parsed = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                return parsed.astimezone(SHANGHAI_TZ).strftime("%m-%d %H:%M")
+        except ValueError:
+            pass
     if "T" in v and len(v) >= 16:
         return v[5:10] + " " + v[11:16]
     return v

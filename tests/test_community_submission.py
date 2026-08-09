@@ -1,3 +1,4 @@
+from services.weather_bot.config import Settings
 from services.weather_bot.models import ForecastPoint, ForecastRequest, ProviderForecast
 from services.weather_bot.service import ForecastService
 
@@ -5,24 +6,42 @@ from services.weather_bot.service import ForecastService
 class FakeProvider:
     name = "open_meteo"
 
+    def __init__(self, source_metadata: dict[str, str]):
+        self._source_metadata = source_metadata
+        self.source_endpoints = (source_metadata["source_url"],)
+
     async def fetch(self, request: ForecastRequest) -> ProviderForecast:
         return ProviderForecast(
             provider=self.name,
             status="ok",
             points=[
                 ForecastPoint(
-                    time="2026-06-10T00:00:00+08:00",
+                    time=f"{request.target_date}T{hour:02d}:00:00+08:00",
                     temperature=28.0,
                     precipitation_probability=30.0,
                     wind_speed=3.0,
                     cloud_cover=70.0,
                 )
+                for hour in range(24)
             ],
+            **self._source_metadata,
         )
 
 
-async def test_forecast_service_outputs_document_style_official_submission():
-    result = await ForecastService(providers={"open_meteo": FakeProvider()}).forecast(
+async def test_forecast_service_outputs_document_style_official_submission(
+    external_source_metadata,
+    verified_test_source_registry,
+    test_source_clock,
+):
+    service = ForecastService(
+        providers={"open_meteo": FakeProvider(external_source_metadata("open_meteo"))},
+        settings=Settings(_env_file=None, app_env="test"),
+        source_registry=verified_test_source_registry(
+            {"open_meteo": "https://open_meteo.weather.test/v1/forecast"}
+        ),
+        clock=test_source_clock,
+    )
+    result = await service.forecast(
         ForecastRequest(region="深圳", target_date="2026-06-10", providers=["open_meteo"])
     )
 

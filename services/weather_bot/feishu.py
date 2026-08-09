@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
+import hmac
 import time
 from typing import Any
 
 import httpx
 
 from services.weather_bot.config import Settings
+from services.weather_bot.data_minimization import minimize_submission_for_storage
 from services.weather_bot.models import WeatherSubmission
 from services.weather_bot.tasks import WeatherTask
 
@@ -40,6 +42,8 @@ class FeishuBotAccount:
     verification_token: str | None = None
     encrypt_key: str | None = None
     default_chat_id: str | None = None
+    bot_open_id: str | None = None
+    allow_name_mention_fallback: bool = False
     name: str = ""
 
 
@@ -54,6 +58,8 @@ class FeishuClient:
             verification_token=self.settings.feishu_verification_token,
             encrypt_key=self.settings.feishu_encrypt_key,
             default_chat_id=self.settings.feishu_default_chat_id,
+            bot_open_id=self.settings.feishu_bot_open_id,
+            allow_name_mention_fallback=self.settings.feishu_allow_legacy_name_mentions,
             name="legacy",
         )
         self._tenant_access_token: str | None = None
@@ -74,9 +80,11 @@ class FeishuClient:
                 },
             )
             response.raise_for_status()
-            body = response.json()
+        body = response.json()
         if body.get("code", 0) != 0:
-            raise RuntimeError(f"Feishu tenant access token failed: {body}")
+            raise RuntimeError(
+                f"Feishu tenant access token failed code={_safe_error_code(body)}"
+            )
         self._tenant_access_token = body["tenant_access_token"]
         self._tenant_access_token_expires_at = time.monotonic() + self._token_cache_ttl(body.get("expire"))
         return self._tenant_access_token
@@ -92,36 +100,59 @@ class FeishuClient:
             expire_seconds = 7200
         return max(60, expire_seconds - self._TOKEN_REFRESH_SKEW_SECONDS)
 
-    async def send_interactive_card(self, chat_id: str, card: dict[str, Any]) -> str:
-        body = await self.send_message(chat_id, "interactive", card["card"])
+    async def send_interactive_card(
+        self,
+        chat_id: str,
+        card: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> str:
+        body = await self.send_message(
+            chat_id,
+            "interactive",
+            card["card"],
+            idempotency_key=idempotency_key,
+        )
         return body.get("data", {}).get("message_id", "")
 
     async def send_text_message(self, chat_id: str, text: str) -> str:
         body = await self.send_message(chat_id, "text", {"text": text})
         return body.get("data", {}).get("message_id", "")
 
-    async def send_message(self, chat_id: str, msg_type: str, content: dict[str, Any]) -> dict[str, Any]:
+    async def send_message(
+        self,
+        chat_id: str,
+        msg_type: str,
+        content: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         for attempt in range(2):
             token = await self.tenant_access_token()
+            payload = {"receive_id": chat_id, "msg_type": msg_type, "content": json_dumps(content)}
+            if idempotency_key:
+                payload["uuid"] = idempotency_key
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await _post_with_retry(client, 
                     "https://open.feishu.cn/open-apis/im/v1/messages",
                     params={"receive_id_type": "chat_id"},
                     headers={"Authorization": f"Bearer {token}"},
-                    json={"receive_id": chat_id, "msg_type": msg_type, "content": json_dumps(content)},
+                    json=payload,
                 )
             if response.status_code >= 400:
                 if attempt == 0 and _is_invalid_access_token(response):
                     self._clear_tenant_access_token()
                     continue
-                raise RuntimeError(f"Feishu send message HTTP {response.status_code}: {response.text}")
+                raise RuntimeError(f"Feishu send message HTTP {response.status_code}")
 
             body = response.json()
             if body.get("code", 0) == 99991663 and attempt == 0:
                 self._clear_tenant_access_token()
                 continue
             if body.get("code", 0) != 0:
-                raise RuntimeError(f"Feishu send message failed: {body}")
+                raise RuntimeError(
+                    f"Feishu send message failed code={_safe_error_code(body)}"
+                )
             return body
 
     async def reply_interactive_card(self, message_id: str, card: dict[str, Any], in_thread: bool = False) -> str:
@@ -145,13 +176,15 @@ class FeishuClient:
                 if attempt == 0 and _is_invalid_access_token(response):
                     self._clear_tenant_access_token()
                     continue
-                raise RuntimeError(f"Feishu reply message HTTP {response.status_code}: {response.text}")
+                raise RuntimeError(f"Feishu reply message HTTP {response.status_code}")
             body = response.json()
             if body.get("code", 0) == 99991663 and attempt == 0:
                 self._clear_tenant_access_token()
                 continue
             if body.get("code", 0) != 0:
-                raise RuntimeError(f"Feishu reply message failed: {body}")
+                raise RuntimeError(
+                    f"Feishu reply message failed code={_safe_error_code(body)}"
+                )
             return body
 
         raise RuntimeError("Feishu send message failed after token refresh")
@@ -186,12 +219,46 @@ class FeishuClient:
             response.raise_for_status()
 
 
-def verify_feishu_token(payload: dict[str, Any], expected_token: str | None) -> bool:
+def verify_feishu_token(
+    payload: dict[str, Any],
+    expected_token: str | None,
+    *,
+    allow_unsigned: bool = False,
+) -> bool:
+    """Authenticate a Feishu callback before any event-controlled side effect.
+
+    An absent verification token is not authentication.  Unsigned callbacks are
+    accepted only when the caller has already established an explicit local/test
+    bypass; a configured token always wins over that bypass.
+    """
+
     if not expected_token:
-        return True
+        return allow_unsigned
     header = payload.get("header", {})
     token = header.get("token") if isinstance(header, dict) else None
-    return payload.get("token") == expected_token or token == expected_token
+    candidates = (payload.get("token"), token)
+    return any(
+        isinstance(candidate, str) and hmac.compare_digest(candidate, expected_token)
+        for candidate in candidates
+    )
+
+
+def unsigned_feishu_events_allowed(settings: Settings) -> bool:
+    """Return the narrow, explicit unsigned-callback exception.
+
+    Using an allow-list means misspelled or unknown environments fail closed.
+    Production/staging can never activate this test convenience accidentally.
+    """
+
+    environment = str(settings.app_env or "").strip().lower()
+    return bool(settings.feishu_allow_unsigned_events) and environment in {"local", "test"}
+
+
+def _safe_error_code(body: object) -> int | str:
+    if not isinstance(body, dict):
+        return "unknown"
+    value = body.get("code")
+    return value if isinstance(value, int) else "unknown"
 
 
 def _is_invalid_access_token(response: httpx.Response) -> bool:
@@ -203,6 +270,7 @@ def _is_invalid_access_token(response: httpx.Response) -> bool:
 
 
 def bitable_fields(submission: WeatherSubmission, card_message_id: str | None = None) -> dict[str, Any]:
+    submission = minimize_submission_for_storage(submission)
     summary = submission.aggregated_forecast.summary
     return {
         "task_id": submission.task_id,

@@ -39,11 +39,11 @@ class TavilySearchClient:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post("https://api.tavily.com/search", json=payload)
             if response.status_code >= 400:
-                logger.warning("Tavily search HTTP %s: %s", response.status_code, response.text[:300])
+                logger.warning("Tavily search HTTP %s", response.status_code)
                 return []
             body = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("Tavily search failed: %s", exc)
+            logger.warning("Tavily search failed error_type=%s", type(exc).__name__)
             return []
         return _parse_search_results(body)
 

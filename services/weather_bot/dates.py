@@ -212,10 +212,10 @@ def _weekday_from_text(text: str, today: date) -> date | None:
     wd = _CN_WEEKDAY.get(m.group(2))
     if wd is None:
         return None
-    base = _next_weekday(today, wd, force_next=False)
-    if m.group(1):  # 下周X
-        base = base + timedelta(days=7)
-    return base
+    if m.group(1):  # 下周X: 下一个自然周，而不是“下一个星期几”再加 7 天。
+        current_week_monday = today - timedelta(days=today.weekday())
+        return current_week_monday + timedelta(days=7 + wd)
+    return _next_weekday(today, wd, force_next=False)
 
 
 def _parse_date_and_span(text: str, today: date) -> tuple[date, int]:

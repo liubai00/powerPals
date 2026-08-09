@@ -107,6 +107,72 @@ def test_briefing_cache_key_changes_across_date_and_config_version(monkeypatch):
     assert first != power_briefing.briefing_cache_key("2026-07-27")
 
 
+def test_scheduled_delivery_claim_recovers_after_lease_with_the_same_send_uuid(tmp_path):
+    cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=3600)
+    release_slot = "2026-08-09|09:00"
+    target_chat_id = "oc_approved_briefing"
+    send_uuid = "5c2a0869-225f-542f-8529-eb721f5030cb"
+
+    assert cache.claim_scheduled_delivery(
+        release_slot,
+        target_chat_id,
+        "owner-1",
+        send_uuid,
+        lease_seconds=10,
+        now=100,
+    )
+    assert not cache.claim_scheduled_delivery(
+        release_slot,
+        target_chat_id,
+        "owner-2",
+        send_uuid,
+        lease_seconds=10,
+        now=109,
+    )
+    assert cache.claim_scheduled_delivery(
+        release_slot,
+        target_chat_id,
+        "owner-2",
+        send_uuid,
+        lease_seconds=10,
+        now=111,
+    )
+    cache.complete_scheduled_delivery(
+        release_slot,
+        target_chat_id,
+        "owner-2",
+        "message-1",
+        now=112,
+    )
+    assert not cache.claim_scheduled_delivery(
+        release_slot,
+        target_chat_id,
+        "owner-3",
+        send_uuid,
+        lease_seconds=10,
+        now=200,
+    )
+
+
+def test_scheduled_delivery_ledger_is_bounded_by_the_version_retention_window(tmp_path):
+    cache = BriefingCache(
+        str(tmp_path / "briefing.db"),
+        ttl_seconds=3600,
+        version_retention_days=1,
+    )
+    old_slot = "2026-08-09|09:00"
+    new_slot = "2026-08-11|09:00"
+    target = "oc_approved_briefing"
+    old_uuid = "5c2a0869-225f-542f-8529-eb721f5030cb"
+    new_uuid = "d184af41-95cc-5667-a109-643499ad3def"
+
+    assert cache.claim_scheduled_delivery(old_slot, target, "owner-1", old_uuid, now=100)
+    cache.complete_scheduled_delivery(old_slot, target, "owner-1", "message-1", now=101)
+    assert cache.claim_scheduled_delivery(new_slot, target, "owner-2", new_uuid, now=86_502)
+
+    assert cache.claim_scheduled_delivery(old_slot, target, "owner-3", old_uuid, now=86_503)
+
+
 @pytest.mark.asyncio
 async def test_briefing_cache_hit_skips_generation(monkeypatch, tmp_path):
     cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=3600)

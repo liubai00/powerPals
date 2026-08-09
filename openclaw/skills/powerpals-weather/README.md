@@ -15,13 +15,17 @@ This OpenClaw skill calls the PowerPals Weather Bot API. It can:
 
 ```bash
 export POWERPALS_WEATHER_API_BASE="https://your-domain.example.com"
+export POWERPALS_WEATHER_ADMIN_TOKEN="<long-random-secret>"
 ```
 
 For local development:
 
 ```bash
 export POWERPALS_WEATHER_API_BASE="http://127.0.0.1:8000"
+export POWERPALS_WEATHER_ADMIN_TOKEN="<local-admin-secret>"
 ```
+
+The admin token is required only for write/publish APIs and must be sent as a Bearer token. Keep it out of prompts, logs, reports, and source control. Forecast and read-only endpoints do not require it.
 
 ## Forecast Examples
 

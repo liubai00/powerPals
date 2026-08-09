@@ -19,6 +19,7 @@ METRIC_WEIGHTS: dict[str, dict[str, float]] = {
     "apparent_temperature": {"open_meteo": 1.0},
     "wind_direction": {"open_meteo": 1.0},
     "uv_index": {"open_meteo": 1.0},
+    "shortwave_radiation": {"open_meteo": 1.0},
 }
 
 
@@ -48,6 +49,7 @@ def aggregate_provider_forecasts(provider_results: list[ProviderForecast]) -> Ag
                 apparent_temperature=_weighted_metric(provider_points, "apparent_temperature"),
                 wind_direction=_weighted_metric(provider_points, "wind_direction"),
                 uv_index=_weighted_metric(provider_points, "uv_index"),
+                shortwave_radiation=_weighted_metric(provider_points, "shortwave_radiation"),
             )
         )
 

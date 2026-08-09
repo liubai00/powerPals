@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import logging
 import re
@@ -11,28 +12,62 @@ from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, Response
 
+from services.weather_bot.bot_identity import mentions_expected_bot
 from services.weather_bot.cards import build_feishu_card, build_text_reply_card, build_weather_comparison_card, is_rich_reply_text
+from services.weather_bot.auth import AdminApiAuthenticator
 from services.weather_bot.config import Settings
-from services.weather_bot.feishu import FeishuBotAccount, FeishuClient, verify_feishu_token
+from services.weather_bot.decision_boundary import weather_only_boundary_answer
+from services.weather_bot.electricity_entities import (
+    ElectricityEntities,
+    TradingWindow,
+    parse_electricity_entities,
+)
+from services.weather_bot.feishu import (
+    FeishuBotAccount,
+    FeishuClient,
+    unsigned_feishu_events_allowed,
+    verify_feishu_token,
+)
 from services.weather_bot.judge import WeatherJudgeRequest, WeatherJudgeResult, score_weather_submission
 from services.weather_bot.llm import LlmClient, answer_role_question, answer_weather_knowledge_question, extract_location_with_llm
 from services.weather_bot.location import (
+    AmbiguousLocationError,
     BUILTIN_LOCATIONS,
     FavoriteLocation,
     LocationBook,
+    LocationResolutionError,
     LocationResolver,
     interpret_region_scope,
     location_slug,
     starts_with_province_scope_modifier,
 )
+from services.weather_bot.logging_safety import (
+    redact_sensitive_text,
+    safe_error_summary,
+    text_log_metadata,
+)
 from services.weather_bot.models import ForecastRequest, SubmissionRecord, WeatherSubmission
+from services.weather_bot.official_warnings import (
+    PROVIDER_ID as OFFICIAL_WARNING_PROVIDER_ID,
+    QWeatherWarningClientConfig,
+    fetch_official_warnings,
+)
+from services.weather_bot.power_briefing_markets import NATIONAL_MARKETS, MarketZone, RepresentativePoint
 from services.weather_bot.service import ForecastService
-from services.weather_bot.search import TavilySearchClient
+from services.weather_bot.send_policy import AdminSendPolicy
+from services.weather_bot.source_registry import SourceRegistry
 from services.weather_bot.storage import JsonlRecorder
-from services.weather_bot.typhoon import TyphoonClient, mentions_typhoon
+from services.weather_bot.subscription_runtime import SubscriptionCoordinator
+from services.weather_bot.subscriptions import ConversationScope, SubscriptionStore
+from services.weather_bot.typhoon import (
+    QWEATHER_TYPHOON_PROVIDER,
+    TyphoonClient,
+    mentions_typhoon,
+)
 from services.weather_bot.task_cards import build_task_card, build_task_text
 from services.weather_bot.tasks import WeatherTask, WeatherTaskRequest, WeatherTaskService
 from services.weather_bot.workbench import (
@@ -52,6 +87,13 @@ from services.weather_bot.weather_metrics import (
     weather_metrics_from_text,
     weather_metrics_query_value,
 )
+from services.weather_bot.weather_risk_evidence import (
+    analyze_provider_disagreement,
+    compare_forecast_versions,
+    detect_wind_ramp_windows,
+    explain_forecast_confidence,
+    rank_renewable_forecast_complexity,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +103,8 @@ FEISHU_WEATHER_BOT = "weather"
 FEISHU_TASK_BOT = "task"
 WEATHER_FORECAST_BOT_ROLE = "weather_forecast_bot"
 WEATHER_TASK_BOT_ROLE = "weather_task_bot"
+_FEISHU_EVENT_AUTHENTICATED = "_weather_bot_callback_authenticated"
+_FEISHU_GROUP_ADDRESS_VERIFIED = "_weather_bot_group_address_verified"
 WEATHER_BOT_ALIASES = ["云云", "AI气象预测小助手", "气象预测小助手", "气象小助手", "全国气象预测机器人"]
 TASK_BOT_ALIASES = ["点点", "AI任务小助手", "任务小助手", "气象任务发布机器人"]
 WEATHER_TASK_ID_RE = re.compile(r"WEATHER-CN-(.+)-(\d{4})(\d{2})(\d{2})-DAYAHEAD-001")
@@ -334,7 +378,8 @@ WEATHER_KNOWLEDGE_KEYWORDS = (
 )
 
 
-# T1/L2 对话记忆: SQLite 落盘(data/memory.db), TTL 7 天, 重启不丢; 失败自动降级为无记忆
+# T1/L2 对话记忆: SQLite 落盘；待澄清 10 分钟，成功查询群聊 30 分钟/私聊 24 小时。
+# 普通对话轮次最多保留 7 天；存储失败自动降级为无记忆。
 def _card_memory_summary(subs) -> str | None:
     """把刚发出的天气卡片压成一行文本存进对话记忆, 供 LLM 回答后续追问时引用真实数据。"""
     if not subs:
@@ -411,13 +456,32 @@ def create_app(
     settings: Settings | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
-    service = forecast_service or ForecastService(settings=settings)
+    source_registry = SourceRegistry.from_json(
+        settings.weather_source_policies_json,
+        environment=settings.app_env,
+    )
+    service = forecast_service or ForecastService(
+        settings=settings,
+        source_registry=source_registry,
+    )
     progress_messages_enabled = settings.feishu_progress_message_enabled and forecast_service is None
     llm_client = LlmClient.from_settings(settings)
-    search_client = TavilySearchClient(settings.tavily_api_key)
-    typhoon_client = TyphoonClient(settings.qweather_api_key, settings.qweather_api_host)
+    qweather_host = (settings.qweather_api_host or "devapi.qweather.com").strip().rstrip("/")
+    typhoon_policy = source_registry.resolve(
+        QWEATHER_TYPHOON_PROVIDER,
+        f"https://{qweather_host}/v7/tropical/storm-list",
+    )
+    typhoon_client = TyphoonClient(
+        settings.qweather_api_key,
+        qweather_host,
+        source_registry=source_registry,
+        source_policy=typhoon_policy,
+    )
     task_service = WeatherTaskService()
-    location_resolver = LocationResolver(settings)
+    location_resolver = LocationResolver(
+        settings,
+        source_registry=source_registry,
+    )
     location_book = LocationBook(settings)
     recorder = JsonlRecorder(settings.local_jsonl_path)
     task_recorder = JsonlRecorder(settings.local_task_jsonl_path)
@@ -432,7 +496,28 @@ def create_app(
     task_index: dict[str, WeatherTask] = {}
     fallback_processed_message_ids: dict[str, float] = {}
     forecast_report_cache: dict[str, tuple[float, list[WeatherSubmission], list[dict[str, str]]]] = {}
-    pending_region_clarifications: dict[str, dict[str, Any]] = {}
+    forecast_evidence_history: dict[tuple[str, str], list[WeatherSubmission]] = {}
+    require_admin_api = AdminApiAuthenticator(settings.admin_api_token)
+    admin_send_policy = AdminSendPolicy(
+        global_send_enabled=settings.global_feishu_send_enabled,
+        dry_run=settings.dry_run,
+    )
+    subscription_store = SubscriptionStore(settings.subscriptions_db)
+    subscription_coordinator = SubscriptionCoordinator(subscription_store)
+    allow_unsigned_feishu_events = unsigned_feishu_events_allowed(settings)
+    try:
+        configured_subscription_admins = json.loads(
+            settings.subscription_admin_open_ids_json
+        )
+    except (TypeError, json.JSONDecodeError):
+        configured_subscription_admins = []
+    if not isinstance(configured_subscription_admins, list):
+        configured_subscription_admins = []
+    subscription_admin_open_ids = frozenset(
+        str(open_id)
+        for open_id in configured_subscription_admins
+        if isinstance(open_id, str) and open_id.strip()
+    )
 
     app = FastAPI(title="PowerPals Weather Data Workbench", version="0.7.0")
 
@@ -516,26 +601,40 @@ def create_app(
         errors: list[dict[str, str]] | None = None,
     ) -> None:
         forecast_report_cache[_forecast_report_cache_key(request)] = (time.monotonic(), submissions, errors or [])
+        for submission in submissions:
+            run_id = str(submission.time_info.forecast_run_id or "")
+            if not run_id:
+                continue
+            history_key = (submission.region, submission.target_date)
+            history = forecast_evidence_history.setdefault(history_key, [])
+            if any(item.time_info.forecast_run_id == run_id for item in history):
+                continue
+            history.append(submission)
+            del history[:-8]
 
     def _remember_pending_region(event: dict[str, Any], allowed_bot: str, command_type: str, text: str) -> None:
         chat_id = _event_chat_id(event)
         if not chat_id:
             return
-        pending_region_clarifications[
-            _pending_region_key(
-                allowed_bot,
-                chat_id,
-                _event_sender_id(event),
-                _event_thread_id(event) or "",
-                _event_chat_type(event),
+        key = _pending_region_key(
+            allowed_bot,
+            chat_id,
+            _event_sender_id(event),
+            _event_thread_id(event) or "",
+            _event_chat_type(event),
+        )
+        try:
+            weather_memory.save_pending_clarification(
+                key,
+                {
+                    "command_type": command_type,
+                    "target_date": _target_date_from_text(text),
+                    "days": _days_from_text(text),
+                    "metrics": weather_metrics_from_text(text),
+                },
             )
-        ] = {
-            "command_type": command_type,
-            "target_date": _target_date_from_text(text),
-            "days": _days_from_text(text),
-            "metrics": weather_metrics_from_text(text),
-            "created_at": time.monotonic(),
-        }
+        except Exception:  # noqa: BLE001 - clarification memory is best effort
+            logger.exception("pending_region_clarification_save_failed")
 
     def _take_pending_region(event: dict[str, Any], allowed_bot: str) -> dict[str, Any] | None:
         chat_id = _event_chat_id(event)
@@ -548,18 +647,36 @@ def create_app(
             _event_thread_id(event) or "",
             _event_chat_type(event),
         )
-        pending = pending_region_clarifications.get(key)
-        if not pending:
+        try:
+            return weather_memory.load_pending_clarification(key)
+        except Exception:  # noqa: BLE001 - clarification memory is best effort
+            logger.exception("pending_region_clarification_load_failed")
             return None
-        if time.monotonic() - float(pending.get("created_at", 0)) > 600:
-            pending_region_clarifications.pop(key, None)
-            return None
-        return pending
 
     def _clear_pending_region(event: dict[str, Any], allowed_bot: str) -> None:
         chat_id = _event_chat_id(event)
-        if chat_id:
-            pending_region_clarifications.pop(
+        if not chat_id:
+            return
+        try:
+            weather_memory.clear_pending_clarification(
+                _pending_region_key(
+                    allowed_bot,
+                    chat_id,
+                    _event_sender_id(event),
+                    _event_thread_id(event) or "",
+                    _event_chat_type(event),
+                )
+            )
+        except Exception:  # noqa: BLE001 - clarification memory is best effort
+            logger.exception("pending_region_clarification_clear_failed")
+
+    def _remember_retry_request(event: dict[str, Any], allowed_bot: str, text: str) -> None:
+        chat_id = _event_chat_id(event)
+        retry_text = str(text or "").strip()
+        if not chat_id or not retry_text or not _is_weather_command(retry_text):
+            return
+        try:
+            weather_memory.save_retry_request(
                 _pending_region_key(
                     allowed_bot,
                     chat_id,
@@ -567,8 +684,48 @@ def create_app(
                     _event_thread_id(event) or "",
                     _event_chat_type(event),
                 ),
-                None,
+                {
+                    "command_type": "forecast",
+                    "text": redact_sensitive_text(retry_text)[:300],
+                },
             )
+        except Exception:  # noqa: BLE001 - retry state is best effort
+            logger.exception("weather_retry_request_save_failed")
+
+    def _take_retry_request(event: dict[str, Any], allowed_bot: str) -> dict[str, Any] | None:
+        chat_id = _event_chat_id(event)
+        if not chat_id:
+            return None
+        try:
+            return weather_memory.load_retry_request(
+                _pending_region_key(
+                    allowed_bot,
+                    chat_id,
+                    _event_sender_id(event),
+                    _event_thread_id(event) or "",
+                    _event_chat_type(event),
+                )
+            )
+        except Exception:  # noqa: BLE001 - retry state is best effort
+            logger.exception("weather_retry_request_load_failed")
+            return None
+
+    def _clear_retry_request(event: dict[str, Any], allowed_bot: str) -> None:
+        chat_id = _event_chat_id(event)
+        if not chat_id:
+            return
+        try:
+            weather_memory.clear_retry_request(
+                _pending_region_key(
+                    allowed_bot,
+                    chat_id,
+                    _event_sender_id(event),
+                    _event_thread_id(event) or "",
+                    _event_chat_type(event),
+                )
+            )
+        except Exception:  # noqa: BLE001 - retry state is best effort
+            logger.exception("weather_retry_request_clear_failed")
 
     @app.post("/api/weather/forecast", response_model=WeatherSubmission)
     async def forecast(request: ForecastRequest) -> WeatherSubmission:
@@ -802,28 +959,34 @@ def create_app(
         )
         return HTMLResponse(content=html)
 
-    @app.post("/api/weather/submission")
-    async def submission(submission: WeatherSubmission) -> dict[str, str]:
-        recorder.append(SubmissionRecord(submission=submission))
-        await weather_feishu.write_bitable_record(submission)
-        return {"status": "accepted", "task_id": submission.task_id}
+    @app.post("/api/weather/submission", dependencies=[Depends(require_admin_api)])
+    async def submission(submission: WeatherSubmission) -> dict[str, Any]:
+        external_write_decision = admin_send_policy.external_write_decision()
+        if external_write_decision.allowed:
+            recorder.append(SubmissionRecord(submission=submission))
+            await weather_feishu.write_bitable_record(submission)
+        return {
+            "status": "accepted" if external_write_decision.allowed else "generated",
+            "task_id": submission.task_id,
+            "delivery": external_write_decision.as_dict(),
+        }
 
     @app.get("/api/locations")
     async def list_locations() -> dict[str, Any]:
         locations = [item.model_dump(mode="json") for item in location_book.list()]
         return {"status": "ok", "count": len(locations), "locations": locations}
 
-    @app.post("/api/locations")
+    @app.post("/api/locations", dependencies=[Depends(require_admin_api)])
     async def create_location(location: FavoriteLocation) -> dict[str, Any]:
         saved = location_book.upsert(location)
         return {"status": "saved", "location": saved.model_dump(mode="json")}
 
-    @app.delete("/api/locations/{alias}")
+    @app.delete("/api/locations/{alias}", dependencies=[Depends(require_admin_api)])
     async def delete_location(alias: str) -> dict[str, Any]:
         deleted = location_book.delete(alias)
         return {"status": "deleted" if deleted else "not_found", "alias": alias}
 
-    @app.post("/api/news/items")
+    @app.post("/api/news/items", dependencies=[Depends(require_admin_api)])
     async def create_news_item(item: NewsItem) -> dict[str, Any]:
         news_recorder.append(item)
         return {"status": "accepted", "item": item.model_dump(mode="json")}
@@ -833,7 +996,7 @@ def create_app(
         items = news_recorder.read_json_objects()
         return {"status": "ok", "count": len(items), "items": list(reversed(items))}
 
-    @app.post("/api/hydrology/records")
+    @app.post("/api/hydrology/records", dependencies=[Depends(require_admin_api)])
     async def create_hydrology_record(record: HydrologyRecord) -> dict[str, Any]:
         hydrology_recorder.append(record)
         return {"status": "accepted", "record": record.model_dump(mode="json")}
@@ -866,58 +1029,101 @@ def create_app(
     async def judge_weather_score(request: WeatherJudgeRequest) -> WeatherJudgeResult:
         return score_weather_submission(request)
 
-    @app.post("/api/weather/publish")
+    @app.post("/api/weather/publish", dependencies=[Depends(require_admin_api)])
     async def publish(request: ForecastRequest | None = None) -> dict[str, Any]:
         request = request or _tomorrow_request()
         result = await service.forecast(request)
         card = build_feishu_card(result, show_task_id=True)
         card_message_id = None
-        if weather_account.default_chat_id:
+        card_send_decision = admin_send_policy.card_send_decision(weather_account.default_chat_id)
+        external_write_decision = admin_send_policy.external_write_decision()
+        if card_send_decision.allowed:
             card_message_id = await weather_feishu.send_interactive_card(weather_account.default_chat_id, card)
-        recorder.append(SubmissionRecord(submission=result, card_message_id=card_message_id))
-        await weather_feishu.write_bitable_record(result, card_message_id)
-        return {"status": "published", "submission": result.model_dump(mode="json"), "card": card}
+        if external_write_decision.allowed:
+            recorder.append(SubmissionRecord(submission=result, card_message_id=card_message_id))
+            await weather_feishu.write_bitable_record(result, card_message_id)
+        return {
+            "status": "published" if external_write_decision.allowed else "generated",
+            "submission": result.model_dump(mode="json"),
+            "card": card,
+            "delivery": card_send_decision.as_dict(),
+        }
 
-    @app.post("/api/tasks/weather/create")
+    @app.post("/api/tasks/weather/create", dependencies=[Depends(require_admin_api)])
     async def create_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
         location = await _resolve_task_location(location_resolver, request)
         task = _cache_task(task_service.create_dayahead_task(request.target_date, location, request.days))
         return task.model_dump(mode="json")
 
-    @app.post("/api/tasks/weather/publish")
+    @app.post("/api/tasks/weather/publish", dependencies=[Depends(require_admin_api)])
     async def publish_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
         location = await _resolve_task_location(location_resolver, request)
-        task = task_service.publish(task_service.create_dayahead_task(request.target_date, location, request.days))
+        external_write_decision = admin_send_policy.external_write_decision()
+        task = task_service.create_dayahead_task(request.target_date, location, request.days)
+        if external_write_decision.allowed:
+            task = task_service.publish(task)
         card = build_task_card(task)
         text = build_task_text(task)
         card_message_id = None
-        if task_account.default_chat_id:
+        card_send_decision = admin_send_policy.card_send_decision(task_account.default_chat_id)
+        if card_send_decision.allowed:
             card_message_id = await task_feishu.send_interactive_card(task_account.default_chat_id, card)
-        task = _cache_task(task.model_copy(update={"task_card_message_id": card_message_id}))
-        task_recorder.append(task)
-        await task_feishu.write_task_bitable_record(task)
-        return {"task": task.model_dump(mode="json"), "card": card, "text": text}
+        if external_write_decision.allowed:
+            task = _cache_task(task.model_copy(update={"task_card_message_id": card_message_id}))
+            task_recorder.append(task)
+            await task_feishu.write_task_bitable_record(task)
+        return {
+            "status": "published" if external_write_decision.allowed else "generated",
+            "task": task.model_dump(mode="json"),
+            "card": card,
+            "text": text,
+            "delivery": card_send_decision.as_dict(),
+        }
 
-    @app.post("/api/tasks/weather/remind")
+    @app.post("/api/tasks/weather/remind", dependencies=[Depends(require_admin_api)])
     async def remind_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
         location = await _resolve_task_location(location_resolver, request)
         task = task_service.remind(task_service.publish(task_service.create_dayahead_task(request.target_date, location, request.days)))
         card = build_task_card(task)
-        if task_account.default_chat_id:
+        card_send_decision = admin_send_policy.card_send_decision(task_account.default_chat_id)
+        external_write_decision = admin_send_policy.external_write_decision()
+        if card_send_decision.allowed:
             card_message_id = await task_feishu.send_interactive_card(task_account.default_chat_id, card)
             task = task.model_copy(update={"task_card_message_id": card_message_id})
-        task = _cache_task(task)
-        task_recorder.append(task)
-        await task_feishu.write_task_bitable_record(task)
-        return {"task": task.model_dump(mode="json"), "card": card, "text": build_task_text(task)}
+        if external_write_decision.allowed:
+            task = _cache_task(task)
+            task_recorder.append(task)
+            await task_feishu.write_task_bitable_record(task)
+        return {
+            "status": "published" if external_write_decision.allowed else "generated",
+            "task": task.model_dump(mode="json"),
+            "card": card,
+            "text": build_task_text(task),
+            "delivery": card_send_decision.as_dict(),
+        }
 
-    @app.post("/api/tasks/weather/close")
+    @app.post("/api/tasks/weather/close", dependencies=[Depends(require_admin_api)])
     async def close_weather_task(request: WeatherTaskRequest) -> dict[str, Any]:
         location = await _resolve_task_location(location_resolver, request)
-        task = _cache_task(task_service.close(task_service.publish(task_service.create_dayahead_task(request.target_date, location, request.days))))
-        task_recorder.append(task)
-        await task_feishu.write_task_bitable_record(task)
-        return {"task": task.model_dump(mode="json")}
+        task = task_service.close(
+            task_service.publish(
+                task_service.create_dayahead_task(
+                    request.target_date,
+                    location,
+                    request.days,
+                )
+            )
+        )
+        external_write_decision = admin_send_policy.external_write_decision()
+        if external_write_decision.allowed:
+            task = _cache_task(task)
+            task_recorder.append(task)
+            await task_feishu.write_task_bitable_record(task)
+        return {
+            "status": "closed" if external_write_decision.allowed else "generated",
+            "task": task.model_dump(mode="json"),
+            "delivery": external_write_decision.as_dict(),
+        }
 
     @app.get("/api/tasks/weather/{task_id}")
     async def get_weather_task(task_id: str) -> dict[str, Any]:
@@ -1000,14 +1206,21 @@ def create_app(
                 live_context = await typhoon_client.brief_for_text(text)
             except Exception:  # noqa: BLE001 - 台风数据失败不影响回答
                 live_context = None
-        # 有权威实时台风数据时以它为准, 跳过较慢且噪声大的通用搜索; 否则退回联网搜索
+        if _requires_live_typhoon_data(text) and not live_context:
+            return {
+                "status": "handled",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "knowledge_answer",
+                "search_result_count": 0,
+                "typhoon_grounded": False,
+                "text": (
+                    "当前无法取得通过来源核验的实时台风数据，因此我不会用搜索摘要或模型记忆补写当前位置、"
+                    "强度、移动方向或路径。请稍后重试，或以中央气象台等官方实时发布为准。"
+                ),
+            }
+        # Tavily 结果只能用于发现原始来源。本入口尚未实现“打开原文 +
+        # 来源许可/时间/哈希核验”，因此必须保持 0 次搜索，不能把摘要交给 LLM 当事实。
         search_results = []
-        if not live_context and search_client.enabled:
-            search_results = await search_client.search(text)
-        compact_results = [
-            {"title": item.title, "url": item.url, "content": item.content[:500]}
-            for item in search_results
-        ]
         return {
             "status": "handled",
             "bot_role": WEATHER_FORECAST_BOT_ROLE,
@@ -1018,7 +1231,7 @@ def create_app(
                 llm_client,
                 user_text=text,
                 fallback=_weather_knowledge_fallback(text),
-                search_results=compact_results,
+                search_results=[],
                 live_context=live_context,
             ),
         }
@@ -1037,8 +1250,8 @@ def create_app(
             settings.power_briefing_cache_db,
             ttl_seconds=settings.power_briefing_cache_ttl_seconds,
         )
-        if _is_power_briefing_expand_command(text):
-            state = _load_conversation_state(event, WEATHER_FORECAST_BOT_ROLE) or {}
+        if _is_power_briefing_expand_command(text) or _is_power_briefing_explanation_command(text):
+            state = _load_briefing_context_state(event, WEATHER_FORECAST_BOT_ROLE) or {}
             if not state.get("last_power_briefing_cache_key"):
                 state = (
                     _load_shared_briefing_thread_state(
@@ -1053,8 +1266,24 @@ def create_app(
                 return {
                     "status": "needs_briefing_context",
                     "bot_role": WEATHER_FORECAST_BOT_ROLE,
-                    "mode": "power_briefing_expand",
-                    "text": "当前会话没有可展开的有效晨报快照。请先发送“生成今天的电力气象决策晨报 2.0”。",
+                    "mode": (
+                        "power_briefing_explain"
+                        if _is_power_briefing_explanation_command(text)
+                        else "power_briefing_expand"
+                    ),
+                    "text": "当前会话没有可展开的有效晨报快照。请先发送“生成今天的电力气象决策晨报 3.0”。",
+                }
+            if _is_power_briefing_explanation_command(text):
+                return {
+                    "status": "handled",
+                    "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                    "mode": "power_briefing_explain",
+                    "coverage": snapshot["coverage"],
+                    "cache_hit": True,
+                    "briefing_cache_key": snapshot["cache_key"],
+                    "generated_at": snapshot["generated_at"],
+                    "expires_at": snapshot["expires_at"],
+                    "text": _briefing_snapshot_explanation(snapshot),
                 }
             return {
                 "status": "handled",
@@ -1077,8 +1306,11 @@ def create_app(
                 start_date,
                 cache=cache,
             )
-        except Exception:  # noqa: BLE001 - 手动晨报失败返回可重试提示
-            logger.exception("manual_power_briefing_failed")
+        except Exception as exc:  # noqa: BLE001 - 手动晨报失败返回可重试提示
+            logger.error(
+                "manual_power_briefing_failed error_type=%s",
+                safe_error_summary(exc),
+            )
             return {
                 "status": "briefing_unavailable",
                 "bot_role": WEATHER_FORECAST_BOT_ROLE,
@@ -1100,7 +1332,11 @@ def create_app(
         }
 
     async def _handle_weather_command(text: str) -> dict[str, Any]:
-        if _is_past_weather_query(text) and not _is_weather_knowledge_question(text):
+        if (
+            _is_past_weather_query(text)
+            and not _is_weather_knowledge_question(text)
+            and not _is_forecast_version_change_query(text)
+        ):
             return {
                 "status": "handled",
                 "bot_role": WEATHER_FORECAST_BOT_ROLE,
@@ -1285,6 +1521,397 @@ def create_app(
             **response,
         }
 
+    async def _handle_weather_event_command(
+        text: str,
+        event: dict[str, Any],
+        allowed_bot: str,
+    ) -> dict[str, Any]:
+        try:
+            result = await _handle_weather_command(text)
+        except LocationResolutionError as exc:
+            _remember_pending_region(event, allowed_bot, "forecast", text)
+            _clear_retry_request(event, allowed_bot)
+            candidates = (
+                list(exc.candidates)
+                if isinstance(exc, AmbiguousLocationError)
+                else []
+            )
+            if candidates:
+                prompt = (
+                    f"“{exc.region}”可能指多个地点，请选择："
+                    + "、".join(candidates)
+                    + "。"
+                )
+                reason = "location_ambiguous"
+            else:
+                prompt = (
+                    f"暂时无法确认“{exc.region}”对应的地点。"
+                    "请补充完整的省、市或区县名称。"
+                )
+                reason = "location_not_found"
+            return {
+                "status": "needs_location_clarification",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "location_clarification",
+                "reason": reason,
+                "location_entity": exc.region,
+                "location_candidates": candidates,
+                "text": prompt,
+            }
+        except Exception:
+            _remember_retry_request(event, allowed_bot, text)
+            raise
+        if result.get("status") in {"handled", "partial"}:
+            _clear_retry_request(event, allowed_bot)
+        return result
+
+    async def _handle_official_warning_command(text: str) -> dict[str, Any]:
+        request = _apply_favorite_alias(_request_from_text(text), location_book)
+        try:
+            location = await location_resolver.resolve(request)
+        except AmbiguousLocationError as exc:
+            return {
+                "status": "needs_location_clarification",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "official_weather_warning",
+                "reason": "location_ambiguous",
+                "location_entity": exc.region,
+                "location_candidates": list(exc.candidates),
+                "text": (
+                    f"“{exc.region}”可能指多个地点，请选择："
+                    + "、".join(exc.candidates)
+                    + "。当前不会猜测预警落区。"
+                ),
+            }
+        except LocationResolutionError as exc:
+            return {
+                "status": "needs_location_clarification",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "official_weather_warning",
+                "reason": "location_not_found",
+                "location_entity": exc.region,
+                "location_candidates": [],
+                "text": (
+                    f"暂时无法确认“{exc.region}”对应的预警查询点。"
+                    "请补充完整的省、市或区县名称。"
+                ),
+            }
+
+        host = (settings.qweather_api_host or "devapi.qweather.com").strip().lower()
+        policy_lookup_url = (
+            f"https://{host}/weatheralert/v1/current/"
+            f"{location.latitude}/{location.longitude}"
+        )
+        source_policy = source_registry.resolve(
+            OFFICIAL_WARNING_PROVIDER_ID,
+            policy_lookup_url,
+        )
+        fetched = await fetch_official_warnings(
+            location.latitude,
+            location.longitude,
+            QWeatherWarningClientConfig(
+                api_key=settings.qweather_api_key,
+                api_host=host,
+            ),
+            source_registry=source_registry,
+            source_policy=source_policy,
+        )
+        if fetched.status != "ok":
+            return {
+                "status": "data_unavailable",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "official_weather_warning",
+                "reason": fetched.reason,
+                "source_kind": "official_structured_api",
+                "text": (
+                    "当前无法取得可靠官方预警数据；不会使用搜索摘要或模型补写。"
+                    "请以当地气象主管机构最新发布为准。"
+                ),
+            }
+
+        requested_type = _official_warning_type_from_text(text)
+        warnings = tuple(
+            warning
+            for warning in fetched.warnings
+            if requested_type is None or requested_type in warning.headline
+        )
+        source_url = fetched.source_url or (
+            warnings[0].source_url if warnings else policy_lookup_url
+        )
+        retrieved_at = fetched.retrieved_at.isoformat() if fetched.retrieved_at else "未记录"
+        if not warnings:
+            warning_label = f"{requested_type}预警" if requested_type else "有效气象预警"
+            text_result = (
+                f"截至抓取时间 {retrieved_at}，{location.display_name}代表查询点"
+                f"未返回正在生效的官方{warning_label}。\n"
+                f"来源：{source_url}\n"
+                f"归因：{fetched.attribution or '未记录'}\n"
+                "预警具有具体落区和时效，请以当地气象主管机构最新发布为准。"
+            )
+        else:
+            warning_lines = []
+            for warning in warnings:
+                warning_lines.append(
+                    f"- {warning.headline}\n"
+                    f"  发布机构：{warning.original_issuer}｜发布时间：{warning.published_at.isoformat()}\n"
+                    f"  生效：{warning.effective_at.isoformat()}｜到期：{warning.expires_at.isoformat()}"
+                )
+            text_result = (
+                f"{location.display_name}代表查询点的官方预警：\n"
+                + "\n".join(warning_lines)
+                + f"\n抓取时间：{retrieved_at}"
+                + f"\n来源：{source_url}"
+                + f"\n归因：{fetched.attribution or '未记录'}"
+                + "\n仅展示官方结构化元数据；具体落区与处置要求请查看原发布机构。"
+            )
+        return {
+            "status": "handled",
+            "bot_role": WEATHER_FORECAST_BOT_ROLE,
+            "mode": "official_weather_warning",
+            "source_kind": "official_structured_api",
+            "location": location.display_name,
+            "warning_count": len(warnings),
+            "source_tag": fetched.source_tag,
+            "source_url": source_url,
+            "retrieved_at": retrieved_at,
+            "text": text_result,
+        }
+
+    async def _handle_electricity_weather_command(
+        text: str,
+        entities: ElectricityEntities,
+    ) -> dict[str, Any]:
+        representative = _electricity_representative_point(text, entities)
+        if representative is None:
+            return {
+                "status": "needs_clarification",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "electricity_entities",
+                "clarification_reasons": ["analysis_scope_too_broad"],
+                "electricity_entities": _electricity_entities_payload(entities),
+                "text": (
+                    "这个范围包含多个电力气象分析区。请先指定一个省级分析区，"
+                    "或明确蒙西、蒙东、冀北、河北南网等分析区；当前不会猜测代表点。"
+                ),
+            }
+
+        market, point = representative
+        scoped_text = _text_without_analysis_area_spans(text, entities)
+        result = await _handle_weather_command(f"{point.query} {scoped_text}")
+        result["mode"] = "electricity_weather_proxy"
+        result["electricity_entities"] = _electricity_entities_payload(entities)
+        result["representative_point"] = {
+            "market_id": market.market_id,
+            "city": point.city,
+            "query": point.query,
+        }
+
+        submissions = result.get("_memory_submissions")
+        submission = (
+            submissions[0]
+            if isinstance(submissions, list)
+            and submissions
+            and isinstance(submissions[0], WeatherSubmission)
+            else None
+        )
+        window_summary = _electricity_window_weather_summary(
+            submission,
+            entities.trading_window,
+        )
+        result["window_weather_summary"] = window_summary
+        _prepend_electricity_scope_notice(
+            result.get("card"),
+            market,
+            point,
+            entities.trading_window,
+            window_summary,
+        )
+        if submission is not None and _is_wind_ramp_query(text):
+            confidence = explain_forecast_confidence(
+                submission,
+                now=datetime.now().astimezone(),
+            )
+            windows = (
+                detect_wind_ramp_windows(submission.aggregated_forecast.points)
+                if confidence.level != "不可用"
+                else ()
+            )
+            if windows:
+                lines = [
+                    f"- {item.start[11:16]}–{item.end[11:16]}｜"
+                    f"最大相邻小时风速变化 {item.max_speed_change:.1f}m/s｜"
+                    f"峰值时刻 {item.peak_at[11:16]}"
+                    for item in windows
+                ]
+                evidence_text = "\n".join(lines)
+            else:
+                evidence_text = (
+                    "当前可回溯小时数据中未识别到持续至少2小时的快速变化窗口，"
+                    "或来源元数据不足，未强行生成风险窗口。"
+                )
+            result.pop("card", None)
+            result.update(
+                {
+                    "mode": "wind_ramp_weather_proxy",
+                    "text": (
+                        f"**{market.market_name.removesuffix('样本区')}｜"
+                        "10米地面风快速变化代理**\n"
+                        f"{evidence_text}\n"
+                        "口径：相邻小时10米风速变化达到3.0m/s，且连续窗口至少2小时。\n"
+                        "边界：仅反映代表点10米地面风变化；没有轮毂高度风、机组功率曲线"
+                        "和实际出力，不能解释为实际风电爬坡或爬坡MW。"
+                    ),
+                    "risk_windows": [item.model_dump(mode="json") for item in windows],
+                    "source_run_id": submission.time_info.forecast_run_id,
+                }
+            )
+        elif submission is not None and _is_provider_disagreement_query(text):
+            disagreement = analyze_provider_disagreement(submission)
+            result.pop("card", None)
+            if disagreement.status == "available":
+                lines = [
+                    f"- {item.valid_time[11:16]}｜{item.variable}｜"
+                    f"{item.minimum:g}–{item.maximum:g}{item.unit}｜"
+                    f"分歧 {item.spread:g}{item.unit}｜来源 {' / '.join(item.providers)}"
+                    for item in disagreement.items[:5]
+                ]
+                evidence_text = "\n".join(lines)
+                status = "handled"
+            else:
+                evidence_text = (
+                    "当前没有至少两个来源完整、时间对齐且可回溯的数据集，"
+                    "无法可靠定位变量和时段分歧。"
+                )
+                status = "data_unavailable"
+            result.update(
+                {
+                    "status": status,
+                    "mode": "weather_source_disagreement",
+                    "text": (
+                        "**同一有效时刻的数据源分歧**\n"
+                        f"{evidence_text}\n"
+                        f"{disagreement.boundary}"
+                    ),
+                    "source_run_id": disagreement.source_run_id,
+                    "disagreement": disagreement.model_dump(mode="json"),
+                }
+            )
+        elif submission is not None and _is_confidence_explanation_query(text):
+            confidence = explain_forecast_confidence(
+                submission,
+                now=datetime.now().astimezone(),
+            )
+            result.pop("card", None)
+            factor_lines = [
+                f"- {name}：{factor.status}｜{factor.reason}"
+                for name, factor in confidence.factors.items()
+            ]
+            result.update(
+                {
+                    "status": "handled" if confidence.level != "不可用" else "data_unavailable",
+                    "mode": "weather_confidence_explanation",
+                    "text": (
+                        f"**置信度：{confidence.level}**\n"
+                        f"{confidence.explanation}\n"
+                        + "\n".join(factor_lines)
+                        + f"\n{confidence.boundary}"
+                    ),
+                    "source_run_id": submission.time_info.forecast_run_id,
+                    "confidence_evidence": confidence.model_dump(mode="json"),
+                }
+            )
+        elif submission is not None and _is_forecast_version_change_query(text):
+            history = forecast_evidence_history.get(
+                (submission.region, submission.target_date),
+                [],
+            )
+            previous = next(
+                (
+                    item
+                    for item in reversed(history[:-1])
+                    if item.time_info.forecast_run_id
+                    != submission.time_info.forecast_run_id
+                ),
+                None,
+            )
+            comparison = (
+                compare_forecast_versions(submission, previous)
+                if previous is not None
+                else None
+            )
+            result.pop("card", None)
+            if comparison is not None and comparison.status == "available":
+                lines = [
+                    f"- {item.valid_time[11:16]}｜{item.variable}："
+                    f"{item.previous_value:g}→{item.current_value:g}{item.unit} "
+                    f"({item.delta:+g}{item.unit})"
+                    for item in comparison.changes[:6]
+                ]
+                evidence_text = "\n".join(lines) or "对齐时刻的已支持指标没有变化。"
+                result.update(
+                    {
+                        "status": "handled",
+                        "mode": "weather_forecast_version_change",
+                        "current_run_id": comparison.current_run_id,
+                        "previous_run_id": comparison.previous_run_id,
+                        "version_comparison": comparison.model_dump(mode="json"),
+                        "text": (
+                            "**同地点、同一有效时刻预报版本变化**\n"
+                            f"{evidence_text}\n"
+                            f"{comparison.boundary}"
+                        ),
+                    }
+                )
+            else:
+                result.update(
+                    {
+                        "status": "data_unavailable",
+                        "mode": "weather_forecast_version_change",
+                        "current_run_id": submission.time_info.forecast_run_id,
+                        "previous_run_id": None,
+                        "text": (
+                            "当前没有同地点、同目标日、同有效时刻的上一版可回溯预报，"
+                            "不会拿不同日期或不同地点的数据凑比较。"
+                        ),
+                    }
+                )
+        return result
+
+    def _handle_renewable_complexity_ranking() -> dict[str, Any]:
+        latest_by_region = {
+            region: history[-1]
+            for (region, _target_date), history in forecast_evidence_history.items()
+            if history
+        }
+        ranking = rank_renewable_forecast_complexity(latest_by_region)
+        if ranking.status != "available" or len(ranking.entries) < 2:
+            return {
+                "status": "data_unavailable",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "renewable_forecast_complexity_weather_proxy",
+                "ranking": [],
+                "text": (
+                    "当前没有至少两个分析区、且通过来源和多源完整性门禁的同期预报，"
+                    "无法生成全国排行；不会用搜索摘要或模型记忆补齐。"
+                ),
+            }
+        entries = ranking.entries[:5]
+        lines = [
+            f"{index}. {item.region}｜{item.score:.1f}｜{'、'.join(item.drivers)}｜run {item.source_run_id}"
+            for index, item in enumerate(entries, start=1)
+        ]
+        return {
+            "status": "handled",
+            "bot_role": WEATHER_FORECAST_BOT_ROLE,
+            "mode": "renewable_forecast_complexity_weather_proxy",
+            "ranking": [item.model_dump(mode="json") for item in entries],
+            "text": (
+                f"**{ranking.metric_label} Top {len(entries)}**\n"
+                + "\n".join(lines)
+                + f"\n{ranking.boundary}"
+            ),
+        }
+
     async def _handle_task_command(
         text: str,
         feishu_client: FeishuClient,
@@ -1356,6 +1983,13 @@ def create_app(
 
     async def _handle_general_command(text: str, allowed_bot: str, event: dict[str, Any] | None = None) -> dict[str, Any]:
         bot_role = _bot_role_for_allowed_bot(allowed_bot)
+        if isinstance(event, dict) and _is_direct_chat(event):
+            return {
+                "status": "handled",
+                "bot_role": bot_role,
+                "mode": "capability_boundary",
+                "text": _capability_boundary_text(allowed_bot),
+            }
         history = (
             _recent_conversation_turns(
                 bot_role,
@@ -1391,6 +2025,18 @@ def create_app(
         if not pending:
             return None
         pending_command_type = str(pending.get("command_type") or "")
+        if re.fullmatch(r"(?:取消|不用了|算了|停止)", text.strip()):
+            _clear_pending_region(event, allowed_bot)
+            return {
+                "status": "handled",
+                "bot_role": (
+                    WEATHER_TASK_BOT_ROLE
+                    if pending_command_type == "task"
+                    else WEATHER_FORECAST_BOT_ROLE
+                ),
+                "mode": "clarification_cancelled",
+                "text": "已取消刚才的补充信息请求，不会沿用那次未完成的内容。",
+            }
         needs_region = (
             _needs_task_region_clarification(text)
             if pending_command_type == "task"
@@ -1405,10 +2051,12 @@ def create_app(
             await _send_progress_message(feishu_client, event, WEATHER_TASK_BOT_ROLE)
             return await _handle_task_command(command_text, feishu_client, event)
         await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
-        return await _handle_weather_command(command_text)
+        return await _handle_weather_event_command(command_text, event, allowed_bot)
 
     async def _send_progress_message(feishu_client: FeishuClient, event: dict[str, Any], bot_role: str) -> None:
         if not progress_messages_enabled:
+            return
+        if not _passive_feishu_delivery_allowed(event):
             return
         chat_id = _event_chat_id(event)
         if not chat_id:
@@ -1416,7 +2064,11 @@ def create_app(
         try:
             await feishu_client.send_text_message(chat_id, _progress_text(bot_role))
         except Exception as exc:  # noqa: BLE001 - progress messages are best effort only
-            logger.warning("feishu_progress_message_failed bot_role=%s error=%s", bot_role, exc)
+            logger.warning(
+                "feishu_progress_message_failed bot_role=%s error_type=%s",
+                bot_role,
+                safe_error_summary(exc),
+            )
 
     async def _record_task_submission(submission: WeatherSubmission, card_message_id: str | None = None) -> None:
         recorder.append(
@@ -1443,7 +2095,11 @@ def create_app(
             "encrypt" in payload,
             sorted(payload.keys()),
         )
-        if not verify_feishu_token(payload, account.verification_token):
+        if not verify_feishu_token(
+            payload,
+            account.verification_token,
+            allow_unsigned=allow_unsigned_feishu_events,
+        ):
             raise HTTPException(status_code=403, detail="Invalid Feishu verification token")
 
         if payload.get("type") == "url_verification":
@@ -1454,6 +2110,12 @@ def create_app(
             return {"status": "ignored", "reason": "unsupported_event_type", "event_type": event_type}
 
         event = payload.get("event", {})
+        if _is_automated_sender(event):
+            return {
+                "status": "ignored",
+                "bot_role": _bot_role_for_allowed_bot(allowed_bot),
+                "reason": "automated_sender",
+            }
         if _is_group_chat(event) and not _is_supported_group_message_type(event):
             return {
                 "status": "ignored",
@@ -1464,7 +2126,7 @@ def create_app(
         raw_text = _event_text(event)
         if (
             _is_group_chat(event)
-            and not _is_addressed_to_bot(raw_text, event, allowed_bot)
+            and not _is_addressed_to_bot(raw_text, event, allowed_bot, account)
             and not _is_reply_to_recorded_bot_message(event, allowed_bot)
         ):
             return {
@@ -1476,26 +2138,105 @@ def create_app(
             allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_TASK_BOT}
             and not _is_group_chat(event)
             and not _is_direct_chat(event)
-            and not _is_legacy_specialized_event_addressed(raw_text, event, allowed_bot)
+            and not _is_legacy_specialized_event_addressed(raw_text, event, allowed_bot, account)
         ):
             return {
                 "status": "ignored",
                 "bot_role": _bot_role_for_allowed_bot(allowed_bot),
             }
 
+        text_metadata = text_log_metadata(raw_text)
         logger.warning(
-            "feishu_event_text allowed_bot=%s event_keys=%s message_keys=%s text=%r",
+            "feishu_event_text allowed_bot=%s event_keys=%s message_keys=%s "
+            "text_length=%s text_sha256=%s",
             allowed_bot,
             sorted(event.keys()) if isinstance(event, dict) else [],
             sorted(event.get("message", {}).keys()) if isinstance(event, dict) and isinstance(event.get("message"), dict) else [],
-            raw_text,
+            text_metadata["text_length"],
+            text_metadata["text_sha256"],
         )
 
         text = _normalize_event_text(raw_text, event, allowed_bot)
         event["_normalized_text"] = text
-        contextual_text, context_action = _contextual_weather_text(text, event)
+        if _is_group_chat(event):
+            # This marker is trusted only because the wrapper removes any
+            # callback-supplied value before authentication.  Set it after both
+            # structured addressing and message normalization have succeeded.
+            event[_FEISHU_GROUP_ADDRESS_VERIFIED] = True
+        if allowed_bot == FEISHU_WEATHER_BOT:
+            chat_id = _event_chat_id(event)
+            sender_id = _event_sender_id(event)
+            if chat_id and sender_id:
+                subscription_scope = ConversationScope(
+                    bot_role=WEATHER_FORECAST_BOT_ROLE,
+                    chat_type=_event_chat_type(event),
+                    chat_id=chat_id,
+                    thread_id=_event_thread_id(event) or "",
+                    user_id=sender_id,
+                )
+                subscription_result = subscription_coordinator.handle(
+                    text,
+                    subscription_scope,
+                    actor_is_admin=sender_id in subscription_admin_open_ids,
+                    now=datetime.now().astimezone(),
+                )
+                if subscription_result is not None:
+                    subscription_result["bot_role"] = WEATHER_FORECAST_BOT_ROLE
+                    return await _send_feishu_event_response(
+                        feishu_client,
+                        event,
+                        subscription_result,
+                        _record_task_submission,
+                    )
+                if text in {"可以", "好的"} and not _is_group_chat(event):
+                    pending_subscription = subscription_store.find_latest(
+                        subscription_scope,
+                        statuses=("draft", "pending_confirmation"),
+                    )
+                    if pending_subscription is not None:
+                        result = {
+                            "status": "subscription_confirmation_required",
+                            "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                            "send_performed": False,
+                            "text": "订阅尚未启用；只有明确发送“确认订阅”才会生效。",
+                        }
+                        return await _send_feishu_event_response(
+                            feishu_client,
+                            event,
+                            result,
+                            _record_task_submission,
+                        )
+        if allowed_bot != FEISHU_TASK_BOT and _is_retry_command(text):
+            retry_request = _take_retry_request(event, allowed_bot)
+            retry_text = str(retry_request.get("text") or "") if retry_request else ""
+            if not retry_text:
+                result = {
+                    "status": "handled",
+                    "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                    "mode": "retry_unavailable",
+                    "text": "当前会话没有可重试的近期天气请求，请重新告诉我地点、日期和指标。",
+                }
+                return await _send_feishu_event_response(
+                    feishu_client,
+                    event,
+                    result,
+                    _record_task_submission,
+                )
+            text = retry_text
+            event["_retry_replayed"] = True
+        context_bot_role = (
+            WEATHER_TASK_BOT_ROLE
+            if allowed_bot == FEISHU_TASK_BOT
+            else WEATHER_FORECAST_BOT_ROLE
+        )
+        contextual_text, context_action = _contextual_weather_text(
+            text,
+            event,
+            bot_role=context_bot_role,
+        )
         if context_action == "reset":
             _clear_pending_region(event, allowed_bot)
+            _clear_retry_request(event, allowed_bot)
             result = {
                 "status": "handled",
                 "bot_role": WEATHER_FORECAST_BOT_ROLE,
@@ -1507,10 +2248,30 @@ def create_app(
 
         if _is_help_command(text):
             _clear_pending_region(event, allowed_bot)
+            _clear_retry_request(event, allowed_bot)
             result = {"status": "handled", "bot_role": _bot_role_for_allowed_bot(allowed_bot), "text": _help_text(allowed_bot)}
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
 
-        if _is_power_briefing_command(text):
+        if _is_official_warning_query(text):
+            _clear_pending_region(event, allowed_bot)
+            if allowed_bot == FEISHU_TASK_BOT:
+                result = _redirect_to_bot_command(
+                    WEATHER_TASK_BOT_ROLE,
+                    WEATHER_FORECAST_BOT_ROLE,
+                )
+            else:
+                result = await _handle_official_warning_command(text)
+            return await _send_feishu_event_response(
+                feishu_client,
+                event,
+                result,
+                _record_task_submission,
+            )
+
+        if _is_power_briefing_command(text) or (
+            _is_power_briefing_explanation_command(text)
+            and _is_reply_to_recorded_bot_message(event, allowed_bot)
+        ):
             _clear_pending_region(event, allowed_bot)
             if allowed_bot == FEISHU_TASK_BOT:
                 result = _redirect_to_bot_command(WEATHER_TASK_BOT_ROLE, WEATHER_FORECAST_BOT_ROLE)
@@ -1524,14 +2285,120 @@ def create_app(
                 _record_task_submission,
             )
 
+        if _is_renewable_complexity_ranking_query(text):
+            _clear_pending_region(event, allowed_bot)
+            if allowed_bot == FEISHU_TASK_BOT:
+                result = _redirect_to_bot_command(
+                    WEATHER_TASK_BOT_ROLE,
+                    WEATHER_FORECAST_BOT_ROLE,
+                )
+            else:
+                result = _handle_renewable_complexity_ranking()
+            return await _send_feishu_event_response(
+                feishu_client,
+                event,
+                result,
+                _record_task_submission,
+            )
+
+        electricity_entities = parse_electricity_entities(text)
+        blocked_fact_types = list(
+            electricity_entities.data_boundary.blocked_fact_types
+        )
+        boundary_text = weather_only_boundary_answer(text)
+        if blocked_fact_types or boundary_text:
+            _clear_pending_region(event, allowed_bot)
+            boundary_text = boundary_text or (
+                "当前没有可回溯的外部电力数据，不能用天气或模型记忆补造实际值。"
+            )
+            if "actual_load" in blocked_fact_types:
+                boundary_text = (
+                    "当前没有可回溯的外部实际负荷数据。" + boundary_text
+                )
+            result = {
+                "status": "data_unavailable",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "external_power_data_required",
+                "blocked_fact_types": blocked_fact_types,
+                "electricity_entities": _electricity_entities_payload(
+                    electricity_entities
+                ),
+                "text": boundary_text,
+            }
+            return await _send_feishu_event_response(
+                feishu_client,
+                event,
+                result,
+                _record_task_submission,
+            )
+
+        if (
+            electricity_entities.clarification_required
+            and _has_electricity_weather_context(text, electricity_entities)
+        ):
+            _clear_pending_region(event, allowed_bot)
+            result = {
+                "status": "needs_clarification",
+                "bot_role": WEATHER_FORECAST_BOT_ROLE,
+                "mode": "electricity_entities",
+                "clarification_reasons": list(
+                    electricity_entities.clarification_reasons
+                ),
+                "electricity_entities": _electricity_entities_payload(
+                    electricity_entities
+                ),
+                "text": (
+                    "交易时段或分析区不够明确。请使用 00:00–23:59 的合法时刻，"
+                    "并指定省级或具体电力气象分析区。"
+                ),
+            }
+            return await _send_feishu_event_response(
+                feishu_client,
+                event,
+                result,
+                _record_task_submission,
+            )
+
+        if _has_electricity_weather_context(text, electricity_entities):
+            _clear_pending_region(event, allowed_bot)
+            if allowed_bot == FEISHU_TASK_BOT:
+                result = _redirect_to_bot_command(
+                    WEATHER_TASK_BOT_ROLE,
+                    WEATHER_FORECAST_BOT_ROLE,
+                )
+            else:
+                result = await _handle_electricity_weather_command(
+                    text,
+                    electricity_entities,
+                )
+            return await _send_feishu_event_response(
+                feishu_client,
+                event,
+                result,
+                _record_task_submission,
+            )
+
         pending_result = await _handle_pending_region_reply(text, event, allowed_bot, feishu_client)
         if pending_result:
             return await _send_feishu_event_response(feishu_client, event, pending_result, _record_task_submission)
 
+        if _is_group_chat(event) and not (
+            _is_task_submission_command(text)
+            or _is_task_command(text)
+            or _is_weather_command(text)
+            or _is_weather_knowledge_question(text)
+            or _is_reply_to_recorded_bot_message(event, allowed_bot)
+        ):
+            return {
+                "status": "ignored",
+                "bot_role": _bot_role_for_allowed_bot(allowed_bot),
+                "reason": "irrelevant_group_message",
+            }
+
         if allowed_bot == FEISHU_WEATHER_BOT:
             if _is_task_submission_command(text):
                 await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
-                result = await _handle_weather_command(text)
+                result = await _handle_weather_event_command(text, event, allowed_bot)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             if _is_task_command(text):
                 result = _redirect_to_bot_command(WEATHER_FORECAST_BOT_ROLE, WEATHER_TASK_BOT_ROLE)
@@ -1542,7 +2409,7 @@ def create_app(
                     await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
                 else:
                     _remember_pending_region(event, allowed_bot, "forecast", text)
-                result = await _handle_weather_command(text)
+                result = await _handle_weather_event_command(text, event, allowed_bot)
                 return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
             await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
             result = await _handle_general_command(text, allowed_bot, event)
@@ -1569,7 +2436,7 @@ def create_app(
 
         if _is_task_submission_command(text):
             await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
-            result = await _handle_weather_command(text)
+            result = await _handle_weather_event_command(text, event, allowed_bot)
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
         if _is_task_command(text):
             if _task_action_from_text(text) in {"query", "remind", "close"} or not _needs_task_region_clarification(text):
@@ -1585,7 +2452,7 @@ def create_app(
                 await _send_progress_message(feishu_client, event, WEATHER_FORECAST_BOT_ROLE)
             else:
                 _remember_pending_region(event, allowed_bot, "forecast", text)
-            result = await _handle_weather_command(text)
+            result = await _handle_weather_event_command(text, event, allowed_bot)
             return await _send_feishu_event_response(feishu_client, event, result, _record_task_submission)
         await _send_progress_message(feishu_client, event, _bot_role_for_allowed_bot(allowed_bot))
         result = await _handle_general_command(text, allowed_bot, event)
@@ -1597,7 +2464,20 @@ def create_app(
         feishu_client: FeishuClient,
         allowed_bot: str,
     ) -> dict[str, Any]:
+        candidate_event = payload.get("event") if isinstance(payload, dict) else None
+        if isinstance(candidate_event, dict):
+            # Callback JSON is attacker-controlled until token verification.
+            candidate_event.pop(_FEISHU_EVENT_AUTHENTICATED, None)
+            candidate_event.pop(_FEISHU_GROUP_ADDRESS_VERIFIED, None)
+        if not verify_feishu_token(
+            payload,
+            account.verification_token,
+            allow_unsigned=allow_unsigned_feishu_events,
+        ):
+            raise HTTPException(status_code=403, detail="Invalid Feishu verification token")
         event = payload.get("event", {}) if isinstance(payload, dict) else {}
+        if isinstance(event, dict):
+            event[_FEISHU_EVENT_AUTHENTICATED] = True
         header = payload.get("header", {}) if isinstance(payload, dict) else {}
         event_id = str(header.get("event_id")) if isinstance(header, dict) and header.get("event_id") else None
         if not event_id:
@@ -1631,8 +2511,13 @@ def create_app(
                         weather_memory.fail_event(allowed_bot, event_id)
                     else:
                         weather_memory.complete_event(allowed_bot, event_id, result)
-                except Exception:  # noqa: BLE001 - ledger failure must not turn a successful reply into fallback
-                    logger.exception("feishu_event_finalize_failed allowed_bot=%s event_id=%s", allowed_bot, event_id)
+                except Exception as exc:  # noqa: BLE001 - ledger failure must not turn a successful reply into fallback
+                    logger.error(
+                        "feishu_event_finalize_failed allowed_bot=%s event_id=%s error_type=%s",
+                        allowed_bot,
+                        event_id,
+                        safe_error_summary(exc),
+                    )
             return result
         except HTTPException:
             if event_id:
@@ -1641,8 +2526,12 @@ def create_app(
                 except Exception:  # noqa: BLE001
                     pass
             raise
-        except Exception:  # noqa: BLE001 - 永不沉默: 任何未预料异常都回复用户并 200
-            logger.exception("feishu_event_unhandled_error allowed_bot=%s", allowed_bot)
+        except Exception as exc:  # noqa: BLE001 - 永不沉默: 任何未预料异常都回复用户并 200
+            logger.error(
+                "feishu_event_unhandled_error allowed_bot=%s error_type=%s",
+                allowed_bot,
+                safe_error_summary(exc),
+            )
             if event_id:
                 try:
                     weather_memory.fail_event(allowed_bot, event_id)
@@ -1651,7 +2540,7 @@ def create_app(
             try:
                 event = payload.get("event", {}) if isinstance(payload, dict) else {}
                 chat_id = _event_chat_id(event)
-                if chat_id:
+                if chat_id and _passive_feishu_delivery_allowed(event):
                     fallback_text = (
                         "云云处理这条消息时出了点小状况😥 已经记下来修啦~\n"
                         "可以换个问法再试试：查天气用「城市 + 未来3天」；分析类问题稍后再问我一次。"
@@ -1690,6 +2579,8 @@ def _legacy_feishu_account(settings: Settings, verification_token_override: str 
         else settings.feishu_verification_token,
         encrypt_key=settings.feishu_encrypt_key,
         default_chat_id=settings.feishu_default_chat_id,
+        bot_open_id=settings.feishu_bot_open_id,
+        allow_name_mention_fallback=settings.feishu_allow_legacy_name_mentions,
         name=FEISHU_LEGACY_BOT,
     )
 
@@ -1704,6 +2595,9 @@ def _role_feishu_account(settings: Settings, role: str, legacy: FeishuBotAccount
             else legacy.verification_token,
             encrypt_key=settings.feishu_weather_encrypt_key or legacy.encrypt_key,
             default_chat_id=settings.feishu_weather_default_chat_id or legacy.default_chat_id,
+            bot_open_id=settings.feishu_weather_bot_open_id
+            or (legacy.bot_open_id if not settings.feishu_weather_app_id else None),
+            allow_name_mention_fallback=settings.feishu_allow_legacy_name_mentions,
             name=FEISHU_WEATHER_BOT,
         )
     if role == FEISHU_TASK_BOT:
@@ -1715,6 +2609,9 @@ def _role_feishu_account(settings: Settings, role: str, legacy: FeishuBotAccount
             else legacy.verification_token,
             encrypt_key=settings.feishu_task_encrypt_key or legacy.encrypt_key,
             default_chat_id=settings.feishu_task_default_chat_id or legacy.default_chat_id,
+            bot_open_id=settings.feishu_task_bot_open_id
+            or (legacy.bot_open_id if not settings.feishu_task_app_id else None),
+            allow_name_mention_fallback=settings.feishu_allow_legacy_name_mentions,
             name=FEISHU_TASK_BOT,
         )
     raise ValueError(f"Unknown Feishu bot role: {role}")
@@ -1832,6 +2729,39 @@ def _load_conversation_state(event: dict[str, Any], bot_role: str) -> dict[str, 
         return None
 
 
+def _load_briefing_context_state(
+    event: dict[str, Any],
+    bot_role: str,
+) -> dict[str, Any] | None:
+    key = _conversation_state_key(event, bot_role)
+    if not key:
+        return None
+    return _load_briefing_context_by_key(key)
+
+
+def _load_briefing_context_by_key(key: str) -> dict[str, Any] | None:
+    try:
+        state = weather_memory.load_briefing_context(key)
+        if state:
+            return state
+        # Expand/contract migration: accept an old mixed row for one TTL window.
+        legacy = weather_memory.load_conversation_state(key)
+        if legacy and legacy.get("last_power_briefing_cache_key"):
+            return {
+                "state_version": legacy.get("state_version", 1),
+                "last_power_briefing_cache_key": legacy.get(
+                    "last_power_briefing_cache_key"
+                ),
+                "last_power_briefing_generated_at": legacy.get(
+                    "last_power_briefing_generated_at"
+                ),
+                "source": legacy.get("source"),
+            }
+    except Exception:  # noqa: BLE001 - memory is best effort
+        return None
+    return None
+
+
 def _load_shared_briefing_thread_state(
     event: dict[str, Any],
     bot_role: str,
@@ -1848,7 +2778,7 @@ def _load_shared_briefing_thread_state(
         _event_chat_type(event),
     )
     try:
-        return weather_memory.load_conversation_state(key)
+        return _load_briefing_context_by_key(key)
     except Exception:  # noqa: BLE001 - memory is best effort
         return None
 
@@ -1870,7 +2800,13 @@ def _pending_region_key(
     thread_id: str = "",
     chat_type: str = "",
 ) -> str:
-    return f"{allowed_bot}:{chat_type or 'unknown'}:{chat_id}:{sender_id}:{thread_id}"
+    return _conversation_key(
+        _bot_role_for_allowed_bot(allowed_bot),
+        chat_id,
+        thread_id,
+        sender_id,
+        chat_type,
+    )
 
 
 def _merge_pending_region_text(region_text: str, pending: dict[str, Any]) -> str:
@@ -1883,30 +2819,288 @@ def _merge_pending_region_text(region_text: str, pending: dict[str, Any]) -> str
     return f"{region_text} {target_date} 未来{days}天{suffix}"
 
 
-def _is_addressed_to_bot(_text: str, event: dict[str, Any], allowed_bot: str) -> bool:
+def _is_addressed_to_bot(
+    _text: str,
+    event: dict[str, Any],
+    allowed_bot: str,
+    account: FeishuBotAccount,
+) -> bool:
     aliases = _bot_aliases(allowed_bot)
     if not aliases:
         return False
     if _is_direct_chat(event):
         return True
 
-    mention_values = _event_mention_texts(event)
-    return any(alias in item for alias in aliases for item in mention_values)
+    message = event.get("message", {}) if isinstance(event, dict) else {}
+    mentions = message.get("mentions") if isinstance(message, dict) else None
+    return mentions_expected_bot(
+        mentions,
+        expected_open_id=account.bot_open_id,
+        aliases=aliases,
+        allow_name_fallback=account.allow_name_mention_fallback,
+    )
 
 
 def _is_legacy_specialized_event_addressed(
     text: str,
     event: dict[str, Any],
     allowed_bot: str,
+    account: FeishuBotAccount,
 ) -> bool:
     """Compatibility for old webhook fixtures that omit chat_type and structured mentions."""
     aliases = _bot_aliases(allowed_bot)
-    searchable = [text, *_event_mention_texts(event)]
-    return any(alias in item for alias in aliases for item in searchable)
+    message = event.get("message", {}) if isinstance(event, dict) else {}
+    mentions = message.get("mentions") if isinstance(message, dict) else None
+    if isinstance(mentions, list):
+        return mentions_expected_bot(
+            mentions,
+            expected_open_id=account.bot_open_id,
+            aliases=aliases,
+            allow_name_fallback=account.allow_name_mention_fallback,
+        )
+    if not account.allow_name_mention_fallback:
+        return False
+    return any(alias in text for alias in aliases)
 
 
 def _is_group_chat(event: dict[str, Any]) -> bool:
     return _event_chat_type(event) in {"group", "group_chat"}
+
+
+def _passive_feishu_delivery_allowed(event: dict[str, Any]) -> bool:
+    """Permit an authenticated direct reply or a structurally addressed group."""
+
+    if not isinstance(event, dict) or event.get(_FEISHU_EVENT_AUTHENTICATED) is not True:
+        return False
+    if _is_group_chat(event):
+        return event.get(_FEISHU_GROUP_ADDRESS_VERIFIED) is True
+    return True
+
+
+def _is_automated_sender(event: dict[str, Any]) -> bool:
+    sender = event.get("sender", {}) if isinstance(event, dict) else {}
+    sender_type = sender.get("sender_type") if isinstance(sender, dict) else None
+    return str(sender_type or "").strip().lower() in {"app", "bot"}
+
+
+_ELECTRICITY_WEATHER_CONTEXT_RE = re.compile(
+    r"早峰|晚峰|午间光伏|日前|日内|实时市场|负荷压力|光资源|光伏|风资源|"
+    r"风电爬坡|水电|新能源预测偏差|电网风险|分析区|Top\s*5|"
+    r"数据源分歧|置信度|预报相比|预报版本",
+    re.IGNORECASE,
+)
+
+_WIND_RAMP_QUERY_RE = re.compile(r"(?:风电|风资源|风速).{0,8}(?:爬坡|快速变化|大幅波动)")
+_PROVIDER_DISAGREEMENT_QUERY_RE = re.compile(
+    r"(?:数据源|来源|预报源).{0,8}(?:分歧|差异|不一致)|"
+    r"(?:两个|多源).{0,8}(?:分歧|差异)"
+)
+_CONFIDENCE_EXPLANATION_QUERY_RE = re.compile(
+    r"(?:为什么|为何).{0,8}置信度|置信度.{0,8}(?:为什么|为何|怎么|依据)"
+)
+_FORECAST_VERSION_CHANGE_QUERY_RE = re.compile(
+    r"(?:和|与)?昨天.{0,8}预报.{0,8}(?:相比|变化|变了)|"
+    r"预报版本.{0,8}(?:相比|变化|差异)"
+)
+_RENEWABLE_COMPLEXITY_RANKING_QUERY_RE = re.compile(
+    r"(?:哪个|哪些|哪一个)(?:省|市场|分析区)?.{0,12}"
+    r"新能源预测(?:偏差|复杂度|不确定性).{0,8}(?:最大|最高|排行|排名)|"
+    r"新能源预测(?:偏差|复杂度|不确定性).{0,8}(?:哪个|哪些|Top)"
+)
+
+
+def _is_wind_ramp_query(text: str) -> bool:
+    return bool(_WIND_RAMP_QUERY_RE.search(text or ""))
+
+
+def _is_provider_disagreement_query(text: str) -> bool:
+    return bool(_PROVIDER_DISAGREEMENT_QUERY_RE.search(text or ""))
+
+
+def _is_confidence_explanation_query(text: str) -> bool:
+    return bool(_CONFIDENCE_EXPLANATION_QUERY_RE.search(text or ""))
+
+
+def _is_forecast_version_change_query(text: str) -> bool:
+    return bool(_FORECAST_VERSION_CHANGE_QUERY_RE.search(text or ""))
+
+
+def _is_renewable_complexity_ranking_query(text: str) -> bool:
+    return bool(_RENEWABLE_COMPLEXITY_RANKING_QUERY_RE.search(text or ""))
+
+_OFFICIAL_WARNING_QUERY_RE = re.compile(
+    r"(?:官方|气象台|预警中心).{0,10}(?:预警|警报)|"
+    r"(?:预警|警报).{0,10}(?:官方|气象台|预警中心)"
+)
+_OFFICIAL_WARNING_TYPES = (
+    "高温",
+    "暴雨",
+    "雷电",
+    "大风",
+    "冰冻",
+    "寒潮",
+    "台风",
+    "强对流",
+    "暴雪",
+    "大雾",
+    "沙尘暴",
+)
+
+
+def _is_official_warning_query(text: str) -> bool:
+    return bool(_OFFICIAL_WARNING_QUERY_RE.search(text or ""))
+
+
+def _official_warning_type_from_text(text: str) -> str | None:
+    return next((item for item in _OFFICIAL_WARNING_TYPES if item in (text or "")), None)
+
+
+def _has_electricity_weather_context(
+    text: str,
+    entities: ElectricityEntities,
+) -> bool:
+    if any(
+        area.kind in {"analysis_zone", "regional_collection", "national"}
+        for area in entities.analysis_areas
+    ):
+        return True
+    return bool(
+        entities.trading_window
+        or entities.market_stage
+        or _ELECTRICITY_WEATHER_CONTEXT_RE.search(text)
+    )
+
+
+def _electricity_entities_payload(entities: ElectricityEntities) -> dict[str, Any]:
+    return jsonable_encoder(asdict(entities))
+
+
+def _text_without_analysis_area_spans(
+    text: str,
+    entities: ElectricityEntities,
+) -> str:
+    """Remove already-resolved scope spans before prepending a representative point.
+
+    This prevents a province plus its configured city point from being mistaken
+    for a two-region comparison while preserving the user's time and metric text.
+    """
+
+    chars = list(text)
+    for area in sorted(
+        entities.analysis_areas,
+        key=lambda item: item.evidence.start,
+        reverse=True,
+    ):
+        start, end = area.evidence.start, area.evidence.end
+        if 0 <= start < end <= len(chars):
+            del chars[start:end]
+    return re.sub(r"\s+", " ", "".join(chars)).strip(" ，,。；;：:")
+
+
+def _electricity_representative_point(
+    text: str,
+    entities: ElectricityEntities,
+) -> tuple[MarketZone, RepresentativePoint] | None:
+    zone_ids = tuple(
+        dict.fromkeys(
+            zone_id
+            for area in entities.analysis_areas
+            for zone_id in area.analysis_zone_ids
+        )
+    )
+    if len(zone_ids) != 1:
+        return None
+    market = next(
+        (item for item in NATIONAL_MARKETS if item.market_id == zone_ids[0]),
+        None,
+    )
+    if market is None or not market.points:
+        return None
+    desired_role = (
+        "solar"
+        if re.search(r"光伏|光资源|辐照", text)
+        else "wind"
+        if re.search(r"风资源|风电|风速|大风", text)
+        else "hydrology"
+        if re.search(r"水电|来水|水文", text)
+        else "load"
+    )
+    point = next(
+        (item for item in market.points if desired_role in item.roles),
+        market.points[0],
+    )
+    return market, point
+
+
+def _electricity_window_weather_summary(
+    submission: WeatherSubmission | None,
+    window: TradingWindow | None,
+) -> str:
+    if submission is None:
+        return "代表点气象数据不可用，未生成时段代理。"
+    points = submission.aggregated_forecast.points
+    if window is not None:
+        start = window.start_time
+        end = window.end_time
+
+        def in_window(point: Any) -> bool:
+            try:
+                point_time = datetime.fromisoformat(str(point.time)).time()
+            except (TypeError, ValueError):
+                return False
+            if start <= end:
+                return start <= point_time <= end
+            return point_time >= start or point_time <= end
+
+        points = [point for point in points if in_window(point)]
+    if not points:
+        return "所选时段缺少完整小时数据，未生成数值代理。"
+
+    temperatures = [point.temperature for point in points if point.temperature is not None]
+    rains = [
+        point.precipitation_probability
+        for point in points
+        if point.precipitation_probability is not None
+    ]
+    winds = [point.wind_speed for point in points if point.wind_speed is not None]
+    parts: list[str] = []
+    if temperatures:
+        parts.append(f"气温 {min(temperatures):.0f}–{max(temperatures):.0f}℃")
+    if rains:
+        parts.append(f"最高降水概率 {max(rains):.0f}%")
+    if winds:
+        parts.append(f"10米风最高 {max(winds):.1f}m/s")
+    return "；".join(parts) if parts else "所选时段没有可用气象指标。"
+
+
+def _prepend_electricity_scope_notice(
+    card: object,
+    market: MarketZone,
+    point: RepresentativePoint,
+    window: TradingWindow | None,
+    window_summary: str,
+) -> None:
+    if not isinstance(card, dict):
+        return
+    card_body = card.get("card")
+    elements = card_body.get("elements") if isinstance(card_body, dict) else None
+    if not isinstance(elements, list):
+        return
+    window_label = window.label if window is not None else "用户指定日期"
+    scope_text = (
+        f"⚡ **电力气象分析口径**\n"
+        f"{market.market_name.removesuffix('样本区')}｜{window_label}｜"
+        f"{point.city}代表点：{window_summary}\n"
+        "仅为气象事实和气象侧代理；实际负荷、风光出力、供需与价格方向"
+        "需要可回溯的外部电力数据核查，不能由天气单独推断。"
+    )
+    elements.insert(
+        0,
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": scope_text},
+        },
+    )
 
 
 def _event_message_type(event: dict[str, Any]) -> str:
@@ -1945,6 +3139,7 @@ def _remember_bot_reply_message(
                 "message_id": message_id,
                 "bot_role": bot_role,
             },
+            ttl_seconds=weather_memory.BRIEFING_CONTEXT_TTL_SECONDS,
         )
     except Exception:  # noqa: BLE001 - a delivered reply must not be retried or duplicated
         logger.exception("feishu_bot_reply_marker_save_failed chat_id=%s", chat_id)
@@ -1998,7 +3193,7 @@ def _is_reply_to_recorded_bot_message(event: dict[str, Any], allowed_bot: str) -
                 "*",
                 _event_chat_type(event),
             )
-            scheduled_state = weather_memory.load_conversation_state(scheduled_key)
+            scheduled_state = _load_briefing_context_by_key(scheduled_key)
             if (
                 allowed_bot in {FEISHU_WEATHER_BOT, FEISHU_LEGACY_BOT}
                 and scheduled_state
@@ -2057,6 +3252,33 @@ def _string_values(value: Any) -> list[str]:
     return []
 
 
+def _briefing_snapshot_explanation(snapshot: dict[str, Any]) -> str:
+    evidence_lines: list[str] = []
+    for value in _string_values(snapshot.get("summary_card")):
+        for raw_line in value.splitlines():
+            line = raw_line.strip()
+            if (
+                line.startswith("- **")
+                and any(keyword in line for keyword in ("风险", "压力", "资源", "较今日", "驱动"))
+                and line not in evidence_lines
+            ):
+                evidence_lines.append(line)
+            if len(evidence_lines) >= 3:
+                break
+        if len(evidence_lines) >= 3:
+            break
+
+    statistics = snapshot.get("statistics") if isinstance(snapshot.get("statistics"), dict) else {}
+    generated_at = str(snapshot.get("generated_at") or "未知")
+    header = (
+        f"我读取的是同一份晨报快照（生成时间 {generated_at}），没有重新抓取天气。"
+        f"该快照列出 {int(statistics.get('top_risks') or 0)} 个优先风险。"
+    )
+    if not evidence_lines:
+        return header + " 风险变化依据仍以原卡片中的时段、天气驱动和较今日变化为准。"
+    return header + "\n快照中的主要依据：\n" + "\n".join(evidence_lines)
+
+
 def _redirect_to_bot_command(current_bot_role: str, suggested_bot_role: str) -> dict[str, str]:
     if current_bot_role == WEATHER_TASK_BOT_ROLE:
         suggested_bot_name = "气象小助手云云"
@@ -2086,13 +3308,21 @@ async def _send_feishu_event_response(
     submissions_to_record = result.pop("_record_submissions", None)
     memory_submissions = result.pop("_memory_submissions", None)  # 即时查询: 仅供记忆, 不写 Bitable
     chat_id = _event_chat_id(event)
+    if not _passive_feishu_delivery_allowed(event):
+        logger.warning(
+            "feishu_event_delivery_blocked status=%s bot_role=%s chat_type=%s",
+            result.get("status"),
+            result.get("bot_role"),
+            _event_chat_type(event),
+        )
+        return result
     if not chat_id or result.get("status") == "ignored":
         if isinstance(submission_to_record, WeatherSubmission) and record_submission:
             try:
                 await record_submission(submission_to_record, None)
                 result["submission_record_status"] = "accepted"
             except Exception as exc:  # noqa: BLE001 - event ack should not depend on Bitable writes
-                result["submission_record_error"] = str(exc)
+                result["submission_record_error"] = safe_error_summary(exc)
         if isinstance(submissions_to_record, list) and record_submission:
             try:
                 recorded = 0
@@ -2103,7 +3333,7 @@ async def _send_feishu_event_response(
                 result["submission_record_status"] = "accepted"
                 result["submission_record_count"] = recorded
             except Exception as exc:  # noqa: BLE001 - event ack should not depend on Bitable writes
-                result["submission_record_error"] = str(exc)
+                result["submission_record_error"] = safe_error_summary(exc)
         logger.warning(
             "feishu_event_result status=%s bot_role=%s has_chat_id=%s",
             result.get("status"),
@@ -2144,13 +3374,13 @@ async def _send_feishu_event_response(
                 str(result.get("bot_role") or ""),
             )
     except Exception as exc:  # noqa: BLE001 - ack the event even when message delivery fails
-        result["event_reply_error"] = str(exc)
+        result["event_reply_error"] = safe_error_summary(exc)
     if isinstance(submission_to_record, WeatherSubmission) and record_submission:
         try:
             await record_submission(submission_to_record, message_id or None)
             result["submission_record_status"] = "accepted"
         except Exception as exc:  # noqa: BLE001 - event ack should not depend on Bitable writes
-            result["submission_record_error"] = str(exc)
+            result["submission_record_error"] = safe_error_summary(exc)
     if isinstance(submissions_to_record, list) and record_submission:
         try:
             recorded = 0
@@ -2161,7 +3391,7 @@ async def _send_feishu_event_response(
             result["submission_record_status"] = "accepted"
             result["submission_record_count"] = recorded
         except Exception as exc:  # noqa: BLE001 - event ack should not depend on Bitable writes
-            result["submission_record_error"] = str(exc)
+            result["submission_record_error"] = safe_error_summary(exc)
     logger.warning(
         "feishu_event_result status=%s bot_role=%s has_chat_id=%s reply_message_id=%s reply_error=%s",
         result.get("status"),
@@ -2184,6 +3414,9 @@ async def _send_feishu_event_response(
         _bot_text = result.get("text") if isinstance(result.get("text"), str) else ""
         if not _bot_text and result.get("card"):
             _bot_text = _card_memory_summary(_pref_subs) or "[已发送天气卡片]"
+        query_state_ttl_seconds = weather_memory.conversation_query_ttl_seconds(
+            _event_chat_type(event)
+        )
         _record_conversation_turn(
             result.get("bot_role") or "",
             chat_id,
@@ -2201,10 +3434,12 @@ async def _send_feishu_event_response(
         ):
             state_key = _conversation_state_key(event, WEATHER_FORECAST_BOT_ROLE)
             if state_key:
-                state = weather_memory.load_conversation_state(state_key) or {"state_version": 1}
+                state = weather_memory.load_briefing_context(state_key) or {
+                    "state_version": 2
+                }
                 state["last_power_briefing_cache_key"] = briefing_cache_key
                 state["last_power_briefing_generated_at"] = result.get("generated_at")
-                weather_memory.save_conversation_state(state_key, state)
+                weather_memory.save_briefing_context(state_key, state)
                 if message_id and not _event_thread_id(event):
                     reply_thread_key = _conversation_key(
                         WEATHER_FORECAST_BOT_ROLE,
@@ -2213,11 +3448,13 @@ async def _send_feishu_event_response(
                         _event_sender_id(event),
                         _event_chat_type(event),
                     )
-                    weather_memory.save_conversation_state(reply_thread_key, state)
+                    weather_memory.save_briefing_context(reply_thread_key, state)
         if _pref_subs:
             state_key = _conversation_state_key(event, WEATHER_FORECAST_BOT_ROLE)
             if state_key:
                 state = weather_memory.load_conversation_state(state_key) or {"state_version": 1}
+                state.pop("last_power_briefing_cache_key", None)
+                state.pop("last_power_briefing_generated_at", None)
                 first = _pref_subs[0]
                 state["last_successful_request"] = {
                     "region": getattr(first, "region", None),
@@ -2225,7 +3462,11 @@ async def _send_feishu_event_response(
                     "days": max(1, int(result.get("days") or len(_pref_subs))),
                     "metrics": result.get("metrics") or [],
                 }
-                weather_memory.save_conversation_state(state_key, state)
+                weather_memory.save_conversation_state(
+                    state_key,
+                    state,
+                    ttl_seconds=query_state_ttl_seconds,
+                )
                 if message_id and not _event_thread_id(event):
                     reply_thread_key = _conversation_key(
                         WEATHER_FORECAST_BOT_ROLE,
@@ -2234,7 +3475,11 @@ async def _send_feishu_event_response(
                         _event_sender_id(event),
                         _event_chat_type(event),
                     )
-                    weather_memory.save_conversation_state(reply_thread_key, state)
+                    weather_memory.save_conversation_state(
+                        reply_thread_key,
+                        state,
+                        ttl_seconds=query_state_ttl_seconds,
+                    )
         task_payload = result.get("task")
         if isinstance(task_payload, dict) and task_payload.get("task_id"):
             state_key = _conversation_state_key(event, WEATHER_TASK_BOT_ROLE)
@@ -2318,6 +3563,11 @@ _DATE_SIGNAL_RE = re.compile(
 _WINDOW_SIGNAL_RE = re.compile(r"(?:未来|接下来|最近|改成)\s*[一二两三四五六七八九十\d]+\s*[天日]")
 
 
+def _is_retry_command(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return bool(re.fullmatch(r"(?:请)?(?:重试(?:一下)?|再试(?:一次|一下)?|重新试(?:一下)?)", compact))
+
+
 def _region_from_followup_fragment(fragment: str) -> str | None:
     candidate = re.split(
         r"未来|接下来|最近|今天|今日|明天|明日|后天|天气|气象|预报|降雨|降水|温度|风速|云量",
@@ -2348,6 +3598,8 @@ def _region_expression_for_followup(region: str) -> str:
 def _contextual_weather_text(
     text: str,
     event: dict[str, Any],
+    *,
+    bot_role: str = WEATHER_FORECAST_BOT_ROLE,
 ) -> tuple[str, str | None]:
     """Merge a short weather follow-up with the last successful request.
 
@@ -2355,10 +3607,10 @@ def _contextual_weather_text(
     acknowledge a context reset without issuing a weather request.
     """
     if _CONTEXT_RESET_RE.search(text):
-        _clear_conversation_state(event, WEATHER_FORECAST_BOT_ROLE)
+        _clear_conversation_state(event, bot_role)
         return text, "reset"
 
-    state = _load_conversation_state(event, WEATHER_FORECAST_BOT_ROLE) or {}
+    state = _load_conversation_state(event, bot_role) or {}
     last = state.get("last_successful_request")
     if not isinstance(last, dict) or not last.get("region"):
         return text, None
@@ -2533,12 +3785,18 @@ def _is_power_briefing_command(text: str) -> bool:
         "电力气象决策晨报" in compact
         or "电力气象晨报" in compact
         or "晨报2.0" in compact
+        or "晨报3.0" in compact
     )
     has_generate_action = any(
         keyword in compact
         for keyword in ("生成", "出一份", "出个", "预览", "查看", "给我", "测试")
     )
-    concise_daily_request = bool(re.fullmatch(r"(?:今天|今日|明天)?(?:的)?(?:电力气象)?晨报(?:2\.0)?", compact))
+    concise_daily_request = bool(
+        re.fullmatch(
+            r"(?:今天|今日|明天)?(?:的)?(?:电力气象)?晨报(?:[23]\.0)?",
+            compact,
+        )
+    )
     return has_briefing_name and (has_generate_action or concise_daily_request)
 
 
@@ -2555,6 +3813,13 @@ def _is_power_briefing_expand_command(text: str) -> bool:
             "晨报完整明细",
         )
     )
+
+
+def _is_power_briefing_explanation_command(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    asks_reason = any(keyword in compact for keyword in ("为什么", "为何", "原因", "怎么升高", "怎么上升"))
+    mentions_risk = any(keyword in compact for keyword in ("风险", "压力", "升高", "上升", "变高"))
+    return asks_reason and mentions_risk
 
 
 def _task_action_from_text(text: str) -> str | None:
@@ -2698,9 +3963,20 @@ def _weather_knowledge_fallback(text: str) -> str:
     return (
         "可以，我直接解释，不需要城市模板卡片。\n"
         "- 数据来源：当前预测主要来自公开气象接口，并在结果中标注实际使用的数据源。\n"
-        "- 更新时间：不同数据源更新时间不同，卡片里的“数据截止”表示本次预测使用数据的截止时间。\n"
+        "- 更新时间：不同数据源更新时间可能不同；卡片里的“抓取时间”是本次外部接口请求完成时间，数据源起报时间会在可取得时单独记录。D-1 16:00 仅是业务提交截止，不代表数据新鲜度。\n"
         "- 预测不确定性：多日预报、局地短时降水、云量和风速变化通常不确定性更高；所以结果会给出风险提示和置信度说明。\n"
         "- 适用边界：这些结果适合社区共建、评分和复盘参考，不等同于官方预警或交易建议。"
+    )
+
+
+def _requires_live_typhoon_data(text: str) -> bool:
+    if not mentions_typhoon(text):
+        return False
+    return bool(
+        re.search(
+            r"当前|现在|实时|最新|路径|位置|强度|移动|登陆|登录|中心|风力|预报",
+            text,
+        )
     )
 
 
@@ -3069,7 +4345,7 @@ def _help_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
         "• @云云 武汉未来三天天气",
         "• @云云 北京气象预测 2026-06-10",
         "• @云云 22.8016,113.5252 明天天气",
-        "• @云云 生成今天的电力气象决策晨报 2.0",
+        "• @云云 生成今天的电力气象决策晨报 3.0",
         "• @云云 展开全部分析区",
     ]
     task_help = [
@@ -3091,6 +4367,14 @@ def _help_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
     if allowed_bot == FEISHU_TASK_BOT:
         return "\n".join(task_help)
     return "\n".join([*weather_help, "", *task_help])
+
+
+def _capability_boundary_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
+    if allowed_bot == FEISHU_TASK_BOT:
+        return "我主要处理气象任务的发布、查询、提醒和关闭，暂不参与闲聊。需要天气预测请找云云。"
+    if allowed_bot == FEISHU_WEATHER_BOT:
+        return "我主要处理天气预报、电力气象风险代理、晨报和数据来源说明，暂不参与闲聊。可以直接发“城市 + 日期/时段 + 指标”。"
+    return "我主要处理天气预报、电力气象风险代理，以及气象任务的发布和查询，暂不参与闲聊。可以直接说明地点、日期和需求。"
 
 
 app = create_app()

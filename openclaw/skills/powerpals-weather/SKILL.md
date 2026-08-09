@@ -35,6 +35,14 @@ The service base URL is read from:
 POWERPALS_WEATHER_API_BASE
 ```
 
+Administrative write and publish APIs also require:
+
+```text
+POWERPALS_WEATHER_ADMIN_TOKEN
+```
+
+The token is sent only to the configured PowerPals API as `Authorization: Bearer ...`. Never print it or include it in generated reports.
+
 ## Forecast API
 
 Single day:
@@ -107,6 +115,7 @@ Publish a task:
 
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/tasks/weather/publish" \
+  -H "Authorization: Bearer $POWERPALS_WEATHER_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"region":"广州","target_date":"YYYY-MM-DD"}'
 ```
@@ -115,6 +124,7 @@ Send a reminder:
 
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/tasks/weather/remind" \
+  -H "Authorization: Bearer $POWERPALS_WEATHER_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"region":"广州","target_date":"YYYY-MM-DD"}'
 ```
@@ -123,6 +133,7 @@ Close the submission window:
 
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/tasks/weather/close" \
+  -H "Authorization: Bearer $POWERPALS_WEATHER_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"region":"广州","target_date":"YYYY-MM-DD"}'
 ```
@@ -151,6 +162,7 @@ Favorite location:
 
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/locations" \
+  -H "Authorization: Bearer $POWERPALS_WEATHER_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"alias":"南沙基地","name":"广州南沙","latitude":22.8016,"longitude":113.5252}'
 ```
@@ -159,6 +171,7 @@ News digest item:
 
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/news/items" \
+  -H "Authorization: Bearer $POWERPALS_WEATHER_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"title":"广东电力市场动态","source":"示例来源","url":"https://example.com/news","tags":["电力交易"]}'
 ```
@@ -167,6 +180,7 @@ Hydrology record:
 
 ```bash
 curl -s -X POST "$POWERPALS_WEATHER_API_BASE/api/hydrology/records" \
+  -H "Authorization: Bearer $POWERPALS_WEATHER_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"station":"示例水库","basin":"珠江","water_level":12.3,"flow":456.7,"observed_at":"YYYY-MM-DDT08:00:00+08:00"}'
 ```

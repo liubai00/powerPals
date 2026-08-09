@@ -5,7 +5,14 @@ from urllib.parse import parse_qs, urlparse
 from jsonschema import validate
 
 from services.weather_bot.cards import build_feishu_card, build_text_summary, build_weather_comparison_card
-from services.weather_bot.models import AggregatedForecast, ForecastPoint, ForecastSummary, ScopeProfile, WeatherSubmission
+from services.weather_bot.models import (
+    AggregatedForecast,
+    ForecastPoint,
+    ForecastSummary,
+    ScopeProfile,
+    TimeInfo,
+    WeatherSubmission,
+)
 
 
 def make_submission() -> WeatherSubmission:
@@ -14,6 +21,10 @@ def make_submission() -> WeatherSubmission:
         region="广东省深圳市",
         target_date="2026-06-10",
         data_cutoff_time="2026-06-09T16:00:00+08:00",
+        time_info=TimeInfo(
+            retrieved_at="2026-06-09T15:42:00+08:00",
+            business_submission_deadline="2026-06-09T16:00:00+08:00",
+        ),
         provider_results=[],
         aggregated_forecast=AggregatedForecast(
             providers_used=["open_meteo", "qweather"],
@@ -44,15 +55,38 @@ def make_submission() -> WeatherSubmission:
 
 
 def card_text(card: dict) -> str:
-    texts = []
-    for element in card["card"]["elements"]:
-        text = element.get("text")
-        if isinstance(text, dict):
-            texts.append(text.get("content", ""))
-        for item in element.get("elements", []):
-            if isinstance(item, dict):
-                texts.append(item.get("content", ""))
+    texts: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            if value.get("tag") in {"lark_md", "plain_text"} and isinstance(value.get("content"), str):
+                texts.append(value["content"])
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(card.get("card", {}).get("elements", []))
     return "\n".join(texts)
+
+
+def card_elements_by_tag(card: dict, tag: str) -> list[dict]:
+    """Collect nested Feishu elements without depending on the card grid layout."""
+    matches: list[dict] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            if value.get("tag") == tag:
+                matches.append(value)
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(card.get("card", {}).get("elements", []))
+    return matches
 
 
 def test_text_summary_contains_required_fields_and_disclaimer():
@@ -60,7 +94,9 @@ def test_text_summary_contains_required_fields_and_disclaimer():
 
     assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in summary
     assert "广东省深圳市" in summary
-    assert "数据截止" in summary
+    assert "数据抓取时间：2026-06-09T15:42:00+08:00" in summary
+    assert "业务提交截止：2026-06-09T16:00:00+08:00" in summary
+    assert "数据截止" not in summary
     assert "不构成交易建议" in summary
 
 
@@ -69,7 +105,99 @@ def test_feishu_card_uses_message_card_shape():
 
     assert card["msg_type"] == "interactive"
     assert "card" in card
-    assert card["card"]["header"]["title"]["content"] == "广东省深圳市气象预测"
+    assert card["card"]["header"]["title"]["content"].endswith("广东省深圳市气象预测")
+
+
+def test_feishu_card_marks_missing_retrieval_time_and_labels_business_deadline():
+    submission = make_submission().model_copy(
+        update={
+            "time_info": TimeInfo(
+                business_submission_deadline="2026-06-09T16:00:00+08:00",
+            )
+        }
+    )
+
+    text = card_text(build_feishu_card(submission))
+
+    assert "抓取时间 未记录" in text
+    assert "业务提交截止 06-09 16:00" in text
+    assert "数据截止" not in text
+
+
+def test_feishu_card_converts_utc_retrieval_time_to_shanghai_time():
+    submission = make_submission().model_copy(
+        update={
+            "time_info": TimeInfo(
+                retrieved_at="2026-06-09T07:42:00+00:00",
+                business_submission_deadline="2026-06-09T16:00:00+08:00",
+            )
+        }
+    )
+
+    text = card_text(build_feishu_card(submission))
+
+    assert "抓取时间 06-09 15:42" in text
+
+
+def test_feishu_card_power_insight_only_describes_weather_proxies_and_verification_boundary():
+    submission = make_submission()
+    risky_summary = submission.aggregated_forecast.summary.model_copy(
+        update={
+            "max_temperature": 37.0,
+            "wind_speed": 13.0,
+            "rain_probability": 75.0,
+            "cloud_cover": 85.0,
+        }
+    )
+    submission = submission.model_copy(
+        update={
+            "aggregated_forecast": submission.aggregated_forecast.model_copy(
+                update={"summary": risky_summary}
+            )
+        }
+    )
+
+    text = card_text(build_feishu_card(submission))
+
+    assert "负荷天气压力代理" in text
+    assert "10米地面风资源代理" in text
+    assert "光资源代理" in text
+    assert "实际负荷、风光出力、供需和价格方向待结合电力数据核查" in text
+    for forbidden in (
+        "供需偏紧",
+        "现货承压",
+        "现货或承压",
+        "电价支撑",
+        "电价有支撑",
+        "风电出力",
+        "光伏出力",
+        "光伏大发",
+    ):
+        assert forbidden not in text
+
+
+def test_feishu_card_neutral_power_insight_keeps_explicit_proxy_terms():
+    submission = make_submission()
+    neutral_summary = submission.aggregated_forecast.summary.model_copy(
+        update={
+            "max_temperature": 28.0,
+            "wind_speed": 6.0,
+            "rain_probability": 20.0,
+            "cloud_cover": 60.0,
+        }
+    )
+    submission = submission.model_copy(
+        update={
+            "aggregated_forecast": submission.aggregated_forecast.model_copy(
+                update={"summary": neutral_summary}
+            )
+        }
+    )
+
+    text = card_text(build_feishu_card(submission))
+
+    assert "负荷天气压力代理、10米地面风资源代理和光资源代理整体平稳" in text
+    assert "实际负荷、风光出力、供需和价格方向待结合电力数据核查" in text
 
 
 def test_feishu_card_labels_province_forecast_as_representative_point():
@@ -93,39 +221,43 @@ def test_feishu_card_labels_province_forecast_as_representative_point():
     assert card["card"]["header"]["title"]["content"].endswith("辽宁省（沈阳代表点）气象预测")
 
 
-def test_feishu_card_defaults_to_instant_query_display():
+def test_feishu_card_defaults_to_instant_query_display_with_traceable_metadata():
     card = build_feishu_card(make_submission())
     text = card_text(card)
 
     assert "任务 ID" not in text
     assert "正式提交" not in text
-    assert not [element for element in card["card"]["elements"] if element.get("tag") == "note"]
+    notes = card_elements_by_tag(card, "note")
+    assert len(notes) == 1
+    assert "抓取时间 06-09 15:42" in text
+    assert "业务提交截止 06-09 16:00" in text
+    assert "来源 open_meteo / qweather" in text
 
 
-def test_feishu_card_uses_detailed_forecast_body():
+def test_feishu_card_uses_compact_forecast_body_and_power_data_boundary():
     card = build_feishu_card(make_submission())
     text = card_text(card)
 
-    assert "- 最高温：32.5℃" in text
-    assert "- 最低温：27.4℃" in text
-    assert "- 降水概率：45.0%" in text
-    assert "主要影响因素" in text
-    assert "1. 副热带高压影响" in text
-    assert "风险提示" in text
-    assert "- 短时强降水可能导致局地误差放大" in text
+    assert "32° / 27°" in text
+    assert "💧45%" in text
+    assert "💨3m/s" in text
+    assert "关键指标" in text
+    assert "高风险：14:00-18:00 局地降水不确定性较高" in text
+    assert "负荷天气压力代理" in text
+    assert "实际负荷、风光出力、供需和价格方向待结合电力数据核查" in text
 
 
 def test_feishu_card_can_focus_on_requested_metric():
     card = build_feishu_card(make_submission(), metrics=["rain"])
     text = card_text(card)
-    charts = [element for element in card["card"]["elements"] if element.get("tag") == "chart"]
+    charts = card_elements_by_tag(card, "chart")
 
-    assert "- 降水概率：45.0%" in text
-    assert "- 主要天气：多云，局部有阵雨" in text
-    assert "- 最高温" not in text
-    assert "- 风速" not in text
+    assert "🌧️ 降水概率 %" in text
+    assert "🌡️ 气温" not in text
+    assert "💨 风" not in text
     assert len(charts) == 1
-    assert charts[0]["chart_spec"]["title"]["text"] == "小时降水概率（%）"
+    assert charts[0]["chart_spec"]["type"] == "bar"
+    assert charts[0]["chart_spec"]["yField"] == "rain_probability"
 
 
 def test_feishu_card_shows_range_for_multi_day_predictions():
@@ -136,7 +268,6 @@ def test_feishu_card_shows_range_for_multi_day_predictions():
     card = build_feishu_card(first, chart_submissions=[first, second, third])
     text = card_text(card)
 
-    assert "预测范围" in text
     assert "2026-06-10 至 2026-06-12（3天）" in text
     assert "预测日" not in text
 
@@ -182,14 +313,15 @@ def test_weather_comparison_card_includes_report_and_download_actions():
     assert button_urls["下载JSON"].startswith("https://powerpals.example.com/api/weather/compare/export/json?")
 
 
-def test_feishu_task_submission_card_can_show_task_id_without_formal_note():
+def test_feishu_task_submission_card_shows_task_id_and_traceable_metadata():
     card = build_feishu_card(make_submission(), show_task_id=True)
     text = card_text(card)
 
     assert "任务 ID" in text
     assert "WEATHER-CN-440300-20260610-DAYAHEAD-001" in text
     assert "正式提交" not in text
-    assert not [element for element in card["card"]["elements"] if element.get("tag") == "note"]
+    assert len(card_elements_by_tag(card, "note")) == 1
+    assert "抓取时间 06-09 15:42" in text
 
 
 def test_feishu_card_does_not_repeat_disclaimer_as_standalone_note():
@@ -215,16 +347,18 @@ def test_feishu_card_embeds_chart_and_download_actions():
     )
 
     elements = card["card"]["elements"]
-    charts = [element for element in elements if element.get("tag") == "chart"]
+    charts = card_elements_by_tag(card, "chart")
     assert len(charts) >= 4
-    assert charts[0]["chart_spec"]["type"] == "line"
-    assert charts[1]["chart_spec"]["type"] == "bar"
-    assert "小时温度趋势" in charts[0]["chart_spec"]["title"]["text"]
-    assert "小时降水概率" in charts[1]["chart_spec"]["title"]["text"]
-    assert "小时风速趋势" in charts[2]["chart_spec"]["title"]["text"]
-    assert "小时云量" in charts[3]["chart_spec"]["title"]["text"]
-    assert "温度趋势" in charts[0]["chart_spec"]["title"]["text"]
-    assert "降水概率" in charts[1]["chart_spec"]["title"]["text"]
+    charts_by_field = {chart["chart_spec"]["yField"]: chart for chart in charts}
+    assert charts_by_field["temperature"]["chart_spec"]["type"] == "line"
+    assert charts_by_field["rain_probability"]["chart_spec"]["type"] == "bar"
+    assert charts_by_field["wind_speed"]["chart_spec"]["type"] == "line"
+    assert charts_by_field["cloud_cover"]["chart_spec"]["type"] == "bar"
+    text = card_text(card)
+    assert "🌡️ 温度 ℃" in text
+    assert "🌧️ 降水概率 %" in text
+    assert "💨 风速 m/s" in text
+    assert "☁️ 云量 %" in text
     for chart in charts[:4]:
         assert chart["chart_spec"]["tooltip"]["visible"] is True
         assert chart["chart_spec"]["label"]["visible"] is False

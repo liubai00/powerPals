@@ -76,7 +76,7 @@ class FailingOnDateForecastService(CapturingForecastService):
 
     async def forecast(self, request):
         if request.target_date == self.failing_date:
-            raise ValueError("No usable provider forecasts")
+            raise ValueError("No usable provider forecasts token=private-value https://secret.example")
         return await super().forecast(request)
 
 
@@ -102,7 +102,9 @@ def test_weather_range_returns_partial_when_one_day_has_no_provider_data():
     body = response.json()
     assert body["status"] == "partial"
     assert [item["target_date"] for item in body["submissions"]] == ["2026-06-10"]
-    assert body["errors"] == [{"target_date": "2026-06-11", "error": "No usable provider forecasts"}]
+    assert body["errors"] == [{"target_date": "2026-06-11", "error": "forecast_unavailable"}]
+    assert "private-value" not in response.text
+    assert "secret.example" not in response.text
 
 
 def test_weather_command_extracts_province_region_and_days():
@@ -206,12 +208,12 @@ def test_weather_command_prefers_city_suffix_over_bare_province_alias():
 
 
 def test_task_command_extracts_arbitrary_bare_city_without_changing_weather_parser():
-    task_request = _task_request_from_text("发布珠海最近四天的气象任务")
+    task_request = _task_request_from_text("发布漠河最近四天的气象任务")
 
-    assert task_request.region == "珠海"
+    assert task_request.region == "漠河"
     assert task_request.days == 4
-    assert _needs_task_region_clarification("发布珠海最近四天的气象任务") is False
-    assert _needs_region_clarification("帮我查珠海最近四天的气象信息") is True
+    assert _needs_task_region_clarification("发布漠河最近四天的气象任务") is False
+    assert _needs_region_clarification("帮我查漠河最近四天的气象信息") is True
 
 
 def test_weather_export_returns_excel_compatible_csv():
@@ -245,11 +247,14 @@ def test_weather_export_json_returns_standard_submissions():
 def test_weather_report_page_contains_download_and_table():
     client = TestClient(create_app(forecast_service=CapturingForecastService()))
 
-    response = client.get("/reports/weather", params={"region": "广州", "target_date": "2026-06-10", "days": 2})
+    response = client.get(
+        "/reports/weather",
+        params={"region": "广州", "target_date": "2026-06-10", "days": 2, "_fragment": 1},
+    )
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
-    assert "广州气象数据工作台" in response.text
+    assert "广州气象预测" in response.text
     assert "/api/weather/export" in response.text
     assert "/api/weather/export/json" in response.text
     assert "chart-panel" in response.text
@@ -336,6 +341,7 @@ def test_weather_report_get_preserves_coordinate_query():
             "longitude": 116.4074,
             "target_date": "2026-06-10",
             "days": 1,
+            "_fragment": 1,
         },
     )
 
@@ -351,7 +357,13 @@ def test_weather_report_supports_auto_download_mode():
 
     response = client.get(
         "/reports/weather",
-        params={"region": "广州", "target_date": "2026-06-10", "days": 1, "autodownload": "csv"},
+        params={
+            "region": "广州",
+            "target_date": "2026-06-10",
+            "days": 1,
+            "autodownload": "csv",
+            "_fragment": 1,
+        },
     )
 
     assert response.status_code == 200
@@ -363,7 +375,13 @@ def test_weather_report_can_focus_on_requested_metrics():
 
     response = client.get(
         "/reports/weather",
-        params={"region": "广州", "target_date": "2026-06-10", "days": 2, "metrics": "rain,wind"},
+        params={
+            "region": "广州",
+            "target_date": "2026-06-10",
+            "days": 2,
+            "metrics": "rain,wind",
+            "_fragment": 1,
+        },
     )
 
     assert response.status_code == 200
@@ -380,7 +398,10 @@ def test_weather_report_downloads_reuse_recent_report_data():
     service = CapturingForecastService()
     client = TestClient(create_app(forecast_service=service))
 
-    client.get("/reports/weather", params={"region": "广州", "target_date": "2026-06-10", "days": 2})
+    client.get(
+        "/reports/weather",
+        params={"region": "广州", "target_date": "2026-06-10", "days": 2, "_fragment": 1},
+    )
     assert len(service.seen_requests) == 2
 
     csv_response = client.get("/api/weather/export", params={"region": "广州", "target_date": "2026-06-10", "days": 2})
@@ -412,8 +433,16 @@ def test_weather_batch_forecasts_multiple_locations():
 
 
 def test_location_favorite_can_be_used_as_forecast_alias(tmp_path):
-    settings = Settings(local_locations_path=str(tmp_path / "locations.json"))
-    client = TestClient(create_app(forecast_service=CapturingForecastService(), settings=settings))
+    settings = Settings(
+        _env_file=None,
+        admin_api_token="test-admin-token",
+        global_feishu_send_enabled=True,
+        local_locations_path=str(tmp_path / "locations.json"),
+    )
+    client = TestClient(
+        create_app(forecast_service=CapturingForecastService(), settings=settings),
+        headers={"Authorization": "Bearer test-admin-token"},
+    )
 
     create_response = client.post(
         "/api/locations",
@@ -430,10 +459,16 @@ def test_location_favorite_can_be_used_as_forecast_alias(tmp_path):
 
 def test_news_digest_and_hydrology_export(tmp_path):
     settings = Settings(
+        _env_file=None,
+        admin_api_token="test-admin-token",
+        global_feishu_send_enabled=True,
         local_news_jsonl_path=str(tmp_path / "news.jsonl"),
         local_hydrology_jsonl_path=str(tmp_path / "hydrology.jsonl"),
     )
-    client = TestClient(create_app(forecast_service=CapturingForecastService(), settings=settings))
+    client = TestClient(
+        create_app(forecast_service=CapturingForecastService(), settings=settings),
+        headers={"Authorization": "Bearer test-admin-token"},
+    )
 
     news_response = client.post(
         "/api/news/items",

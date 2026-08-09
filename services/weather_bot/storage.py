@@ -13,6 +13,16 @@ class JsonlRecorder:
 
     def append(self, record: BaseModel) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Submission records can contain provider and aggregate hourly series.
+        # Persistence keeps only the retention-policy-safe derivative/provenance copy.
+        from services.weather_bot.models import SubmissionRecord
+
+        if isinstance(record, SubmissionRecord):
+            from services.weather_bot.data_minimization import minimize_submission_for_storage
+
+            record = record.model_copy(
+                update={"submission": minimize_submission_for_storage(record.submission)}
+            )
         payload = record.model_dump(mode="json")
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")

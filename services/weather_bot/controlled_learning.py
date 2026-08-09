@@ -16,17 +16,34 @@ from pathlib import Path
 import re
 import sqlite3
 from statistics import mean
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, Field
 
+from services.weather_bot.data_provenance import DataAvailabilityGate, ExternalDataRecord
 from services.weather_bot.models import ProviderForecast, WeatherSubmission
+from services.weather_bot.source_registry import (
+    SourcePolicy,
+    SourceRegistry,
+    same_source_endpoint,
+)
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 LEARNING_VERSION = "controlled_learning_v1"
+FORECAST_SNAPSHOT_SCHEMA_VERSION = "forecast_daily_features_v2"
+DEFAULT_FORECAST_SNAPSHOT_RETENTION_DAYS = 90
+OPEN_METEO_ARCHIVE_TRUTH_PROVIDER = "open_meteo_archive_truth"
+_ARCHIVE_TRUTH_REQUIRED_METRICS = frozenset(
+    {
+        "temperature_2m_max",
+        "temperature_2m_min",
+        "precipitation_sum",
+        "wind_speed_10m_max",
+    }
+)
 CandidateStatus = Literal["pending", "approved", "rejected", "rolled_back"]
 
 
@@ -100,6 +117,13 @@ class ObservedWeather(BaseModel):
     wind_speed: float
     source: str = "open_meteo_historical_weather_grid"
     fetched_at: str
+    dependent_provider_ids: list[str] = Field(default_factory=lambda: ["open_meteo"])
+    source_provider: str | None = None
+    source_url: str | None = None
+    retrieved_at: str | None = None
+    content_sha256: str | None = None
+    attribution: str | None = None
+    retention_policy: Literal["derived_only", "metadata_only"] = "metadata_only"
 
 
 class ProviderScore(BaseModel):
@@ -114,6 +138,30 @@ class ProviderScore(BaseModel):
     wind_speed_error: float | None = None
     total_score: float
     truth_source: str
+
+
+class ProviderDailyFeatures(BaseModel):
+    provider: str
+    status: str
+    max_temperature: float | None = None
+    min_temperature: float | None = None
+    rain_forecast: bool | None = None
+    wind_speed_max: float | None = None
+    retrieved_at: str | None = None
+    provider_issued_at: str | None = None
+    source_url: str | None = None
+    content_sha256: str | None = None
+    retention_policy: Literal["derived_only", "metadata_only"]
+
+
+class ForecastDailyFeaturesSnapshot(BaseModel):
+    schema_version: Literal["forecast_daily_features_v2"]
+    task_id: str
+    region: str
+    target_date: str
+    forecast_run_id: str = ""
+    valid_time: dict[str, Any] = Field(default_factory=dict)
+    provider_daily_features: list[ProviderDailyFeatures] = Field(default_factory=list)
 
 
 def utc_now() -> datetime:
@@ -158,9 +206,70 @@ def sanitize_evidence(value: Any) -> Any:
     return sanitize_evidence(str(value))
 
 
+def _forecast_snapshot_payload(submission: WeatherSubmission) -> dict[str, Any]:
+    """Build the bounded, derived-only payload used for objective verification."""
+
+    provider_daily_features: list[dict[str, Any]] = []
+    for result in submission.provider_results:
+        temperatures = [point.temperature for point in result.points if point.temperature is not None]
+        rain_probabilities = [
+            point.precipitation_probability
+            for point in result.points
+            if point.precipitation_probability is not None
+        ]
+        wind_speeds = [point.wind_speed for point in result.points if point.wind_speed is not None]
+        retention_policy = str(getattr(result, "retention_policy", "metadata_only"))
+        if retention_policy not in {"derived_only", "metadata_only"}:
+            retention_policy = "metadata_only"
+        may_store_derived_features = retention_policy == "derived_only"
+        provider_daily_features.append(
+            {
+                "provider": result.provider,
+                "status": result.status,
+                "max_temperature": (
+                    max(temperatures) if temperatures and may_store_derived_features else None
+                ),
+                "min_temperature": (
+                    min(temperatures) if temperatures and may_store_derived_features else None
+                ),
+                "rain_forecast": (
+                    max(rain_probabilities) >= 50.0
+                    if rain_probabilities and may_store_derived_features
+                    else None
+                ),
+                "wind_speed_max": (
+                    max(wind_speeds) if wind_speeds and may_store_derived_features else None
+                ),
+                "retrieved_at": result.retrieved_at,
+                "provider_issued_at": result.provider_issued_at,
+                "source_url": result.source_url,
+                "content_sha256": result.content_sha256,
+                "retention_policy": retention_policy,
+            }
+        )
+    payload = {
+        "schema_version": FORECAST_SNAPSHOT_SCHEMA_VERSION,
+        "task_id": submission.task_id,
+        "region": submission.region,
+        "target_date": submission.target_date,
+        "forecast_run_id": submission.time_info.forecast_run_id,
+        "valid_time": submission.time_info.valid_time.model_dump(mode="json"),
+        "provider_daily_features": provider_daily_features,
+    }
+    return sanitize_evidence(payload)
+
+
 class ControlledLearningStore:
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        snapshot_retention_days: int = DEFAULT_FORECAST_SNAPSHOT_RETENTION_DAYS,
+    ):
+        if snapshot_retention_days < 1:
+            raise ValueError("snapshot_retention_days must be at least 1")
         self.db_path = Path(db_path)
+        self.snapshot_retention_days = int(snapshot_retention_days)
         self._initialize()
 
     @contextmanager
@@ -262,18 +371,16 @@ class ControlledLearningStore:
         captured_at: datetime | None = None,
     ) -> int | None:
         captured = captured_at or utc_now()
-        payload = submission.model_dump(mode="json")
-        for result in payload.get("provider_results", []):
-            result["raw"] = None
-            if result.get("error_message"):
-                result["error_message"] = "provider_error"
-        payload = sanitize_evidence(payload)
+        payload = _forecast_snapshot_payload(submission)
         location = payload.get("scope", {}).get("location", {})
+        if not location:
+            location = submission.scope.location
         snapshot_key = _fingerprint(
             payload.get("task_id"),
             payload.get("target_date"),
             payload.get("region"),
-            payload.get("provider_results"),
+            payload.get("forecast_run_id"),
+            payload.get("provider_daily_features"),
             captured.astimezone(SHANGHAI_TZ).date().isoformat(),
         )
         with self._db() as conn:
@@ -507,6 +614,53 @@ class ControlledLearningStore:
         summary.update({str(row["status"]): int(row["count"]) for row in rows})
         return summary
 
+    def purge_expired_snapshots(
+        self,
+        *,
+        as_of: datetime | None = None,
+        retention_days: int | None = None,
+    ) -> dict[str, int]:
+        days = self.snapshot_retention_days if retention_days is None else int(retention_days)
+        if days < 1:
+            raise ValueError("retention_days must be at least 1")
+        current = as_of or utc_now()
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        cutoff = current.astimezone(timezone.utc) - timedelta(days=days)
+        with self._db() as conn:
+            rows = conn.execute("SELECT id,captured_at FROM forecast_snapshots").fetchall()
+            expired_ids: list[int] = []
+            for row in rows:
+                try:
+                    captured = datetime.fromisoformat(str(row["captured_at"]))
+                    if captured.tzinfo is None or captured.utcoffset() is None:
+                        captured = captured.replace(tzinfo=timezone.utc)
+                    is_expired = captured.astimezone(timezone.utc) < cutoff
+                except ValueError:
+                    is_expired = True
+                if is_expired:
+                    expired_ids.append(int(row["id"]))
+            if not expired_ids:
+                return {
+                    "retention_days": days,
+                    "snapshots_deleted": 0,
+                    "provider_scores_deleted": 0,
+                }
+            placeholders = ",".join("?" for _ in expired_ids)
+            score_cursor = conn.execute(
+                f"DELETE FROM provider_scores WHERE snapshot_id IN ({placeholders})",
+                expired_ids,
+            )
+            snapshot_cursor = conn.execute(
+                f"DELETE FROM forecast_snapshots WHERE id IN ({placeholders})",
+                expired_ids,
+            )
+        return {
+            "retention_days": days,
+            "snapshots_deleted": max(0, int(snapshot_cursor.rowcount)),
+            "provider_scores_deleted": max(0, int(score_cursor.rowcount)),
+        }
+
     def create_candidate(
         self,
         candidate_type: str,
@@ -604,11 +758,48 @@ class ControlledLearningStore:
 
 
 class OpenMeteoTruthClient:
-    def __init__(self, api_url: str, timeout_seconds: float = 20.0):
+    def __init__(
+        self,
+        api_url: str,
+        timeout_seconds: float = 20.0,
+        *,
+        source_registry: SourceRegistry | None = None,
+        source_policy: SourcePolicy | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ):
         self.api_url = api_url
         self.timeout_seconds = timeout_seconds
+        self.source_registry = source_registry
+        self.source_policy = source_policy
+        self.clock = clock or utc_now
+
+    @property
+    def enabled(self) -> bool:
+        registry = self.source_registry
+        policy = self.source_policy
+        if registry is None or policy is None:
+            return False
+        return bool(
+            policy.provider == OPEN_METEO_ARCHIVE_TRUTH_PROVIDER
+            and policy.environment == registry.environment
+            and policy.license_status == "verified"
+            and "calculation" in policy.allowed_uses
+            and "derived_storage" in policy.allowed_uses
+            and policy.retention_policy == "derived_only"
+            and policy.attribution_required
+            and (policy.attribution_text or "").strip()
+            and _ARCHIVE_TRUTH_REQUIRED_METRICS.issubset(policy.required_metrics)
+            and registry.resolve(OPEN_METEO_ARCHIVE_TRUTH_PROVIDER, self.api_url)
+            == policy
+            and any(
+                same_source_endpoint(prefix, self.api_url)
+                for prefix in policy.source_url_prefixes
+            )
+        )
 
     async def fetch(self, latitude: float, longitude: float, target_date: str) -> ObservedWeather:
+        if not self.enabled:
+            raise RuntimeError("truth_source_policy_rejected")
         params = {
             "latitude": latitude,
             "longitude": longitude,
@@ -628,6 +819,12 @@ class OpenMeteoTruthClient:
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.get(self.api_url, params=params)
             response.raise_for_status()
+            try:
+                response_endpoint = str(response.request.url.copy_with(query=None))
+            except RuntimeError as exc:
+                raise RuntimeError("truth_source_endpoint_mismatch") from exc
+            if response.history or not same_source_endpoint(response_endpoint, self.api_url):
+                raise RuntimeError("truth_source_endpoint_mismatch")
             payload = response.json()
         daily = payload.get("daily") if isinstance(payload, dict) else None
         if not isinstance(daily, dict):
@@ -641,6 +838,48 @@ class OpenMeteoTruthClient:
         min_temperature = _series_float(daily, "temperature_2m_min", index)
         precipitation_sum = _series_float(daily, "precipitation_sum", index)
         wind_speed = _series_float(daily, "wind_speed_10m_max", index)
+        policy = self.source_policy
+        registry = self.source_registry
+        retrieved_at = self.clock()
+        if (
+            policy is None
+            or registry is None
+            or retrieved_at.tzinfo is None
+            or retrieved_at.utcoffset() is None
+            or policy.max_age_seconds is None
+        ):
+            raise RuntimeError("truth_runtime_provenance_rejected")
+        source_url = str(response.request.url)
+        if registry.resolve(OPEN_METEO_ARCHIVE_TRUTH_PROVIDER, source_url) != policy:
+            raise RuntimeError("truth_source_policy_rejected")
+        content_hash = hashlib.sha256(response.content).hexdigest()
+        record = ExternalDataRecord(
+            source_id=OPEN_METEO_ARCHIVE_TRUTH_PROVIDER,
+            source_kind="structured_api",
+            source_url=source_url,
+            retrieved_at=retrieved_at,
+            valid_time=target_date,
+            unit=policy.unit_manifest,
+            granularity="day",
+            coverage=policy.coverage_model,
+            timezone=policy.timezone,
+            license_status=policy.license_status,
+            allowed_uses=policy.allowed_uses,
+            completeness=1.0,
+            quality_status="good",
+            fresh_until=retrieved_at + timedelta(seconds=policy.max_age_seconds),
+            content_sha256=content_hash,
+            structured_values=True,
+            retention_policy=policy.retention_policy,
+        )
+        decision = DataAvailabilityGate(
+            min_completeness=policy.min_completeness
+        ).evaluate(record, now=retrieved_at)
+        if (
+            decision.status != "allowed_for_calculation"
+            or not decision.derived_storage_allowed
+        ):
+            raise RuntimeError(f"truth_data_availability_rejected:{decision.reason}")
         return ObservedWeather(
             target_date=target_date,
             max_temperature=max_temperature,
@@ -648,7 +887,13 @@ class OpenMeteoTruthClient:
             precipitation_sum=precipitation_sum,
             rain_observed=precipitation_sum >= 0.1,
             wind_speed=wind_speed,
-            fetched_at=iso_now(),
+            fetched_at=retrieved_at.isoformat(),
+            source_provider=OPEN_METEO_ARCHIVE_TRUTH_PROVIDER,
+            source_url=source_url,
+            retrieved_at=retrieved_at.isoformat(),
+            content_sha256=content_hash,
+            attribution=(policy.attribution_text or "").strip(),
+            retention_policy="derived_only",
         )
 
 
@@ -706,6 +951,67 @@ def score_provider_forecast(
     )
 
 
+def _score_provider_daily_features(
+    features: ProviderDailyFeatures,
+    truth: ObservedWeather,
+    *,
+    region: str,
+    target_date: str,
+    horizon_days: int,
+) -> ProviderScore | None:
+    if features.status != "ok" or features.retention_policy != "derived_only":
+        return None
+    max_error = (
+        round(abs(features.max_temperature - truth.max_temperature), 3)
+        if features.max_temperature is not None
+        else None
+    )
+    min_error = (
+        round(abs(features.min_temperature - truth.min_temperature), 3)
+        if features.min_temperature is not None
+        else None
+    )
+    temperature_mae = (
+        round(mean([max_error, min_error]), 3)
+        if max_error is not None and min_error is not None
+        else None
+    )
+    rain_hit = (
+        features.rain_forecast == truth.rain_observed
+        if features.rain_forecast is not None
+        else None
+    )
+    wind_error = (
+        round(abs(features.wind_speed_max - truth.wind_speed), 3)
+        if features.wind_speed_max is not None
+        else None
+    )
+    weighted_scores: list[tuple[float, float]] = []
+    if temperature_mae is not None:
+        weighted_scores.append((_bounded_score(temperature_mae, 10.0), 0.45))
+    if rain_hit is not None:
+        weighted_scores.append((100.0 if rain_hit else 40.0, 0.35))
+    if wind_error is not None:
+        weighted_scores.append((_bounded_score(wind_error, 15.0), 0.20))
+    if not weighted_scores:
+        return None
+    weight_total = sum(weight for _score, weight in weighted_scores)
+    total_score = round(sum(score * weight for score, weight in weighted_scores) / weight_total, 2)
+    return ProviderScore(
+        provider=features.provider,
+        region=region,
+        target_date=target_date,
+        horizon_days=max(0, horizon_days),
+        temperature_mae=temperature_mae,
+        max_temperature_error=max_error,
+        min_temperature_error=min_error,
+        rain_hit=rain_hit,
+        wind_speed_error=wind_error,
+        total_score=total_score,
+        truth_source=truth.source,
+    )
+
+
 async def verify_due_snapshots(
     store: ControlledLearningStore,
     truth_client: OpenMeteoTruthClient,
@@ -715,6 +1021,14 @@ async def verify_due_snapshots(
     limit: int = 100,
 ) -> dict[str, int]:
     current_day = today or datetime.now(SHANGHAI_TZ).date()
+    store.purge_expired_snapshots(
+        as_of=datetime(
+            current_day.year,
+            current_day.month,
+            current_day.day,
+            tzinfo=SHANGHAI_TZ,
+        )
+    )
     due_date = current_day - timedelta(days=max(0, truth_delay_days))
     snapshots = store.pending_snapshots(due_date, limit=limit)
     evaluated = deferred = skipped = 0
@@ -743,25 +1057,66 @@ async def verify_due_snapshots(
             if truth is None:
                 truth = await truth_client.fetch(latitude, longitude, str(snapshot["target_date"]))
                 truth_cache[truth_key] = truth
-            submission = WeatherSubmission.model_validate_json(snapshot["submission_json"])
             captured_date = datetime.fromisoformat(str(snapshot["captured_at"])).astimezone(SHANGHAI_TZ).date()
-            horizon_days = (date.fromisoformat(submission.target_date) - captured_date).days
-            scores = [
-                score
-                for result in submission.provider_results
-                if (
-                    score := score_provider_forecast(
-                        result,
-                        truth,
-                        region=submission.region,
-                        target_date=submission.target_date,
-                        horizon_days=horizon_days,
+            dependent_provider_ids = {
+                provider_id.strip().lower()
+                for provider_id in truth.dependent_provider_ids
+                if provider_id.strip()
+            }
+            stored_payload = json.loads(str(snapshot["submission_json"]))
+            if stored_payload.get("schema_version") == FORECAST_SNAPSHOT_SCHEMA_VERSION:
+                compact = ForecastDailyFeaturesSnapshot.model_validate(stored_payload)
+                horizon_days = (date.fromisoformat(compact.target_date) - captured_date).days
+                all_results = compact.provider_daily_features
+                eligible_results = [
+                    result
+                    for result in all_results
+                    if result.provider.strip().lower() not in dependent_provider_ids
+                ]
+                scores = [
+                    score
+                    for result in eligible_results
+                    if (
+                        score := _score_provider_daily_features(
+                            result,
+                            truth,
+                            region=compact.region,
+                            target_date=compact.target_date,
+                            horizon_days=horizon_days,
+                        )
                     )
-                )
-                is not None
-            ]
+                    is not None
+                ]
+            else:
+                submission = WeatherSubmission.model_validate(stored_payload)
+                horizon_days = (date.fromisoformat(submission.target_date) - captured_date).days
+                all_results = submission.provider_results
+                eligible_results = [
+                    result
+                    for result in all_results
+                    if result.provider.strip().lower() not in dependent_provider_ids
+                ]
+                scores = [
+                    score
+                    for result in eligible_results
+                    if (
+                        score := score_provider_forecast(
+                            result,
+                            truth,
+                            region=submission.region,
+                            target_date=submission.target_date,
+                            horizon_days=horizon_days,
+                        )
+                    )
+                    is not None
+                ]
             if not scores:
-                store.mark_snapshot_skipped(snapshot_id, "provider_scores_missing")
+                skip_reason = (
+                    "independent_truth_missing"
+                    if all_results and not eligible_results
+                    else "provider_scores_missing"
+                )
+                store.mark_snapshot_skipped(snapshot_id, skip_reason)
                 skipped += 1
                 continue
             store.mark_snapshot_evaluated(snapshot_id, scores, truth.source)
@@ -897,10 +1252,19 @@ def generate_improvement_candidates(
 
 def render_learning_report(report: dict[str, Any]) -> str:
     replay = report.get("replay", {})
+    core_gate = report.get("core_gate", {})
     verification = report.get("verification", {})
     snapshots = report.get("snapshots", {})
     provider_summaries = report.get("provider_summaries", [])
     candidates = report.get("candidates", [])
+    reference_data = report.get("reference_data", {})
+    reference_eligible = reference_data.get("availability") == "eligible"
+    reference_line = (
+        "- 参考口径：Open-Meteo 历史格点/再分析参考天气，不等同于官方站点实况"
+        if reference_eligible
+        else "- 参考数据：未启用（来源策略未通过）"
+    )
+    reference_used = "是" if reference_data.get("used_for_scoring") else "否"
     lines = [
         "# 云云受控持续学习报告",
         "",
@@ -914,9 +1278,22 @@ def render_learning_report(report: dict[str, Any]) -> str:
         f"- 通过：{replay.get('passed', 0)}",
         f"- 失败：{replay.get('failed', 0)}",
         "",
+        "## 96 项核心门禁",
+        "",
+        f"- 总数：{core_gate.get('total', 0)}",
+        f"- 通过：{core_gate.get('passed', 0)}",
+        f"- 失败：{core_gate.get('failed', 0)}",
+        f"- 未实现：{core_gate.get('not_implemented', 0)}",
+        f"- 阻塞：{core_gate.get('blocked', 0)}",
+        f"- 门禁：{'通过' if core_gate.get('gate_passed') else '未通过（fail closed）'}",
+        "- 未解决编号：" + ", ".join(
+            str(item) for item in core_gate.get("unresolved_case_numbers", [])
+        ),
+        "",
         "## 预报实况验证",
         "",
-        "- 参考口径：Open-Meteo 历史格点/再分析参考天气，不等同于官方站点实况",
+        reference_line,
+        f"- 本轮实际用于评分：{reference_used}",
         f"- 本轮到期：{verification.get('due', 0)}",
         f"- 已评分：{verification.get('evaluated', 0)}",
         f"- 延后重试：{verification.get('deferred', 0)}",
