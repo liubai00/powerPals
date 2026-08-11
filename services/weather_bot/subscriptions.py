@@ -49,7 +49,7 @@ class SubscriptionSpec:
     quiet_hours_start: str | None = None
     quiet_hours_end: str | None = None
     max_sends_per_hour: int = 2
-    max_sends_per_day: int = 8
+    max_sends_per_day: int = 3
 
     def __post_init__(self) -> None:
         if not self.regions:

@@ -16,6 +16,8 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from services.weather_bot.briefing_cache import BriefingCache
 from services.weather_bot.power_briefing import (
     MARKET_POINTS,
+    MARKET_CONFIG_VERSION,
+    POWER_BRIEFING_REPORT_VERSION,
     PROVINCES,
     SHANGHAI_TZ,
     MarketInsight,
@@ -112,45 +114,88 @@ async def go(mode: str | None = None) -> str | None:
 
     settings = m.Settings()
     selected_mode = (mode or os.getenv("POWER_BRIEFING_MODE") or "precompute").strip().lower()
-    if selected_mode not in {"precompute", "send"}:
+    supported_modes = {
+        "precompute",
+        "send",
+        "afternoon_precompute",
+        "afternoon_send",
+    }
+    if selected_mode not in supported_modes:
         raise ValueError(f"unsupported POWER_BRIEFING_MODE: {selected_mode}")
+    is_afternoon = selected_mode.startswith("afternoon_")
+    is_send = selected_mode in {"send", "afternoon_send"}
+    declared_release_slot = "15:00" if is_afternoon else "09:00"
     dry_run = bool(settings.dry_run) or os.getenv("DRY_RUN") == "1"
     start_date = datetime.now(SHANGHAI_TZ).date().isoformat()
+    selected_card: dict[str, Any]
 
-    if selected_mode == "send":
+    if is_send:
         if dry_run:
-            print("NO-SEND mode=send reason=dry_run")
+            print("NO-SEND mode=%s reason=dry_run" % selected_mode)
             return "dry_run"
         targets = _approved_chat_targets(settings)
         send_policy = AdminSendPolicy(
             global_send_enabled=settings.global_feishu_send_enabled,
             dry_run=False,
         )
-        schedule_send_enabled = bool(settings.power_briefing_allow_send)
+        schedule_send_enabled = bool(
+            settings.power_briefing_afternoon_allow_send
+            if is_afternoon
+            else settings.power_briefing_allow_send
+        )
         initial_decision = send_policy.scheduled_card_send_decision(
             targets[0].chat_id if targets else None,
             schedule_send_enabled=schedule_send_enabled,
         )
         if not initial_decision.allowed:
-            print("NO-SEND mode=send reason=%s" % initial_decision.reason)
+            print("NO-SEND mode=%s reason=%s" % (selected_mode, initial_decision.reason))
             return initial_decision.reason
         cache = BriefingCache(
             settings.power_briefing_cache_db,
             ttl_seconds=settings.power_briefing_cache_ttl_seconds,
         )
-        expected_cache_key = briefing_cache_key(start_date)
+        expected_cache_key = briefing_cache_key(
+            start_date,
+            release_slot=declared_release_slot,
+        )
         snapshot = cache.load_fresh(expected_cache_key)
         if (
             snapshot is None
             or snapshot.get("cache_key") != expected_cache_key
             or snapshot.get("report_date") != start_date
-            or snapshot.get("release_slot") != "09:00"
+            or snapshot.get("release_slot") != declared_release_slot
             or not str(snapshot.get("forecast_run_id") or "").strip()
         ):
-            print("NO-SEND mode=send reason=precompute_snapshot_missing")
+            print("NO-SEND mode=%s reason=precompute_snapshot_missing" % selected_mode)
             return "precompute_snapshot_missing"
+        if is_afternoon:
+            if snapshot.get("afternoon_send_required") is not True:
+                print("NO-SEND mode=afternoon_send reason=no_material_change")
+                return "no_material_change"
+            delta_card = snapshot.get("afternoon_delta_card")
+            if not isinstance(delta_card, dict) or delta_card.get("msg_type") != "interactive":
+                print("NO-SEND mode=afternoon_send reason=precompute_snapshot_missing")
+                return "precompute_snapshot_missing"
+            selected_card = delta_card
+        else:
+            selected_card = snapshot["summary_card"]
         cache_hit = True
     else:
+        cache = BriefingCache(
+            settings.power_briefing_cache_db,
+            ttl_seconds=settings.power_briefing_cache_ttl_seconds,
+        )
+        comparison_snapshot: dict[str, Any] | None = None
+        if is_afternoon:
+            comparison_snapshot = cache.load_same_day_release(
+                report_date=start_date,
+                release_slot="09:00",
+                market_config_version=MARKET_CONFIG_VERSION,
+                report_version=POWER_BRIEFING_REPORT_VERSION,
+            )
+            if comparison_snapshot is None:
+                print("NO-SEND mode=afternoon_precompute reason=morning_baseline_missing")
+                return "morning_baseline_missing"
         source_registry = m.SourceRegistry.from_json(
             settings.weather_source_policies_json,
             environment=settings.app_env,
@@ -167,17 +212,22 @@ async def go(mode: str | None = None) -> str | None:
             source_registry=source_registry,
             source_policy=typhoon_policy,
         )
-        cache = BriefingCache(
-            settings.power_briefing_cache_db,
-            ttl_seconds=settings.power_briefing_cache_ttl_seconds,
-        )
+        generation_kwargs: dict[str, Any] = {
+            "cache": cache,
+            "release_slot": declared_release_slot,
+        }
+        if comparison_snapshot is not None:
+            generation_kwargs["comparison_snapshot"] = comparison_snapshot
         snapshot, cache_hit = await get_or_generate_briefing(
             service,
             typhoon_client,
             start_date,
-            cache=cache,
-            release_slot="09:00",
+            **generation_kwargs,
         )
+        if is_afternoon:
+            selected_card = snapshot.get("afternoon_delta_card") or snapshot["summary_card"]
+        else:
+            selected_card = snapshot["summary_card"]
     coverage = snapshot["coverage"]
     statistics = snapshot["statistics"]
     print(
@@ -196,8 +246,11 @@ async def go(mode: str | None = None) -> str | None:
         )
     )
 
-    if selected_mode == "precompute":
-        card = snapshot["summary_card"]
+    if not is_send:
+        if is_afternoon and snapshot.get("afternoon_send_required") is not True:
+            print("NO-SEND mode=afternoon_precompute reason=no_material_change")
+            return "no_material_change"
+        card = selected_card
         print(
             "NO-SEND mode=%s dry_run=%s title=%s"
             % (
@@ -216,7 +269,7 @@ async def go(mode: str | None = None) -> str | None:
     account = m._role_feishu_account(settings, m.FEISHU_WEATHER_BOT, legacy)
     feishu = m.FeishuClient(settings, account)
     report_date = str(snapshot.get("report_date") or start_date)
-    declared_slot = str(snapshot.get("release_slot") or "09:00")
+    declared_slot = str(snapshot.get("release_slot") or declared_release_slot)
     release_slot = f"{report_date}|{declared_slot}"
     snapshot_cache_key = str(snapshot["cache_key"])
     forecast_run_id = str(snapshot["forecast_run_id"])
@@ -251,7 +304,7 @@ async def go(mode: str | None = None) -> str | None:
         try:
             message_id = await feishu.send_interactive_card(
                 target.chat_id,
-                snapshot["summary_card"],
+                selected_card,
                 idempotency_key=send_uuid,
             )
             cache.complete_scheduled_delivery(
@@ -289,7 +342,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("precompute", "send"),
+        choices=("precompute", "send", "afternoon_precompute", "afternoon_send"),
         default=os.getenv("POWER_BRIEFING_MODE") or "precompute",
     )
     return parser.parse_args()

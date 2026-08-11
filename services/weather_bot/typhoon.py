@@ -51,6 +51,9 @@ _NOW_FIELDS = (
     "moveDir",
 )
 _FORECAST_FIELDS = ("fxTime", "type", "lat", "lon", "windSpeed")
+_MISSING_STORM_NAMES = frozenset(
+    {"null", "none", "nan", "undefined", "unknown", "-", "--"}
+)
 
 
 class TyphoonDataUnavailable(RuntimeError):
@@ -243,7 +246,7 @@ class TyphoonClient:
         if str(body.get("code")) != "200":
             return []
         return [
-            _minimal_item(storm, _STORM_FIELDS, admitted.provenance)
+            _minimal_storm_item(storm, admitted.provenance)
             for storm in (body.get("storm") or [])
             if isinstance(storm, dict)
         ]
@@ -253,7 +256,11 @@ class TyphoonClient:
             storms = await self.list_storms(client, basin, year)
         except httpx.HTTPError:
             return None
-        matches = [s for s in storms if str(s.get("name") or "").strip() and str(s.get("name")).strip() in text]
+        matches = [
+            storm
+            for storm in storms
+            if (name := _normalized_storm_name(storm.get("name"))) and name in text
+        ]
         if not matches:
             return None
         matches.sort(key=lambda s: str(s.get("isActive")) in ("1", "true", "True"), reverse=True)
@@ -340,6 +347,26 @@ def _minimal_item(
     }
 
 
+def _minimal_storm_item(
+    item: dict[str, Any],
+    provenance: dict[str, str],
+) -> dict[str, Any]:
+    minimized = _minimal_item(item, _STORM_FIELDS, provenance)
+    normalized_name = _normalized_storm_name(minimized.get("name"))
+    if normalized_name is None:
+        minimized.pop("name", None)
+    else:
+        minimized["name"] = normalized_name
+    return minimized
+
+
+def _normalized_storm_name(value: object) -> str | None:
+    name = str(value or "").strip()
+    if not name or name.casefold() in _MISSING_STORM_NAMES:
+        return None
+    return name
+
+
 def _provider_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -369,7 +396,7 @@ def _format_brief(storm: dict[str, Any], now: dict[str, Any], forecast: list[dic
             "【台风实时数据不可用】来源或可追溯性校验未通过，不展示台风事实；"
             "这不代表无活跃台风。"
         )
-    name = str(storm.get("name") or "该台风")
+    name = _normalized_storm_name(storm.get("name")) or "该台风"
     stormid = str(storm.get("id") or "")
     year = str(storm.get("year") or "")
     active = str(storm.get("isActive")) in ("1", "true", "True")
@@ -420,7 +447,11 @@ def _format_brief(storm: dict[str, Any], now: dict[str, Any], forecast: list[dic
     return "\n".join(lines)
 
 
-def format_active_for_briefing(active: list[dict[str, Any]]) -> str | None:
+def format_active_for_briefing(
+    active: list[dict[str, Any]],
+    *,
+    market_ids: set[str] | None = None,
+) -> str | None:
     """晨报用: 把活跃台风列成一段 lark_md; 无活跃台风返回 None(晨报当天不显示该段)。"""
     if not active:
         return None
@@ -429,14 +460,23 @@ def format_active_for_briefing(active: list[dict[str, Any]]) -> str | None:
             "**🌀 台风实时数据不可用**\n"
             "台风数据未通过来源与可追溯性校验，本期不展示相关事实；这不代表无活跃台风。"
         )
+    if market_ids is not None:
+        active = [
+            item
+            for item in active
+            if _verified_market_relevance(item, market_ids)
+        ]
+        if not active:
+            return None
     lines = ["**🌀 当前活跃台风**"]
     for item in active:
         storm = item.get("storm") or {}
         now = item.get("now") or {}
-        name = str(storm.get("name") or "台风")
+        name = _normalized_storm_name(storm.get("name")) or "未命名台风"
         number = _storm_number(str(storm.get("id") or ""), str(storm.get("year") or ""))
         typ = _STORM_TYPE_CN.get(str(now.get("type")), str(now.get("type") or ""))
-        seg = f"🌀 **{name}**（{number}{typ}）".replace("（）", "")
+        details = "，".join(part for part in (number.rstrip("，"), typ) if part)
+        seg = f"🌀 **{name}**" + (f"（{details}）" if details else "")
         if now.get("lat") and now.get("lon"):
             seg += f" 中心 {now.get('lat')}°N/{now.get('lon')}°E"
         wind = _to_float(now.get("windSpeed"))
@@ -445,6 +485,13 @@ def format_active_for_briefing(active: list[dict[str, Any]]) -> str | None:
         if now.get("moveDir"):
             seg += f"、向{_DIR_CN.get(str(now.get('moveDir')), now.get('moveDir'))}移动"
         lines.append(seg)
+        if market_ids is not None:
+            affected = sorted(set(item.get("affected_market_ids") or []) & market_ids)
+            valid_time = item.get("impact_valid_time") or {}
+            lines.append(f"关联关注分析区：{'、'.join(affected)}")
+            lines.append(
+                f"影响窗口：{valid_time.get('start')} 至 {valid_time.get('end')}"
+            )
     provenance = [
         item[part]["_provenance"]
         for item in active
@@ -462,6 +509,30 @@ def format_active_for_briefing(active: list[dict[str, Any]]) -> str | None:
         "须结合场站和电力数据另行判断。"
     )
     return "\n".join(lines)
+
+
+def _verified_market_relevance(item: dict[str, Any], market_ids: set[str]) -> bool:
+    affected = item.get("affected_market_ids")
+    valid_time = item.get("impact_valid_time")
+    if (
+        not isinstance(affected, list)
+        or not set(str(value) for value in affected) & market_ids
+        or not isinstance(valid_time, dict)
+        or str(valid_time.get("timezone") or "") != "Asia/Shanghai"
+    ):
+        return False
+    try:
+        start = datetime.fromisoformat(str(valid_time.get("start")))
+        end = datetime.fromisoformat(str(valid_time.get("end")))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        start.tzinfo is not None
+        and start.utcoffset() is not None
+        and end.tzinfo is not None
+        and end.utcoffset() is not None
+        and end > start
+    )
 
 
 def _verified_active_item(item: object) -> bool:

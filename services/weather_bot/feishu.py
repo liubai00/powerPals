@@ -119,6 +119,47 @@ class FeishuClient:
         body = await self.send_message(chat_id, "text", {"text": text})
         return body.get("data", {}).get("message_id", "")
 
+    async def list_chats(self) -> list[dict[str, str]]:
+        """List chats visible to this bot, retaining only fields used for target resolution."""
+        token = await self.tenant_access_token()
+        page_token: str | None = None
+        chats: list[dict[str, str]] = []
+        while True:
+            params: dict[str, Any] = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(
+                    "https://open.feishu.cn/open-apis/im/v1/chats",
+                    params=params,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if response.status_code >= 400:
+                raise RuntimeError(f"Feishu list chats HTTP {response.status_code}")
+            body = response.json()
+            if body.get("code", 0) != 0:
+                raise RuntimeError(
+                    f"Feishu list chats failed code={_safe_error_code(body)}"
+                )
+            data = body.get("data") if isinstance(body.get("data"), dict) else {}
+            for item in data.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                chats.append(
+                    {
+                        "chat_id": str(item.get("chat_id") or ""),
+                        "name": str(item.get("name") or ""),
+                        "chat_mode": str(item.get("chat_mode") or ""),
+                    }
+                )
+            if data.get("has_more") is not True:
+                break
+            next_page_token = str(data.get("page_token") or "").strip()
+            if not next_page_token or next_page_token == page_token:
+                raise RuntimeError("Feishu list chats pagination is invalid")
+            page_token = next_page_token
+        return chats
+
     async def send_message(
         self,
         chat_id: str,

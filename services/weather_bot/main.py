@@ -1509,7 +1509,7 @@ def create_app(
                         if _is_power_briefing_explanation_command(text)
                         else "power_briefing_expand"
                     ),
-                    "text": "当前会话没有可展开的有效晨报快照。请先发送“生成今天的电力气象决策晨报 3.0”。",
+                    "text": "当前会话没有可展开的有效晨报快照。请先发送“生成今天的电力气象交易晨报”。",
                 }
             if _is_power_briefing_explanation_command(text):
                 return {
@@ -1535,7 +1535,9 @@ def create_app(
                 "card": snapshot["detail_card"],
             }
 
-        start_date = datetime.now(SHANGHAI_TZ).date().isoformat()
+        manual_generated_at = datetime.now(SHANGHAI_TZ)
+        start_date = manual_generated_at.date().isoformat()
+        manual_release_slot = manual_generated_at.strftime("%H:%M")
         tomorrow_date = (date.fromisoformat(start_date) + timedelta(days=1)).isoformat()
         try:
             snapshot, cache_hit = await get_or_generate_briefing(
@@ -1543,6 +1545,7 @@ def create_app(
                 typhoon_client,
                 start_date,
                 cache=cache,
+                release_slot=manual_release_slot,
             )
         except Exception as exc:  # noqa: BLE001 - 手动晨报失败返回可重试提示
             logger.error(
@@ -4097,6 +4100,7 @@ def _contextual_weather_text(
     event: dict[str, Any],
     *,
     bot_role: str = WEATHER_FORECAST_BOT_ROLE,
+    today: date | None = None,
 ) -> tuple[str, str | None]:
     """Merge a short weather follow-up with the last successful request.
 
@@ -4131,16 +4135,16 @@ def _contextual_weather_text(
         return text, None
 
     region = explicit_region or _region_expression_for_followup(str(last.get("region")))
-    target_date = str(last.get("target_date") or _target_date_from_text(text))
+    target_date = str(last.get("target_date") or _target_date_from_text(text, today=today))
     days = max(1, int(last.get("days") or 1))
     metrics = current_metrics or last.get("metrics") or None
 
     if _DATE_SIGNAL_RE.search(text):
-        target_date = _target_date_from_text(text)
+        target_date = _target_date_from_text(text, today=today)
         if re.search(r"明天|明日|后天|大后天|今天|今日", text) and not _WINDOW_SIGNAL_RE.search(text):
             days = 1
     if _WINDOW_SIGNAL_RE.search(text):
-        days = _days_from_text(text)
+        days = _days_from_text(text, today=today)
 
     metric_phrase = weather_metric_phrase(metrics)
     metric_suffix = f" {metric_phrase}" if metric_phrase else ""
@@ -4280,9 +4284,11 @@ def _is_power_briefing_command(text: str) -> bool:
         return True
     has_briefing_name = (
         "电力气象决策晨报" in compact
+        or "电力气象交易晨报" in compact
         or "电力气象晨报" in compact
         or "晨报2.0" in compact
         or "晨报3.0" in compact
+        or "晨报3.1" in compact
     )
     has_generate_action = any(
         keyword in compact
@@ -4290,7 +4296,7 @@ def _is_power_briefing_command(text: str) -> bool:
     )
     concise_daily_request = bool(
         re.fullmatch(
-            r"(?:今天|今日|明天)?(?:的)?(?:电力气象)?晨报(?:[23]\.0)?",
+            r"(?:今天|今日|明天)?(?:的)?(?:电力气象)?(?:交易|决策)?晨报(?:2\.0|3\.[01])?",
             compact,
         )
     )
@@ -4391,8 +4397,8 @@ def _request_from_task(task: WeatherTask) -> ForecastRequest:
     )
 
 
-def _target_date_from_text(text: str) -> str:
-    return weather_dates.target_date_from_text(text)
+def _target_date_from_text(text: str, *, today: date | None = None) -> str:
+    return weather_dates.target_date_from_text(text, today=today)
 
 
 def _date_span_status(text: str) -> str:
@@ -4406,8 +4412,8 @@ WEEK_BARE_RE = re.compile(r"(?:下|这|本)\s*(?:周|星期|礼拜)(?![末一二
 _WEEK_COUNT_WORDS = {"一": 1, "1": 1, "两": 2, "二": 2, "2": 2, "三": 3, "3": 3}
 
 
-def _days_from_text(text: str) -> int:
-    return weather_dates.days_from_text(text)
+def _days_from_text(text: str, *, today: date | None = None) -> int:
+    return weather_dates.days_from_text(text, today=today)
 
 
 def _normalize_day_count(token: str) -> int:
@@ -4842,7 +4848,7 @@ def _help_text(allowed_bot: str = FEISHU_LEGACY_BOT) -> str:
         "• @云云 武汉未来三天天气",
         "• @云云 北京气象预测 2026-06-10",
         "• @云云 22.8016,113.5252 明天天气",
-        "• @云云 生成今天的电力气象决策晨报 3.0",
+        "• @云云 生成今天的电力气象交易晨报 3.1",
         "• @云云 展开全部分析区",
     ]
     task_help = [

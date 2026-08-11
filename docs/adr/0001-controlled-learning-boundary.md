@@ -1,3 +1,5 @@
 # Keep controlled learning outside the live reply and release paths
 
 PowerPals will improve from deterministic replay and objective forecast verification, but learning runs may only archive privacy-minimized signals and create versioned, non-executable candidates. They cannot send Feishu messages, edit runtime rules, change provider weights, deploy code, or release a candidate; those actions remain explicit, tested administrative decisions because unattended adaptation would make group-reply safety and weather provenance difficult to audit and roll back.
+
+A separate report publisher may read the completed, privacy-minimized cycle report and send a count-only summary to one explicitly configured test-group name. This does not grant the learning engine a messaging capability. The publisher is default-off, requires the global send gate, refuses stale reports, requires one exact bot-visible group-name match, never falls back to a default chat, and uses a hashed delivery ledger plus a stable Feishu idempotency key.

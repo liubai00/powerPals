@@ -1089,7 +1089,7 @@ def test_manual_power_briefing_command_returns_card_without_region_clarification
     assert result["coverage"]["provincial_areas"] == {"covered": 31, "total": 31}
     assert result["coverage"]["markets"]["covered"] == 33
     assert result["coverage"]["points"] == {"covered": 75, "total": 75, "missing": 0}
-    assert result["card"]["card"]["header"]["title"]["content"].startswith("⚡ 电力气象决策晨报 3.0")
+    assert result["card"]["card"]["header"]["title"]["content"].startswith("⚡ 电力气象交易晨报｜")
     assert len(service.requests) == len(MARKET_POINTS) * 2
 
 
@@ -1098,6 +1098,8 @@ def test_manual_power_briefing_command_returns_card_without_region_clarification
     [
         ("生成今天的电力气象决策晨报 2.0", True),
         ("生成今天的电力气象决策晨报 3.0", True),
+        ("生成今天的电力气象交易晨报 3.1", True),
+        ("晨报3.1", True),
         ("晨报3.0", True),
         ("今天的电力气象晨报", True),
         ("预览晨报2.0", True),

@@ -60,6 +60,26 @@ class RepresentativePoint:
 
 
 @dataclass(frozen=True)
+class AnalysisWindow:
+    """One configurable local-time window used by an analysis area."""
+
+    window_id: str
+    label: str
+    start_hour: int
+    end_hour: int
+
+
+DEFAULT_ANALYSIS_WINDOWS: tuple[AnalysisWindow, ...] = (
+    AnalysisWindow("overnight", "凌晨", 0, 6),
+    AnalysisWindow("early_peak", "早峰", 6, 10),
+    AnalysisWindow("midday_solar", "午间光伏", 10, 16),
+    AnalysisWindow("afternoon_transition", "下午过渡", 16, 17),
+    AnalysisWindow("evening_peak", "晚峰", 17, 21),
+    AnalysisWindow("night", "夜间", 21, 24),
+)
+
+
+@dataclass(frozen=True)
 class MarketZone:
     market_id: str
     market_name: str
@@ -67,6 +87,7 @@ class MarketZone:
     provincial_code: str
     points: tuple[RepresentativePoint, ...]
     scope_kind: str = "provincial_sample"
+    analysis_windows: tuple[AnalysisWindow, ...] = DEFAULT_ANALYSIS_WINDOWS
 
 
 def _point(point_id: str, city: str, query: str, *roles: str) -> RepresentativePoint:
@@ -426,6 +447,21 @@ def representative_points(
     return tuple((market, point) for market in markets for point in market.points)
 
 
+def validate_analysis_windows(windows: tuple[AnalysisWindow, ...]) -> None:
+    ordered = sorted(windows, key=lambda item: (item.start_hour, item.end_hour, item.window_id))
+    if not ordered or ordered[0].start_hour != 0 or ordered[-1].end_hour != 24:
+        raise ValueError("analysis windows must cover 00:00-24:00 without gaps")
+    if len({item.window_id for item in ordered}) != len(ordered):
+        raise ValueError("analysis window_id must be unique within an analysis area")
+    previous_end = 0
+    for window in ordered:
+        if not (0 <= window.start_hour < window.end_hour <= 24):
+            raise ValueError("analysis window hours must satisfy 0 <= start < end <= 24")
+        if window.start_hour != previous_end:
+            raise ValueError("analysis windows must cover 00:00-24:00 without gaps")
+        previous_end = window.end_hour
+
+
 def validate_market_config(markets: tuple[MarketZone, ...] = NATIONAL_MARKETS) -> None:
     market_ids = [market.market_id for market in markets]
     point_ids = [point.point_id for market in markets for point in market.points]
@@ -467,6 +503,7 @@ def validate_market_config(markets: tuple[MarketZone, ...] = NATIONAL_MARKETS) -
             f"required grid samples missing: {sorted(required_split_ids - set(market_ids))}"
         )
     for market in markets:
+        validate_analysis_windows(market.analysis_windows)
         roles = {role for point in market.points for role in point.roles}
         unknown_roles = roles - ALLOWED_POINT_ROLES
         if unknown_roles:

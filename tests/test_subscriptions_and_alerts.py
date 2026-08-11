@@ -349,6 +349,53 @@ async def test_hourly_send_cap_leaves_excess_items_pending(tmp_path) -> None:
     assert len(calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_default_alert_policy_has_a_hard_daily_cap_of_three_messages(tmp_path) -> None:
+    subscriptions = SubscriptionStore(tmp_path / "subscriptions.db")
+    outbox = AlertOutbox(tmp_path / "alerts.db")
+    engine = AlertEngine(outbox)
+    rule = _active_rule(
+        subscriptions,
+        replace(
+            _threshold_spec(),
+            consecutive_hits=1,
+            cooldown_seconds=1,
+            max_sends_per_hour=10,
+        ),
+    )
+    engine.evaluate(rule, _observation("run-1", 39, severity="medium"), now=NOW)
+    engine.evaluate(
+        rule,
+        _observation("run-2", 40, severity="high"),
+        now=NOW + timedelta(minutes=1),
+    )
+    engine.evaluate(
+        rule,
+        _observation("run-3", 40, severity="high"),
+        now=NOW + timedelta(minutes=2),
+    )
+    engine.evaluate(
+        rule,
+        _observation("run-4", 35, severity="low"),
+        now=NOW + timedelta(minutes=3),
+    )
+    calls: list[str] = []
+
+    async def sender(item):
+        calls.append(item.outbox_id)
+
+    result = await outbox.deliver(
+        sender,
+        send_enabled=True,
+        dry_run=False,
+        now=NOW + timedelta(minutes=4),
+    )
+
+    assert result.sent == 3
+    assert result.pending == 1
+    assert len(calls) == 3
+
+
 def test_total_external_data_failure_neither_alerts_nor_mutates_hit_state(tmp_path) -> None:
     subscriptions = SubscriptionStore(tmp_path / "subscriptions.db")
     outbox = AlertOutbox(tmp_path / "alerts.db")

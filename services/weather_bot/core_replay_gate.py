@@ -996,7 +996,7 @@ def _run_public_event_scenario(
         passed = bool(
             generated.get("status") == "handled"
             and generated.get("mode") == "power_briefing"
-            and "电力气象决策晨报 3.0" in str(title or "")
+            and "电力气象交易晨报" in str(title or "")
             and (generated.get("coverage") or {}).get("markets", {}).get("total") == 33
             and service.requests
         )
@@ -1547,8 +1547,8 @@ def _execute_briefing_card(
                     text_fragments.append(str(child.get("content") or ""))
     card_text = "\n".join(text_fragments)
     checks = {
-        39: "负荷天气压力代理↑" in card_text and "负荷天气压力（角色内等权样本）" in card_text,
-        40: "光伏资源代理↓" in card_text and "光资源转弱代理（角色内等权样本）" in card_text,
+        39: "负荷天气压力代理↑" in card_text and "负荷天气压力（同类代表点等权汇总）" in card_text,
+        40: "光伏资源代理↓" in card_text and "光资源转弱代理（同类代表点等权汇总）" in card_text,
         41: "地面风资源代理↑" in card_text and "10米风仅作地面风资源代理" in card_text,
         72: "稳定分析区 0 个" not in card_text,
         73: (

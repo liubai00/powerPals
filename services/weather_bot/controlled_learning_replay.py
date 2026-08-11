@@ -406,6 +406,7 @@ def run_replay_case(case: ReplayCase, *, today: date | None = None) -> ReplayCas
         normalized,
         event,
         bot_role=context_bot_role,
+        today=today,
     )
     if action == "reset":
         actual = ReplayActual(
@@ -445,10 +446,14 @@ def run_replay_case(case: ReplayCase, *, today: date | None = None) -> ReplayCas
         contextual_text=contextual,
         region=_normalized_region_entity(explicit_region),
         regions=regions,
-        days=_days_from_text(contextual),
+        days=_days_from_text(contextual, today=today),
         metrics=metrics,
         unsupported_metrics=unsupported,
-        target_date=_target_date_from_text(contextual) if intent in {"weather", "weather_comparison"} else None,
+        target_date=(
+            _target_date_from_text(contextual, today=today)
+            if intent in {"weather", "weather_comparison"}
+            else None
+        ),
     )
     return _compare(case, actual, today=today)
 

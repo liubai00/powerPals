@@ -20,8 +20,11 @@ from services.weather_bot.models import (
 )
 from services.weather_bot.power_briefing import briefing_coverage, briefing_statistics
 from services.weather_bot.power_briefing_markets import (
+    AnalysisWindow,
     MAINLAND_PROVINCIAL_AREAS,
     NATIONAL_MARKETS,
+    MarketZone,
+    RepresentativePoint,
     representative_points,
     validate_market_config,
 )
@@ -70,8 +73,12 @@ def _scheduled_snapshot(
     release_slot: str = "09:00",
     run_id: str = "briefing-run-20260809-0850",
 ) -> dict:
-    cache_key = daily_power_briefing.briefing_cache_key(report_date)
-    _, market_config_version, report_version = cache_key.rsplit(":", 2)
+    cache_key = daily_power_briefing.briefing_cache_key(
+        report_date,
+        release_slot=release_slot,
+    )
+    base_cache_key = cache_key.rsplit(":release-", 1)[0]
+    _, market_config_version, report_version = base_cache_key.rsplit(":", 2)
     card = {
         "msg_type": "interactive",
         "card": {
@@ -133,6 +140,14 @@ def _scheduled_snapshot(
         },
         "statistics": {"classified_markets": 33, "configured_markets": 33},
         "market_risk_snapshots": [],
+        "window_assessment_snapshots": [],
+        "window_version_change": {
+            "status": "available",
+            "reason": "same_target_window_lifecycle",
+            "previous_run_id": None,
+            "counts": {},
+            "items": [],
+        },
         "summary_card": card,
         "detail_card": card,
     }
@@ -142,6 +157,13 @@ class _ScheduledDateTime(datetime):
     @classmethod
     def now(cls, tz=None):
         value = cls(2026, 8, 9, 9, 0)
+        return value.replace(tzinfo=tz) if tz is not None else value
+
+
+class _AfternoonScheduledDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 8, 9, 15, 0)
         return value.replace(tzinfo=tz) if tz is not None else value
 
 
@@ -282,9 +304,136 @@ async def test_scheduled_send_publishes_one_exact_precomputed_snapshot_with_a_st
         (
             "oc_reviewed",
             snapshot["summary_card"],
-            "5639970c-a529-5d60-af6e-a8058747abd2",
+            "c792d9da-6452-5859-9056-35e4a782a9ff",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_afternoon_precompute_requires_the_same_day_0900_baseline_before_fetching(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=str(tmp_path / "briefing.db"),
+    )
+
+    def fail_forecast_service(*args, **kwargs):
+        raise AssertionError("missing 09:00 baseline must stop before weather fetch setup")
+
+    async def fail_generation(*args, **kwargs):
+        raise AssertionError("missing 09:00 baseline must not generate 15:00 snapshot")
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(weather_main, "ForecastService", fail_forecast_service)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _AfternoonScheduledDateTime)
+    monkeypatch.setattr(daily_power_briefing, "get_or_generate_briefing", fail_generation)
+
+    result = await daily_power_briefing.go("afternoon_precompute")
+
+    assert result == "morning_baseline_missing"
+    assert "reason=morning_baseline_missing" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_afternoon_send_is_silent_when_precomputed_snapshot_has_no_material_change(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = str(tmp_path / "briefing.db")
+    snapshot = _scheduled_snapshot(
+        release_slot="15:00",
+        run_id="briefing-run-20260809-1450",
+    )
+    snapshot["afternoon_send_required"] = False
+    snapshot["afternoon_delta_card"] = None
+    cache = BriefingCache(db_path, ttl_seconds=3600)
+    assert cache.claim_generation(snapshot["cache_key"], "seed")
+    cache.save_and_release(
+        snapshot["cache_key"],
+        "seed",
+        snapshot,
+        generator_version=snapshot["report_version"],
+    )
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=db_path,
+        global_feishu_send_enabled=True,
+        power_briefing_afternoon_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "reviewed briefing group", "chat_id": "oc_reviewed"}],
+        ),
+    )
+
+    async def fail_send(*args, **kwargs):
+        raise AssertionError("no material change must remain silent")
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _AfternoonScheduledDateTime)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fail_send)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    assert await daily_power_briefing.go("afternoon_send") == "no_material_change"
+
+
+@pytest.mark.asyncio
+async def test_afternoon_send_uses_its_own_gate_and_only_sends_the_delta_card(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = str(tmp_path / "briefing.db")
+    snapshot = _scheduled_snapshot(
+        release_slot="15:00",
+        run_id="briefing-run-20260809-1450",
+    )
+    delta_card = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {"title": {"content": "15:00 delta"}},
+            "elements": [],
+        },
+    }
+    snapshot["afternoon_send_required"] = True
+    snapshot["afternoon_delta_card"] = delta_card
+    cache = BriefingCache(db_path, ttl_seconds=3600)
+    assert cache.claim_generation(snapshot["cache_key"], "seed")
+    cache.save_and_release(
+        snapshot["cache_key"],
+        "seed",
+        snapshot,
+        generator_version=snapshot["report_version"],
+    )
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=db_path,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=False,
+        power_briefing_afternoon_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "reviewed briefing group", "chat_id": "oc_reviewed"}],
+        ),
+    )
+    sends: list[dict] = []
+
+    async def fake_send(self, chat_id, card, *, idempotency_key=None):
+        sends.append(card)
+        return "message-afternoon"
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _AfternoonScheduledDateTime)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fake_send)
+    monkeypatch.setattr(
+        daily_power_briefing,
+        "_remember_scheduled_briefing_thread",
+        lambda *args: None,
+    )
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    await daily_power_briefing.go("afternoon_send")
+
+    assert sends == [delta_card]
 
 
 def _points(
@@ -399,6 +548,376 @@ def test_continuous_windows_reports_ranges_instead_of_first_hit():
     assert result == "11:00–14:00、17:00–20:00"
 
 
+def test_0900_briefing_states_exact_remaining_horizon_and_checks_every_tomorrow_window():
+    rows = [
+        {
+            "market_id": "cn-test",
+            "market": "测试分析区",
+            "province": "测试地区",
+            "point_id": "test-main",
+            "city": "测试城市",
+            "roles": ["hydrology"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission("2026-07-28"),
+            },
+        }
+    ]
+
+    text = _card_text(
+        build_briefing_card(
+            rows,
+            "2026-07-27",
+            generated_at=datetime.fromisoformat("2026-07-27T09:00:00+08:00"),
+        )
+    )
+
+    assert "分析范围：今日09:00–24:00 + 明日00:00–24:00" in text
+    assert "范围 今日+明日" not in text
+    assert "今日00:00–06:00｜凌晨｜已经过去，不作为未来预报" in text
+    assert "今日09:00–10:00｜早峰剩余｜已检查，暂无需要重点跟踪的信号" in text
+    for expected in (
+        "明日00:00–06:00｜凌晨｜已检查，暂无需要重点跟踪的信号",
+        "明日06:00–10:00｜早峰｜已检查，暂无需要重点跟踪的信号",
+        "明日10:00–16:00｜午间光伏｜已检查，暂无需要重点跟踪的信号",
+        "明日16:00–17:00｜下午过渡｜已检查，暂无需要重点跟踪的信号",
+        "明日17:00–21:00｜晚峰｜已检查，暂无需要重点跟踪的信号",
+        "明日21:00–24:00｜夜间｜已检查，暂无需要重点跟踪的信号",
+    ):
+        assert expected in text
+
+
+def test_0900_briefing_names_the_actual_today_and_tomorrow_windows_that_need_attention():
+    rows = [
+        {
+            "market_id": "cn-44-guangdong",
+            "market": "广东样本区",
+            "province": "广东",
+            "point_id": "guangdong-guangzhou",
+            "city": "广州",
+            "roles": ["solar"],
+            "submissions": {
+                "2026-07-27": _submission(
+                    "2026-07-27",
+                    cloudy_hours={11, 12, 13, 14},
+                ),
+                "2026-07-28": _submission("2026-07-28"),
+            },
+        },
+        {
+            "market_id": "cn-32-jiangsu",
+            "market": "江苏样本区",
+            "province": "江苏",
+            "point_id": "jiangsu-yancheng",
+            "city": "盐城",
+            "roles": ["wind"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission(
+                    "2026-07-28",
+                    cloudy_hours={7, 8, 9},
+                    wind_hours={7, 8, 9},
+                ),
+            },
+        },
+    ]
+
+    card = build_briefing_card(
+        rows,
+        "2026-07-27",
+        generated_at=datetime.fromisoformat("2026-07-27T09:00:00+08:00"),
+    )
+    text = _card_text(card)
+    focus = _card_section(card, "今天先看哪三件事")
+
+    assert "广东样本区·广州代表点｜今日10:00–16:00｜午间光伏" in focus
+    assert "光资源代理转弱" in focus
+    assert "建议核对：新能源功率预测和场站运行信息" in focus
+    assert "江苏样本区·盐城代表点｜明日06:00–10:00｜早峰" in focus
+    assert "局地风雨复合天气风险" in focus
+    assert "今日17:00–21:00｜晚峰｜已检查，暂无需要重点跟踪的信号" in text
+
+
+def test_window_check_distinguishes_checked_stable_areas_from_areas_with_missing_data():
+    incomplete_tomorrow = _submission("2026-07-28")
+    incomplete_tomorrow.aggregated_forecast.points = [
+        point
+        for point in incomplete_tomorrow.aggregated_forecast.points
+        if int(str(point.time)[11:13]) < 21
+    ]
+    rows = [
+        {
+            "market_id": "cn-complete",
+            "market": "完整分析区",
+            "province": "完整地区",
+            "point_id": "complete-main",
+            "city": "完整城市",
+            "roles": ["hydrology"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission("2026-07-28"),
+            },
+        },
+        {
+            "market_id": "cn-missing-night",
+            "market": "夜间缺失分析区",
+            "province": "缺失地区",
+            "point_id": "missing-night-main",
+            "city": "缺失城市",
+            "roles": ["hydrology"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": incomplete_tomorrow,
+            },
+        },
+    ]
+
+    text = _card_text(
+        build_briefing_card(
+            rows,
+            "2026-07-27",
+            generated_at=datetime.fromisoformat("2026-07-27T09:00:00+08:00"),
+        )
+    )
+
+    assert (
+        "明日21:00–24:00｜夜间｜已检查，暂无需要重点跟踪的信号；"
+        "另1个分析区数据不足"
+    ) in text
+
+
+def test_elapsed_today_weather_is_not_presented_as_future_or_as_unverified_observation():
+    rows = [
+        {
+            "market_id": "cn-elapsed",
+            "market": "已过时段分析区",
+            "province": "测试地区",
+            "point_id": "elapsed-main",
+            "city": "测试城市",
+            "roles": ["wind"],
+            "submissions": {
+                "2026-07-27": _submission(
+                    "2026-07-27",
+                    cloudy_hours={1, 2, 3},
+                    wind_hours={1, 2, 3},
+                ),
+                "2026-07-28": _submission("2026-07-28"),
+            },
+        }
+    ]
+
+    card = build_briefing_card(
+        rows,
+        "2026-07-27",
+        generated_at=datetime.fromisoformat("2026-07-27T09:00:00+08:00"),
+    )
+    text = _card_text(card)
+    focus = _card_section(card, "今天先看哪三件事")
+
+    assert "今日早间回顾：未接入经过可用性门禁的实况数据" in text
+    assert "已过时段不作为实况展示" in text
+    assert "01:00–04:00" not in focus
+
+
+def test_verified_morning_observation_is_shown_as_observation_not_as_forecast():
+    rows = [
+        {
+            "market_id": "cn-44-guangdong",
+            "market": "广东样本区",
+            "province": "广东",
+            "point_id": "guangzhou",
+            "city": "广州",
+            "roles": ["load"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission("2026-07-28"),
+            },
+        }
+    ]
+    observations = [
+        {
+            "availability_status": "allowed_for_calculation",
+            "market": "广东样本区",
+            "representative_point": "广州",
+            "metric": "apparent_temperature",
+            "value": 36.2,
+            "unit": "℃",
+            "valid_time": {
+                "start": "2026-07-27T06:00:00+08:00",
+                "end": "2026-07-27T09:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+            "retrieved_at": "2026-07-27T09:01:00+08:00",
+            "source_url": "https://example.gov.cn/weather/observation/guangzhou",
+            "provenance_ref": "official-observation:guangzhou:20260727-am",
+        }
+    ]
+
+    text = _card_text(
+        build_briefing_card(
+            rows,
+            "2026-07-27",
+            generated_at=datetime.fromisoformat("2026-07-27T09:05:00+08:00"),
+            verified_observations=observations,
+        )
+    )
+
+    assert "今日早间回顾（已核验实况）" in text
+    assert "广东样本区·广州代表点｜06:00–09:00｜实况体感温度 36.2℃" in text
+    assert "未接入经过可用性门禁的实况数据" not in text
+
+
+def test_unverified_morning_observation_is_never_presented_as_actual_weather():
+    rows = [
+        {
+            "market_id": "cn-44-guangdong",
+            "market": "广东样本区",
+            "province": "广东",
+            "point_id": "guangzhou",
+            "city": "广州",
+            "roles": ["load"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission("2026-07-28"),
+            },
+        }
+    ]
+
+    text = _card_text(
+        build_briefing_card(
+            rows,
+            "2026-07-27",
+            generated_at=datetime.fromisoformat("2026-07-27T09:05:00+08:00"),
+            verified_observations=[
+                {
+                    "availability_status": "text_only",
+                    "market": "广东样本区",
+                    "representative_point": "广州",
+                    "metric": "apparent_temperature",
+                    "value": 99,
+                    "unit": "℃",
+                }
+            ],
+        )
+    )
+
+    assert "实况体感温度 99" not in text
+    assert "今日早间回顾：未接入经过可用性门禁的实况数据" in text
+
+
+def test_naive_observation_timestamps_are_not_treated_as_verified_actuals():
+    text = _card_text(
+        build_briefing_card(
+            [],
+            "2026-07-27",
+            generated_at=datetime.fromisoformat("2026-07-27T09:05:00+08:00"),
+            market_config=(),
+            verified_observations=[
+                {
+                    "availability_status": "allowed_for_calculation",
+                    "market": "广东样本区",
+                    "representative_point": "广州",
+                    "metric": "temperature",
+                    "value": 31,
+                    "unit": "℃",
+                    "valid_time": {
+                        "start": "2026-07-27T06:00:00",
+                        "end": "2026-07-27T09:00:00",
+                        "timezone": "Asia/Shanghai",
+                    },
+                    "retrieved_at": "2026-07-27T09:01:00",
+                    "source_url": "https://example.gov.cn/weather/observation/guangzhou",
+                    "provenance_ref": "official-observation:guangzhou:20260727-am",
+                }
+            ],
+        )
+    )
+
+    assert "实况气温 31" not in text
+    assert "未接入经过可用性门禁的实况数据" in text
+
+
+def test_briefing_uses_analysis_area_window_configuration_instead_of_fixed_national_hours():
+    market_config = (
+        MarketZone(
+            market_id="cn-custom",
+            market_name="自定义分析区",
+            provincial_area="测试地区",
+            provincial_code="99",
+            points=(
+                RepresentativePoint(
+                    point_id="custom-main",
+                    city="测试城市",
+                    query="测试城市",
+                    roles=("hydrology",),
+                ),
+            ),
+            analysis_windows=(
+                AnalysisWindow("custom_overnight", "本区凌晨", 0, 5),
+                AnalysisWindow("custom_early_peak", "本区早峰", 5, 9),
+                AnalysisWindow("custom_remaining", "本区其余时段", 9, 24),
+            ),
+        ),
+    )
+    rows = [
+        {
+            "market_id": "cn-custom",
+            "market": "自定义分析区",
+            "province": "测试地区",
+            "point_id": "custom-main",
+            "city": "测试城市",
+            "roles": ["hydrology"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission("2026-07-28"),
+            },
+        }
+    ]
+
+    text = _card_text(
+        build_briefing_card(
+            rows,
+            "2026-07-27",
+            generated_at=datetime.fromisoformat("2026-07-27T09:00:00+08:00"),
+            market_config=market_config,
+        )
+    )
+
+    assert "明日05:00–09:00｜本区早峰｜已检查" in text
+    assert "明日06:00–10:00｜早峰" not in text
+
+
+def test_briefing_rejects_analysis_area_windows_with_an_unchecked_time_gap():
+    market_config = (
+        MarketZone(
+            market_id="cn-gap",
+            market_name="时间缺口分析区",
+            provincial_area="测试地区",
+            provincial_code="99",
+            points=(
+                RepresentativePoint(
+                    point_id="gap-main",
+                    city="测试城市",
+                    query="测试城市",
+                    roles=("hydrology",),
+                ),
+            ),
+            analysis_windows=(
+                AnalysisWindow("overnight", "凌晨", 0, 6),
+                AnalysisWindow("daytime", "白天", 7, 24),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must cover 00:00-24:00 without gaps"):
+        build_briefing_card(
+            [],
+            "2026-07-27",
+            generated_at=datetime.fromisoformat("2026-07-27T09:00:00+08:00"),
+            market_config=market_config,
+        )
+
+
 def test_briefing_2_0_prioritizes_risk_change_confidence_and_proxy_boundaries():
     rows = [
         {
@@ -436,13 +955,13 @@ def test_briefing_2_0_prioritizes_risk_change_confidence_and_proxy_boundaries():
     assert "山东·济南代表点" in text
     assert "局地风雨复合风险" in text
     assert "另有 3 个独立风险信号" in text
-    assert "负荷天气压力（角色内等权样本）：山东·济南代表点" in text
-    assert "光资源转弱代理（角色内等权样本）：山东·济南代表点" in text
-    assert "地面风资源代理（角色内等权样本）：山东·济南代表点" in text
+    assert "负荷天气压力（同类代表点等权汇总）：山东·济南代表点" in text
+    assert "光资源转弱代理（同类代表点等权汇总）：山东·济南代表点" in text
+    assert "地面风资源代理（同类代表点等权汇总）：山东·济南代表点" in text
     assert "变化：较今日新增风雨复合时段" in text
     assert "置信度：中等" in text
     assert "稳定分析区 1 个，精简卡未逐一列出" in text
-    assert "当前为多城市代表点样本扫描" in text
+    assert "当前为多城市代表点扫描" in text
     for unsupported_claim in ("强对流", "现货承压", "电价", "风电出力"):
         assert unsupported_claim not in text
 
@@ -541,8 +1060,11 @@ def test_briefing_coverage_distinguishes_market_count_from_representative_points
         )
     )
 
-    assert "分析区有数据 1/1（完整 1，部分 0，其中单点 0）" in text
-    assert "代表点 2/2" in text
+    assert (
+        "分析区有数据 1/1（所有代表城市均有数据 1，部分代表城市缺数据 0，"
+        "仅1个代表城市有数据 0）"
+    ) in text
+    assert "明日代表城市 2/2" in text
 
 
 def test_national_market_config_covers_31_areas_33_zones_and_75_unique_points():
@@ -592,7 +1114,8 @@ def test_partial_point_coverage_is_reported_without_marking_market_missing():
         "missing": 0,
     }
     assert coverage["points"] == {"covered": 1, "total": 2, "missing": 1}
-    assert "部分覆盖分析区 1 个" in text
+    assert "代表城市数据不齐的分析区 1 个；只按已有城市展示，不外推整个分析区" in text
+    assert "部分覆盖" not in text
     assert "数据完全缺失分析区" not in text
 
 
@@ -624,15 +1147,81 @@ def test_single_point_partial_zone_is_local_only_and_excluded_from_zone_rankings
             "roles": ["load", "solar", "wind"],
             "submissions": {},
         },
+        {
+            "market_id": "cn-test",
+            "market": "测试样本区",
+            "province": "测试地区",
+            "point_id": "also-missing",
+            "city": "另一缺失点",
+            "roles": ["load", "solar", "wind"],
+            "submissions": {},
+        },
     ]
 
     card = build_briefing_card(rows, "2026-07-27")
     text = _card_text(card)
     ranking = _card_section(card, "资源代理排行")
 
-    assert "测试样本区·高温点代表点（1/2点，不可外推全区）" in text
+    assert "测试样本区·高温点代表点｜用于分析的3个城市中，仅1个有数据；不能代表全区" in text
+    assert "代表点数据 1/3" not in text
     assert "测试样本区" not in ranking
-    assert "样本不足" in ranking
+    assert "代表点不足" in ranking
+
+
+def test_full_representative_point_coverage_uses_plain_language_not_sample_jargon():
+    rows = [
+        {
+            "market_id": "cn-test-full",
+            "market": "测试分析区",
+            "province": "测试地区",
+            "point_id": f"point-{index}",
+            "city": city,
+            "roles": ["load", "solar", "wind"],
+            "submissions": {
+                "2026-07-27": _submission("2026-07-27"),
+                "2026-07-28": _submission(
+                    "2026-07-28",
+                    hot_hours={17, 18, 19},
+                ),
+            },
+        }
+        for index, city in enumerate(("代表点甲", "代表点乙"), start=1)
+    ]
+
+    text = _card_text(build_briefing_card(rows, "2026-07-27"))
+
+    assert "用于分析的2个城市都有数据" in text
+    assert "完整样本" not in text
+
+
+def test_partial_representative_point_coverage_explains_missing_city_in_plain_language():
+    rows = [
+        {
+            "market_id": "cn-test-partial",
+            "market": "测试分析区",
+            "province": "测试地区",
+            "point_id": f"point-{index}",
+            "city": city,
+            "roles": ["load", "solar", "wind"],
+            "submissions": (
+                {
+                    "2026-07-27": _submission("2026-07-27"),
+                    "2026-07-28": _submission(
+                        "2026-07-28",
+                        hot_hours={17, 18, 19},
+                    ),
+                }
+                if index < 3
+                else {}
+            ),
+        }
+        for index, city in enumerate(("参考城市甲", "参考城市乙", "参考城市丙"), start=1)
+    ]
+
+    text = _card_text(build_briefing_card(rows, "2026-07-27"))
+
+    assert "用于分析的3个城市中，2个有数据；结论可能不完整" in text
+    assert "代表点数据 2/3" not in text
 
 
 def test_point_roles_strictly_constrain_resource_signals():

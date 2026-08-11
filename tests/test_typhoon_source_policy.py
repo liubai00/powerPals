@@ -463,3 +463,79 @@ def test_briefing_formatter_rejects_unverified_raw_typhoon_facts() -> None:
     assert block is not None
     assert "台风实时数据不可用" in block
     assert "未经门禁的台风" not in block
+
+
+def test_briefing_formatter_does_not_render_provider_null_as_storm_name() -> None:
+    provenance = {
+        "provider": QWEATHER_TYPHOON_PROVIDER,
+        "source_url": f"https://{API_HOST}/v7/tropical/storm-list",
+        "retrieved_at": "2026-08-10T00:50:00+00:00",
+        "content_sha256": "a" * 64,
+        "attribution": "QWeather",
+        "retention_policy": "metadata_only",
+    }
+    block = format_active_for_briefing(
+        [
+            {
+                "storm": {
+                    "id": "NP202616",
+                    "name": "null",
+                    "year": "2026",
+                    "_provenance": provenance,
+                },
+                "now": {
+                    "lat": "20.5",
+                    "lon": "147.2",
+                    "windSpeed": "20",
+                    "_provenance": provenance,
+                },
+            }
+        ]
+    )
+
+    assert block is not None
+    assert "**null**" not in block
+    assert "**未命名台风**" in block
+
+
+def test_briefing_formatter_only_renders_storms_with_a_verified_market_relevance_link() -> None:
+    provenance = {
+        "provider": QWEATHER_TYPHOON_PROVIDER,
+        "source_url": f"https://{API_HOST}/v7/tropical/storm-list",
+        "retrieved_at": "2026-08-10T00:50:00+00:00",
+        "content_sha256": "a" * 64,
+        "attribution": "QWeather",
+        "retention_policy": "metadata_only",
+    }
+    active = [
+        {
+            "storm": {
+                "id": "NP202616",
+                "name": "测试台风",
+                "year": "2026",
+                "_provenance": provenance,
+            },
+            "now": {
+                "lat": "20.5",
+                "lon": "147.2",
+                "windSpeed": "20",
+                "_provenance": provenance,
+            },
+            "affected_market_ids": ["cn-44-guangdong"],
+            "impact_valid_time": {
+                "start": "2026-08-11T08:00:00+08:00",
+                "end": "2026-08-12T20:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
+        }
+    ]
+
+    assert (
+        format_active_for_briefing(active, market_ids={"cn-31-shanghai"})
+        is None
+    )
+    relevant = format_active_for_briefing(active, market_ids={"cn-44-guangdong"})
+    assert relevant is not None
+    assert "测试台风" in relevant
+    assert "关联关注分析区：cn-44-guangdong" in relevant
+    assert "影响窗口：2026-08-11T08:00:00+08:00 至 2026-08-12T20:00:00+08:00" in relevant

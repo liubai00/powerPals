@@ -50,7 +50,11 @@ def _is_valid_snapshot(
         return False
     if payload.get("report_version") != generator_version:
         return False
-    key_parts = cache_key.rsplit(":", 2)
+    base_cache_key = cache_key
+    release_suffix: str | None = None
+    if re.search(r":release-\d{4}$", cache_key):
+        base_cache_key, release_suffix = cache_key.rsplit(":", 1)
+    key_parts = base_cache_key.rsplit(":", 2)
     if len(key_parts) == 3:
         report_date, market_config_version, report_version = key_parts
         if (
@@ -59,6 +63,13 @@ def _is_valid_snapshot(
             or payload.get("report_version") != report_version
         ):
             return False
+        if release_suffix is not None:
+            release_slot = payload.get("release_slot")
+            if (
+                not isinstance(release_slot, str)
+                or f"release-{release_slot.replace(':', '')}" != release_suffix
+            ):
+                return False
     coverage = payload.get("coverage")
     if not isinstance(coverage, dict):
         return False
@@ -381,6 +392,47 @@ class BriefingCache:
                 "AND report_version=? ORDER BY generated_at DESC LIMIT 1",
                 (
                     previous_date,
+                    release_slot,
+                    market_config_version,
+                    report_version,
+                ),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row[1])
+        except (TypeError, ValueError):
+            return None
+        identity = _version_identity(payload)
+        if (
+            identity is None
+            or identity[0] != str(row[0])
+            or not _is_valid_snapshot(
+                payload,
+                cache_key=str(payload.get("cache_key") or ""),
+                generator_version=identity[4],
+            )
+        ):
+            return None
+        return payload
+
+    def load_same_day_release(
+        self,
+        *,
+        report_date: str,
+        release_slot: str,
+        market_config_version: str,
+        report_version: str,
+    ) -> dict[str, Any] | None:
+        """Return the latest immutable run for an exact release on the report date."""
+
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT run_id,payload FROM briefing_versions "
+                "WHERE report_date=? AND release_slot=? AND market_config_version=? "
+                "AND report_version=? ORDER BY generated_at DESC LIMIT 1",
+                (
+                    report_date,
                     release_slot,
                     market_config_version,
                     report_version,

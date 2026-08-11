@@ -141,6 +141,7 @@ def evaluate_release_preflight(
         _runtime_capability_check(settings, phase),
         _phase_effect_check(settings, phase),
         _target_check(phase, target_count, evidence),
+        _learning_report_scope_check(settings, phase, evidence),
         _evidence_check(evidence, policies, observed_at),
     ]
     return ReleasePreflightResult(phase=phase, checks=tuple(checks))
@@ -199,8 +200,10 @@ def _phase_effect_check(settings: Settings, phase: ReleasePhase) -> PreflightChe
     proactive_disabled = (
         not settings.admin_api_send_enabled
         and not settings.power_briefing_allow_send
+        and not settings.power_briefing_afternoon_allow_send
         and not settings.alert_send_enabled
         and not settings.legacy_weather_scheduler_enabled
+        and not settings.controlled_learning_report_send_enabled
     )
     if phase == "shadow":
         passed = bool(
@@ -319,6 +322,37 @@ def _target_check(
         "exactly one initial scheduled target has an external approval reference"
         if passed
         else "scheduled target is invalid, duplicated, not singular, or lacks approval evidence",
+    )
+
+
+def _learning_report_scope_check(
+    settings: Settings,
+    phase: ReleasePhase,
+    evidence: Mapping[str, object] | None,
+) -> PreflightCheck:
+    if not settings.controlled_learning_report_send_enabled:
+        return PreflightCheck(
+            "learning_report_scope_reviewed",
+            True,
+            "controlled-learning report delivery is disabled",
+        )
+    approval = (
+        evidence.get("learning_report_target_approval_reference")
+        if isinstance(evidence, Mapping)
+        else None
+    )
+    passed = bool(
+        phase == "scheduled"
+        and str(settings.controlled_learning_report_chat_name or "").strip()
+        and isinstance(approval, str)
+        and approval.strip()
+    )
+    return PreflightCheck(
+        "learning_report_scope_reviewed",
+        passed,
+        "learning-report delivery has a named target and external approval reference"
+        if passed
+        else "learning-report delivery is enabled outside the scheduled phase or lacks target approval",
     )
 
 

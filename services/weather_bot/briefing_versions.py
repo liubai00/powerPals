@@ -561,3 +561,225 @@ def compare_market_risk_versions(
             "weight_version": weight_version,
         },
     }
+
+
+_WINDOW_LIFECYCLES = (
+    "upgraded",
+    "weakened",
+    "resolved",
+    "continuing",
+    "stable",
+    "first_observation",
+)
+
+
+def _window_assessment_identity(
+    item: Any,
+    *,
+    include_methodology: bool,
+) -> tuple[Any, ...] | None:
+    if not isinstance(item, dict):
+        return None
+    market_id = _non_empty(item.get("market_id"))
+    window_id = _non_empty(item.get("window_id"))
+    valid_time = _valid_time_identity(item.get("target_valid_time"))
+    proxy_metric = _non_empty(item.get("proxy_metric"))
+    if market_id is None or window_id is None or valid_time is None or proxy_metric is None:
+        return None
+    identity: tuple[Any, ...] = (market_id, window_id, valid_time, proxy_metric)
+    if not include_methodology:
+        return identity
+    proxy_version = _non_empty(item.get("proxy_method_version"))
+    weight_version = _non_empty(item.get("weight_version"))
+    if proxy_version is None or weight_version is None:
+        return None
+    return (*identity, proxy_version, weight_version)
+
+
+def _empty_window_counts() -> dict[str, int]:
+    return {lifecycle: 0 for lifecycle in _WINDOW_LIFECYCLES}
+
+
+def _window_lifecycle(previous: dict[str, Any], current: dict[str, Any]) -> str:
+    previous_status = str(previous.get("status") or "")
+    current_status = str(current.get("status") or "")
+    if current_status == "insufficient_data":
+        return "insufficient_data"
+    if previous_status == "insufficient_data":
+        return "first_observation"
+    previous_severity = int(previous.get("severity") or 0)
+    current_severity = int(current.get("severity") or 0)
+    if previous_severity == 0 and current_severity == 0:
+        return "stable"
+    if previous_severity > 0 and current_severity == 0:
+        return "resolved"
+    if current_severity > previous_severity:
+        return "upgraded"
+    if current_severity < previous_severity:
+        return "weakened"
+    return "continuing"
+
+
+def _window_change_item(
+    current: dict[str, Any],
+    previous: dict[str, Any] | None,
+    *,
+    lifecycle: str,
+    current_run_id: str,
+    previous_run_id: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    current_valid_time = current.get("target_valid_time")
+    previous_valid_time = previous.get("target_valid_time") if previous else None
+    return {
+        "market_id": current.get("market_id"),
+        "market": current.get("market"),
+        "representative_point": current.get("representative_point"),
+        "target_date": current.get("target_date"),
+        "window_id": current.get("window_id"),
+        "window_label": current.get("window_label"),
+        "target_valid_time": current_valid_time,
+        "proxy_metric": current.get("proxy_metric"),
+        "signal_type": current.get("signal_type"),
+        "previous_signal_type": previous.get("signal_type") if previous else None,
+        "current_event_id": current.get("event_id"),
+        "previous_event_id": previous.get("event_id") if previous else None,
+        "lifecycle": lifecycle,
+        "previous_status": previous.get("status") if previous else None,
+        "current_status": current.get("status"),
+        "previous_direction": previous.get("direction") if previous else None,
+        "current_direction": current.get("direction"),
+        "previous_severity": int(previous.get("severity") or 0) if previous else None,
+        "current_severity": int(current.get("severity") or 0),
+        "driver": current.get("driver"),
+        "verification_item": current.get("verification_item"),
+        "previous_confidence": previous.get("confidence") if previous else None,
+        "confidence": current.get("confidence"),
+        "comparison_basis": {
+            "reason": reason,
+            "current_run_id": current_run_id,
+            "previous_run_id": previous_run_id,
+            "current_target_valid_time": current_valid_time,
+            "previous_target_valid_time": previous_valid_time,
+            "proxy_method_version": current.get("proxy_method_version"),
+            "weight_version": current.get("weight_version"),
+        },
+    }
+
+
+def compare_window_assessment_versions(
+    current: list[dict[str, Any]],
+    previous: dict[str, Any] | None,
+    *,
+    current_run_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Classify derived time-window assessments without crossing target times.
+
+    Only a matching analysis area, business window, exact aware valid time,
+    proxy metric, proxy-method version and weight version is comparable.  An
+    unmatched current window is explicitly a first observation; it is never
+    described as an upgrade merely because it was absent from another date.
+    """
+
+    counts = _empty_window_counts()
+    current_run_id = _non_empty(current_run_metadata.get("forecast_run_id"))
+    if current_run_id is None or not _comparison_provenance_complete(current_run_metadata):
+        return {
+            "status": "unavailable",
+            "reason": "current_comparison_provenance_incomplete",
+            "previous_run_id": None,
+            "counts": counts,
+            "items": [],
+        }
+
+    previous_run_id = (
+        _non_empty(previous.get("forecast_run_id")) if isinstance(previous, dict) else None
+    )
+    previous_items: list[dict[str, Any]] = []
+    previous_is_usable = False
+    if isinstance(previous, dict):
+        candidate_items = previous.get("window_assessment_snapshots")
+        previous_is_usable = (
+            previous_run_id is not None
+            and isinstance(candidate_items, list)
+            and _comparison_provenance_complete(previous)
+        )
+        if previous_is_usable:
+            previous_items = [item for item in candidate_items if isinstance(item, dict)]
+
+    previous_exact: dict[tuple[Any, ...], dict[str, Any]] = {}
+    previous_base: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for item in previous_items:
+        exact_identity = _window_assessment_identity(item, include_methodology=True)
+        base_identity = _window_assessment_identity(item, include_methodology=False)
+        if exact_identity is not None:
+            previous_exact[exact_identity] = item
+        if base_identity is not None:
+            previous_base.setdefault(base_identity, []).append(item)
+
+    items: list[dict[str, Any]] = []
+    for item in current:
+        if not isinstance(item, dict):
+            continue
+        exact_identity = _window_assessment_identity(item, include_methodology=True)
+        base_identity = _window_assessment_identity(item, include_methodology=False)
+        if exact_identity is None or base_identity is None:
+            continue
+        if (
+            item.get("proxy_method_version")
+            != current_run_metadata.get("proxy_method_version")
+            or item.get("weight_version") != current_run_metadata.get("weight_version")
+        ):
+            return {
+                "status": "unavailable",
+                "reason": "current_methodology_metadata_conflict",
+                "previous_run_id": previous_run_id,
+                "counts": _empty_window_counts(),
+                "items": [],
+            }
+
+        matched = previous_exact.get(exact_identity) if previous_is_usable else None
+        if matched is None:
+            methodology_mismatch = bool(previous_base.get(base_identity))
+            reason = (
+                "methodology_mismatch"
+                if methodology_mismatch
+                else (
+                    "no_same_target_snapshot"
+                    if previous_is_usable
+                    else "no_previous_comparable_snapshot"
+                )
+            )
+            lifecycle = (
+                "insufficient_data"
+                if item.get("status") == "insufficient_data"
+                else "first_observation"
+            )
+        else:
+            lifecycle = _window_lifecycle(matched, item)
+            reason = "same_area_target_window_proxy_and_methodology"
+
+        if lifecycle in counts:
+            counts[lifecycle] += 1
+        items.append(
+            _window_change_item(
+                item,
+                matched,
+                lifecycle=lifecycle,
+                current_run_id=current_run_id,
+                previous_run_id=previous_run_id,
+                reason=reason,
+            )
+        )
+
+    return {
+        "status": "available",
+        "reason": (
+            "same_target_window_lifecycle"
+            if previous_is_usable
+            else "no_previous_comparable_snapshot"
+        ),
+        "previous_run_id": previous_run_id,
+        "counts": counts,
+        "items": items,
+    }

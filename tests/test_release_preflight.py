@@ -199,6 +199,51 @@ def test_preflight_requires_phase_scoped_runtime_capabilities() -> None:
     assert "runtime_capabilities_scoped" not in passive.failed_codes
 
 
+def test_afternoon_briefing_send_is_blocked_outside_the_scheduled_phase() -> None:
+    shadow = evaluate_release_preflight(
+        _shadow_settings(power_briefing_afternoon_allow_send=True),
+        phase="shadow",
+        evidence=_release_evidence(),
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+    passive = evaluate_release_preflight(
+        _shadow_settings(
+            dry_run=False,
+            feishu_passive_reply_enabled=True,
+            electricity_weather_analysis_enabled=True,
+            power_briefing_afternoon_allow_send=True,
+        ),
+        phase="passive",
+        evidence=_release_evidence(),
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+
+    assert "shadow_external_effects_disabled" in shadow.failed_codes
+    assert "passive_effects_scoped" in passive.failed_codes
+
+
+def test_scheduled_phase_can_review_morning_and_afternoon_briefing_paths_together() -> None:
+    evidence = _release_evidence()
+    evidence["target_approval_references"] = ["target-approval-20260809"]
+    result = evaluate_release_preflight(
+        _shadow_settings(
+            dry_run=False,
+            global_feishu_send_enabled=True,
+            power_briefing_allow_send=True,
+            power_briefing_afternoon_allow_send=True,
+            power_briefing_targets_json=(
+                '[{"chat_id":"oc_reviewed","approval_reference":'
+                '"target-approval-20260809"}]'
+            ),
+        ),
+        phase="scheduled",
+        evidence=evidence,
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+
+    assert "scheduled_effects_scoped" not in result.failed_codes
+
+
 def test_preflight_rejects_legacy_external_data_workbench_in_every_phase() -> None:
     for phase in ("shadow", "passive", "scheduled"):
         overrides: dict[str, object] = {
@@ -229,3 +274,45 @@ def test_preflight_rejects_legacy_external_data_workbench_in_every_phase() -> No
         )
 
         assert "runtime_capabilities_scoped" in result.failed_codes
+
+
+def test_learning_report_send_requires_scheduled_phase_and_explicit_test_target_approval() -> None:
+    passive = evaluate_release_preflight(
+        _shadow_settings(
+            dry_run=False,
+            feishu_passive_reply_enabled=True,
+            electricity_weather_analysis_enabled=True,
+            controlled_learning_report_send_enabled=True,
+            controlled_learning_report_chat_name="test",
+        ),
+        phase="passive",
+        evidence=_release_evidence(),
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+    scheduled_settings = _shadow_settings(
+        dry_run=False,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json='[{"name":"briefing","chat_id":"oc_reviewed"}]',
+        controlled_learning_report_send_enabled=True,
+        controlled_learning_report_chat_name="test",
+    )
+    evidence = _release_evidence()
+    evidence["target_approval_references"] = ["briefing-target-approval"]
+    missing_approval = evaluate_release_preflight(
+        scheduled_settings,
+        phase="scheduled",
+        evidence=evidence,
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+    evidence["learning_report_target_approval_reference"] = "test-group-approved-by-owner"
+    approved = evaluate_release_preflight(
+        scheduled_settings,
+        phase="scheduled",
+        evidence=evidence,
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+
+    assert "learning_report_scope_reviewed" in passive.failed_codes
+    assert "learning_report_scope_reviewed" in missing_approval.failed_codes
+    assert "learning_report_scope_reviewed" not in approved.failed_codes

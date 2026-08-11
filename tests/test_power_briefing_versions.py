@@ -5,6 +5,7 @@ from datetime import datetime
 import pytest
 
 from services.weather_bot.briefing_cache import BriefingCache
+from services.weather_bot.briefing_versions import compare_window_assessment_versions
 from services.weather_bot import power_briefing
 from services.weather_bot.models import (
     AggregatedForecast,
@@ -100,6 +101,226 @@ def _snapshot(
         "summary_card": _card(),
         "detail_card": _card(),
     }
+
+
+def _window_assessment(
+    *,
+    target_date: str = "2026-08-10",
+    severity: int = 3,
+    direction: str = "负荷天气压力代理偏高",
+    status: str = "attention",
+    proxy_method_version: str = "power-weather-proxy-v1",
+) -> dict:
+    return {
+        "market_id": "cn-37-shandong",
+        "market": "山东样本区",
+        "representative_point": "济南",
+        "target_date": target_date,
+        "window_id": "evening_peak",
+        "window_label": "晚峰",
+        "target_valid_time": {
+            "start": f"{target_date}T17:00:00+08:00",
+            "end": f"{target_date}T21:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        "proxy_metric": "window_attention_severity",
+        "signal_type": "load",
+        "status": status,
+        "severity": severity,
+        "direction": direction,
+        "driver": "体感温度峰值39.0℃",
+        "verification_item": "晚峰负荷预测、机组可用状态",
+        "confidence": "中等",
+        "proxy_method_version": proxy_method_version,
+        "weight_version": "market-risk-weight-v1",
+    }
+
+
+def test_window_version_comparison_reports_explicit_same_target_upgrade():
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["window_assessment_snapshots"] = [
+        _window_assessment(
+            severity=1,
+            direction="负荷天气压力代理轻微抬升",
+        )
+    ]
+    current = [_window_assessment(severity=3)]
+
+    result = compare_window_assessment_versions(
+        current,
+        previous,
+        current_run_metadata=_snapshot(run_id="briefing-run-20260810-0900"),
+    )
+
+    assert result["status"] == "available"
+    assert result["previous_run_id"] == "briefing-run-20260809-0900"
+    assert result["counts"] == {
+        "upgraded": 1,
+        "weakened": 0,
+        "resolved": 0,
+        "continuing": 0,
+        "stable": 0,
+        "first_observation": 0,
+    }
+    change = result["items"][0]
+    assert change["lifecycle"] == "upgraded"
+    assert change["market"] == "山东样本区"
+    assert change["representative_point"] == "济南"
+    assert change["target_date"] == "2026-08-10"
+    assert change["window_label"] == "晚峰"
+    assert change["previous_direction"] == "负荷天气压力代理轻微抬升"
+    assert change["current_direction"] == "负荷天气压力代理偏高"
+    assert change["previous_severity"] == 1
+    assert change["current_severity"] == 3
+    assert change["comparison_basis"]["current_run_id"] == "briefing-run-20260810-0900"
+    assert change["comparison_basis"]["previous_run_id"] == "briefing-run-20260809-0900"
+
+
+def test_window_version_comparison_never_compares_different_target_dates():
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["window_assessment_snapshots"] = [
+        _window_assessment(target_date="2026-08-09", severity=1)
+    ]
+
+    result = compare_window_assessment_versions(
+        [_window_assessment(target_date="2026-08-10", severity=3)],
+        previous,
+        current_run_metadata=_snapshot(run_id="briefing-run-20260810-0900"),
+    )
+
+    assert result["counts"]["upgraded"] == 0
+    assert result["counts"]["first_observation"] == 1
+    assert result["items"][0]["lifecycle"] == "first_observation"
+    assert result["items"][0]["comparison_basis"]["reason"] == "no_same_target_snapshot"
+
+
+@pytest.mark.parametrize(
+    ("previous_severity", "current_severity", "expected"),
+    [
+        (3, 3, "continuing"),
+        (3, 1, "weakened"),
+        (3, 0, "resolved"),
+        (0, 0, "stable"),
+    ],
+)
+def test_window_version_comparison_classifies_the_full_risk_lifecycle(
+    previous_severity,
+    current_severity,
+    expected,
+):
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["window_assessment_snapshots"] = [
+        _window_assessment(
+            severity=previous_severity,
+            status="attention" if previous_severity else "checked_no_attention",
+        )
+    ]
+    current = _window_assessment(
+        severity=current_severity,
+        direction=("暂无需要重点跟踪的天气侧信号" if current_severity == 0 else "负荷天气压力代理偏高"),
+        status="attention" if current_severity else "checked_no_attention",
+    )
+
+    result = compare_window_assessment_versions(
+        [current],
+        previous,
+        current_run_metadata=_snapshot(run_id="briefing-run-20260810-0900"),
+    )
+
+    assert result["items"][0]["lifecycle"] == expected
+    assert result["counts"][expected] == 1
+
+
+def test_window_version_comparison_fails_closed_across_proxy_method_versions():
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["window_assessment_snapshots"] = [
+        _window_assessment(proxy_method_version="legacy-proxy-v0", severity=1)
+    ]
+
+    result = compare_window_assessment_versions(
+        [_window_assessment(severity=3)],
+        previous,
+        current_run_metadata=_snapshot(run_id="briefing-run-20260810-0900"),
+    )
+
+    assert result["counts"]["upgraded"] == 0
+    assert result["counts"]["first_observation"] == 1
+    assert result["items"][0]["comparison_basis"]["reason"] == "methodology_mismatch"
+
+
+def test_afternoon_release_uses_a_distinct_cache_key_and_loads_same_day_0900(tmp_path):
+    morning_key = power_briefing.briefing_cache_key("2026-08-11", release_slot="09:00")
+    afternoon_key = power_briefing.briefing_cache_key("2026-08-11", release_slot="15:00")
+    assert morning_key != afternoon_key
+
+    cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=86400)
+    morning = _snapshot(run_id="briefing-run-20260811-0900", report_date="2026-08-11")
+    morning["market_config_version"] = power_briefing.MARKET_CONFIG_VERSION
+    morning["report_version"] = power_briefing.POWER_BRIEFING_REPORT_VERSION
+    morning["cache_key"] = morning_key
+    assert cache.claim_generation(morning_key, "morning", now=100)
+    cache.save_and_release(
+        morning_key,
+        "morning",
+        morning,
+        generator_version=power_briefing.POWER_BRIEFING_REPORT_VERSION,
+        generated_at=100,
+    )
+
+    loaded = cache.load_same_day_release(
+        report_date="2026-08-11",
+        release_slot="09:00",
+        market_config_version=power_briefing.MARKET_CONFIG_VERSION,
+        report_version=power_briefing.POWER_BRIEFING_REPORT_VERSION,
+    )
+
+    assert loaded is not None
+    assert loaded["forecast_run_id"] == "briefing-run-20260811-0900"
+
+
+@pytest.mark.asyncio
+async def test_1500_snapshot_compares_against_the_explicit_same_day_0900_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    market_config = _market_config()
+    row = _row(hot_tomorrow=True)
+
+    async def fake_fetch(*args, **kwargs):
+        return row
+
+    monkeypatch.setattr(power_briefing, "NATIONAL_MARKETS", market_config)
+    monkeypatch.setattr(
+        power_briefing,
+        "MARKET_POINTS",
+        ((market_config[0], market_config[0].points[0]),),
+    )
+    monkeypatch.setattr(power_briefing, "_fetch", fake_fetch)
+    morning = _snapshot(run_id="briefing-run-20260810-0900", report_date="2026-08-10")
+    morning["window_assessment_snapshots"] = [
+        _window_assessment(
+            target_date="2026-08-10",
+            severity=0,
+            status="checked_no_attention",
+            direction="暂无需要重点跟踪的天气侧信号",
+        )
+    ]
+
+    afternoon = await power_briefing.generate_briefing_snapshot(
+        object(),
+        None,
+        "2026-08-10",
+        cache=BriefingCache(str(tmp_path / "briefing.db")),
+        generated_at=datetime.fromisoformat("2026-08-10T14:50:00+08:00"),
+        forecast_run_id="briefing-run-20260810-1500",
+        release_slot="15:00",
+        comparison_snapshot=morning,
+    )
+
+    assert afternoon["cache_key"].endswith(":release-1500")
+    assert afternoon["window_version_change"]["previous_run_id"] == (
+        "briefing-run-20260810-0900"
+    )
 
 
 def _submission(
@@ -223,6 +444,102 @@ def _market_config() -> tuple[MarketZone, ...]:
     )
 
 
+@pytest.mark.asyncio
+async def test_generated_briefing_uses_yesterdays_forecast_for_the_same_today_window(
+    monkeypatch,
+    tmp_path,
+):
+    market_config = _market_config()
+    current_row = _row(hot_tomorrow=True)
+    for point in current_row["submissions"]["2026-08-10"].aggregated_forecast.points:
+        if 17 <= int(point.time[11:13]) <= 20:
+            point.temperature = 37.0
+            point.apparent_temperature = 39.0
+
+    async def fake_fetch(*args, **kwargs):
+        return current_row
+
+    monkeypatch.setattr(power_briefing, "NATIONAL_MARKETS", market_config)
+    monkeypatch.setattr(
+        power_briefing,
+        "MARKET_POINTS",
+        ((market_config[0], market_config[0].points[0]),),
+    )
+    monkeypatch.setattr(power_briefing, "_fetch", fake_fetch)
+    cache = BriefingCache(str(tmp_path / "briefing.db"), ttl_seconds=3600)
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["market_config_version"] = power_briefing.MARKET_CONFIG_VERSION
+    previous["report_version"] = power_briefing.POWER_BRIEFING_REPORT_VERSION
+    previous["cache_key"] = (
+        "2026-08-09:"
+        f"{power_briefing.MARKET_CONFIG_VERSION}:"
+        f"{power_briefing.POWER_BRIEFING_REPORT_VERSION}"
+    )
+    previous["window_assessment_snapshots"] = [
+        _window_assessment(
+            target_date="2026-08-10",
+            severity=1,
+            direction="负荷天气压力代理轻微抬升",
+        )
+    ]
+    assert cache.claim_generation(previous["cache_key"], "previous", now=100)
+    cache.save_and_release(
+        previous["cache_key"],
+        "previous",
+        previous,
+        generator_version=power_briefing.POWER_BRIEFING_REPORT_VERSION,
+        generated_at=100,
+    )
+
+    current = await power_briefing.generate_briefing_snapshot(
+        object(),
+        None,
+        "2026-08-10",
+        cache=cache,
+        generated_at=datetime.fromisoformat("2026-08-10T09:01:00+08:00"),
+        forecast_run_id="briefing-run-20260810-0900",
+        release_slot="09:00",
+    )
+
+    assert current["report_version"] == "power-briefing-3.1"
+    assessments = current["window_assessment_snapshots"]
+    assert {item["target_date"] for item in assessments} == {
+        "2026-08-10",
+        "2026-08-11",
+    }
+    change = next(
+        item
+        for item in current["window_version_change"]["items"]
+        if item["target_date"] == "2026-08-10"
+        and item["window_id"] == "evening_peak"
+    )
+    assert change["lifecycle"] == "upgraded"
+    assert change["comparison_basis"]["previous_run_id"] == "briefing-run-20260809-0900"
+
+    tomorrow = next(
+        item
+        for item in current["window_version_change"]["items"]
+        if item["target_date"] == "2026-08-11"
+        and item["window_id"] == "evening_peak"
+    )
+    assert tomorrow["lifecycle"] == "first_observation"
+    assert tomorrow["comparison_basis"]["reason"] == "no_same_target_snapshot"
+
+    card_text = _card_text(current["summary_card"])
+    title = current["summary_card"]["card"]["header"]["title"]["content"]
+    assert "电力气象交易晨报｜08/10 09:00" in title
+    assert "分析范围：今日09:00–24:00 + 明日00:00–24:00" in card_text
+    assert "今日预测修正" in card_text
+    assert "对比昨日09:00对今日相同时段的预测" in card_text
+    assert "负荷天气压力代理轻微抬升 → 负荷天气压力代理偏高" in card_text
+    assert "明日首次观察" in card_text
+    assert "首次纳入观察，暂无同时间可比预测" in card_text
+    assert "放心清单" in card_text
+    assert "结论有效期" in card_text
+    assert "Top 5 气象侧风险" not in card_text
+    assert "资源代理排行" not in card_text
+
+
 def _card_text(card: dict) -> str:
     chunks = [card["card"]["header"]["title"]["content"]]
     for element in card["card"]["elements"]:
@@ -233,6 +550,54 @@ def _card_text(card: dict) -> str:
             if isinstance(item, dict):
                 chunks.append(item.get("content", ""))
     return "\n".join(chunks)
+
+
+def test_healthy_summary_keeps_data_health_compact_until_user_expands():
+    run_metadata = _snapshot(run_id="briefing-run-20260810-0900")
+    run_metadata["quality"] = {
+        "status": "good",
+        "reasons": [],
+        "point_coverage": 1.0,
+        "baseline_coverage": 1.0,
+    }
+    run_metadata["confidence"] = {
+        "level": "高",
+        "basis": "coverage_and_provenance",
+    }
+    run_metadata["metric_coverage"] = {
+        "weather_points": {"covered": 1, "total": 1, "ratio": 1.0},
+        "today_baseline_points": {"covered": 1, "total": 1, "ratio": 1.0},
+        "provider_issued_at": {"covered": 1, "total": 1, "ratio": 1.0},
+    }
+    run_metadata["provider_issued_at"] = {
+        "open_meteo": "2026-08-10T08:00:00+08:00",
+    }
+
+    summary = power_briefing.build_briefing_card(
+        [_row(hot_tomorrow=True)],
+        "2026-08-10",
+        generated_at=datetime.fromisoformat("2026-08-10T09:01:00+08:00"),
+        market_config=_market_config(),
+        run_metadata=run_metadata,
+        version_change=run_metadata["version_change"],
+    )
+    detail = power_briefing.build_briefing_card(
+        [_row(hot_tomorrow=True)],
+        "2026-08-10",
+        generated_at=datetime.fromisoformat("2026-08-10T09:01:00+08:00"),
+        expanded=True,
+        market_config=_market_config(),
+        run_metadata=run_metadata,
+        version_change=run_metadata["version_change"],
+    )
+
+    summary_text = _card_text(summary)
+    detail_text = _card_text(detail)
+    assert "更新 2026-08-10 08:58｜分析区有数据 1/1｜总体可信度：高" in summary_text
+    assert "预报版本与数据质量" not in summary_text
+    assert "SHA-256" not in summary_text
+    assert "预报版本与数据质量" in detail_text
+    assert "SHA-256 " + "a" * 64 in detail_text
 
 
 def test_cache_persists_an_immutable_briefing_version_by_forecast_run_id(tmp_path):
@@ -471,9 +836,10 @@ async def test_generated_briefing_3_snapshot_exposes_traceable_run_and_quality_m
         "previous_run_id": None,
     }
     assert all("raw" not in item for item in snapshot["provider_run_metadata"])
+    assert snapshot["report_version"] == "power-briefing-3.1"
 
     card_text = _card_text(snapshot["summary_card"])
-    assert "电力气象决策晨报 3.0" in card_text
+    assert "电力气象交易晨报｜08/10 09:00" in card_text
     assert "briefing-run-20260810-0900" in card_text
     assert "实际抓取 2026-08-10 08:58" in card_text
     assert "聚合完成 2026-08-10 08:58" in card_text
@@ -484,7 +850,9 @@ async def test_generated_briefing_3_snapshot_exposes_traceable_run_and_quality_m
     assert "SHA-256 " + "a" * 64 in card_text
     assert "数据质量 降级" in card_text
     assert "provider_issued_at_missing" not in card_text
-    assert "上一同发布时次版本不可用" in card_text
+    assert "同目标时段比较基准：未找到可追溯快照；本卡不输出升降结论" in card_text
+    assert "上一版本" not in card_text
+    assert "上一同发布时次" not in card_text
     assert "未接入负荷、出力、机组、联络线及价格数据" in card_text
 
 
@@ -554,7 +922,7 @@ async def test_briefing_refuses_to_compare_yesterdays_tomorrow_with_todays_tomor
     assert "upgraded_markets" not in current["version_change"]
     assert "downgraded_markets" not in current["version_change"]
     card_text = _card_text(current["summary_card"])
-    assert "目标有效时间不同，不进行版本升降比较" in card_text
+    assert "比较基准与本次目标有效时间不同，不进行升降比较" in card_text
     assert "较上一同发布时次 briefing-run-20260809-0900：" not in card_text
 
 

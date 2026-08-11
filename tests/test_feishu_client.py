@@ -40,6 +40,10 @@ class FakeAsyncClient:
         self.calls.append((url, kwargs))
         return self.responses.pop(0)
 
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append((url, kwargs))
+        return self.responses.pop(0)
+
 
 @pytest.fixture(autouse=True)
 def fake_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,3 +115,50 @@ async def test_send_message_forwards_the_caller_idempotency_key_as_feishu_uuid()
         kwargs for url, kwargs in FakeAsyncClient.calls if "/im/v1/messages" in url
     )
     assert message_call["json"]["uuid"] == stable_uuid
+
+
+async def test_list_chats_paginates_and_returns_only_target_resolution_fields() -> None:
+    FakeAsyncClient.responses = [
+        FakeResponse({"code": 0, "tenant_access_token": "token-1", "expire": 7200}),
+        FakeResponse(
+            {
+                "code": 0,
+                "data": {
+                    "items": [
+                        {
+                            "chat_id": "oc_1",
+                            "name": "other",
+                            "chat_mode": "group",
+                            "description": "不得保留的群描述",
+                        }
+                    ],
+                    "has_more": True,
+                    "page_token": "next-page",
+                },
+            }
+        ),
+        FakeResponse(
+            {
+                "code": 0,
+                "data": {
+                    "items": [
+                        {"chat_id": "oc_2", "name": "test", "chat_mode": "group"}
+                    ],
+                    "has_more": False,
+                },
+            }
+        ),
+    ]
+    client = _client()
+
+    chats = await client.list_chats()
+
+    assert chats == [
+        {"chat_id": "oc_1", "name": "other", "chat_mode": "group"},
+        {"chat_id": "oc_2", "name": "test", "chat_mode": "group"},
+    ]
+    chat_calls = [
+        kwargs for url, kwargs in FakeAsyncClient.calls if url.endswith("/im/v1/chats")
+    ]
+    assert chat_calls[0]["params"] == {"page_size": 100}
+    assert chat_calls[1]["params"] == {"page_size": 100, "page_token": "next-page"}
