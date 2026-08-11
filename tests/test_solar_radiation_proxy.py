@@ -19,9 +19,11 @@ from services.weather_bot.providers import OpenMeteoProvider
 @pytest.mark.asyncio
 async def test_open_meteo_fetch_exposes_traceable_shortwave_radiation(monkeypatch):
     observed_hourly_fields: set[str] = set()
+    observed_wind_speed_unit: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed_hourly_fields.update(request.url.params["hourly"].split(","))
+        observed_wind_speed_unit.append(request.url.params.get("wind_speed_unit"))
         return httpx.Response(
             200,
             json={
@@ -62,6 +64,7 @@ async def test_open_meteo_fetch_exposes_traceable_shortwave_radiation(monkeypatc
     )
 
     assert "shortwave_radiation" in observed_hourly_fields
+    assert observed_wind_speed_unit == ["ms"]
     assert result.points[0].shortwave_radiation == 612.5
     assert result.source_url == "https://api.open-meteo.com/v1/forecast"
 

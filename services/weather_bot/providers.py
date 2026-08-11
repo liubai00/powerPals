@@ -133,6 +133,7 @@ class OpenMeteoProvider:
             "longitude": longitude,
             "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,cloud_cover,apparent_temperature,wind_direction_10m,uv_index,shortwave_radiation",
             "daily": "sunrise,sunset",
+            "wind_speed_unit": "ms",
             "timezone": "Asia/Shanghai",
             "start_date": target.isoformat(),
             "end_date": target.isoformat(),
