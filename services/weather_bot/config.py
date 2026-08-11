@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     feishu_task_encrypt_key: str | None = None
     feishu_task_default_chat_id: str | None = None
     feishu_task_bot_open_id: str | None = None
+    release_required_bot_roles_json: str = '["weather"]'
     feishu_bitable_app_token: str | None = None
     feishu_bitable_table_id: str | None = None
     feishu_task_bitable_table_id: str | None = None

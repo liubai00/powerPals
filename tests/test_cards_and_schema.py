@@ -7,6 +7,7 @@ from jsonschema import validate
 from services.weather_bot.cards import build_feishu_card, build_text_summary, build_weather_comparison_card
 from services.weather_bot.models import (
     AggregatedForecast,
+    DataProfile,
     ForecastPoint,
     ForecastSummary,
     ScopeProfile,
@@ -98,6 +99,26 @@ def test_text_summary_contains_required_fields_and_disclaimer():
     assert "业务提交截止：2026-06-09T16:00:00+08:00" in summary
     assert "数据截止" not in summary
     assert "不构成交易建议" in summary
+
+
+def test_weather_outputs_use_reviewed_source_disclosure_labels_for_required_attribution():
+    submission = make_submission().model_copy(
+        update={
+            "data_profile": DataProfile(
+                data_sources_summary=[
+                    "open_meteo — Weather data by Open-Meteo.com (CC BY 4.0)",
+                    "qweather — 天气数据来源：和风天气",
+                ]
+            )
+        }
+    )
+
+    summary = build_text_summary(submission)
+    card = card_text(build_feishu_card(submission))
+
+    for output in (summary, card):
+        assert "Weather data by Open-Meteo.com (CC BY 4.0)" in output
+        assert "天气数据来源：和风天气" in output
 
 
 def test_feishu_card_uses_message_card_shape():

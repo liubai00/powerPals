@@ -80,7 +80,11 @@ def evaluate_release_preflight(
         raise ValueError("preflight now must be timezone-aware")
 
     policies = _reviewed_source_policies(settings)
-    target_count = _reviewed_scheduled_target_count(settings.power_briefing_targets_json)
+    required_bot_roles = _required_bot_roles(settings.release_required_bot_roles_json)
+    scheduled_targets = _reviewed_scheduled_targets(settings.power_briefing_targets_json)
+    bot_identities_bound = bool(required_bot_roles) and all(
+        _role_bot_identity_complete(settings, role) for role in required_bot_roles
+    )
     checks = [
         PreflightCheck(
             "production_environment",
@@ -115,14 +119,10 @@ def evaluate_release_preflight(
         ),
         PreflightCheck(
             "feishu_bot_identities_bound",
-            _role_bot_identity_complete(settings, "weather")
-            and _role_bot_identity_complete(settings, "task"),
-            "both bot roles have callback credentials and exact open_id bindings"
-            if (
-                _role_bot_identity_complete(settings, "weather")
-                and _role_bot_identity_complete(settings, "task")
-            )
-            else "one or more bot roles lack callback credentials or exact open_id binding",
+            bot_identities_bound,
+            "every explicitly required bot role has callback credentials and an exact open_id binding"
+            if bot_identities_bound
+            else "required bot roles are invalid or one lacks callback credentials or an exact open_id binding",
         ),
         PreflightCheck(
             "model_selection_reviewed",
@@ -140,7 +140,7 @@ def evaluate_release_preflight(
         ),
         _runtime_capability_check(settings, phase),
         _phase_effect_check(settings, phase),
-        _target_check(phase, target_count, evidence),
+        _target_check(phase, scheduled_targets, evidence),
         _learning_report_scope_check(settings, phase, evidence),
         _evidence_check(evidence, policies, observed_at),
     ]
@@ -177,6 +177,24 @@ def _role_bot_identity_complete(settings: Settings, role: Literal["weather", "ta
     )
     open_id = getattr(settings, f"feishu_{role}_bot_open_id") or settings.feishu_bot_open_id
     return all(str(value or "").strip() for value in (app_id, app_secret, verification_token, open_id))
+
+
+def _required_bot_roles(raw: str | None) -> tuple[Literal["weather", "task"], ...]:
+    try:
+        decoded = json.loads((raw or "").strip() or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    if not isinstance(decoded, list) or not decoded:
+        return ()
+    roles: list[Literal["weather", "task"]] = []
+    for item in decoded:
+        if not isinstance(item, str):
+            return ()
+        role = item.strip().casefold()
+        if role not in {"weather", "task"} or role in roles:
+            return ()
+        roles.append(role)  # type: ignore[arg-type]
+    return tuple(roles)
 
 
 def _external_ai_egress_reviewed(settings: Settings) -> bool:
@@ -276,7 +294,7 @@ def _runtime_capability_check(
     )
 
 
-def _reviewed_scheduled_target_count(raw: str | None) -> int | None:
+def _reviewed_scheduled_targets(raw: str | None) -> tuple[str | None, ...] | None:
     try:
         decoded = json.loads((raw or "").strip() or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -284,6 +302,7 @@ def _reviewed_scheduled_target_count(raw: str | None) -> int | None:
     if not isinstance(decoded, list):
         return None
     seen: set[str] = set()
+    target_approvals: list[str | None] = []
     for item in decoded:
         if not isinstance(item, dict):
             return None
@@ -291,16 +310,22 @@ def _reviewed_scheduled_target_count(raw: str | None) -> int | None:
         if not isinstance(chat_id, str) or not chat_id.strip() or chat_id.strip() in seen:
             return None
         seen.add(chat_id.strip())
-    return len(seen)
+        approval = item.get("approval_reference")
+        if approval is not None and (
+            not isinstance(approval, str) or not approval.strip()
+        ):
+            return None
+        target_approvals.append(approval.strip() if isinstance(approval, str) else None)
+    return tuple(target_approvals)
 
 
 def _target_check(
     phase: ReleasePhase,
-    target_count: int | None,
+    targets: tuple[str | None, ...] | None,
     evidence: Mapping[str, object] | None,
 ) -> PreflightCheck:
     if phase != "scheduled":
-        passed = target_count is not None
+        passed = targets is not None
         return PreflightCheck(
             "target_configuration_valid",
             passed,
@@ -309,19 +334,27 @@ def _target_check(
             else "target configuration is malformed or contains duplicates",
         )
     approvals = evidence.get("target_approval_references") if isinstance(evidence, Mapping) else None
+    configured_approvals = tuple(item for item in (targets or ()) if item is not None)
+    evidence_approvals = tuple(
+        item.strip()
+        for item in approvals
+        if isinstance(item, str) and item.strip()
+    ) if isinstance(approvals, list) else ()
     passed = bool(
-        target_count == 1
+        targets
+        and len(configured_approvals) == len(targets)
+        and len(set(configured_approvals)) == len(configured_approvals)
         and isinstance(approvals, list)
-        and len(approvals) == 1
-        and isinstance(approvals[0], str)
-        and approvals[0].strip()
+        and len(evidence_approvals) == len(approvals) == len(configured_approvals)
+        and len(set(evidence_approvals)) == len(evidence_approvals)
+        and set(evidence_approvals) == set(configured_approvals)
     )
     return PreflightCheck(
         "scheduled_target_reviewed",
         passed,
-        "exactly one initial scheduled target has an external approval reference"
+        "every distinct scheduled target is bound to one current owner-confirmation reference"
         if passed
-        else "scheduled target is invalid, duplicated, not singular, or lacks approval evidence",
+        else "scheduled targets are invalid, duplicated, or not exactly bound to owner-confirmation evidence",
     )
 
 

@@ -11,6 +11,15 @@ from services.weather_bot.weather_metrics import SUPPORTED_WEATHER_METRIC_ORDER,
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 
+def _source_labels(submission: WeatherSubmission) -> list[str]:
+    reviewed = [
+        str(item).strip()
+        for item in submission.data_profile.data_sources_summary
+        if str(item).strip()
+    ]
+    return reviewed or list(submission.aggregated_forecast.providers_used)
+
+
 def to_feishu_lark_md(text: str) -> str:
     """把 LLM 输出规整成飞书 lark_md 友好格式: Markdown 标题(#/##)转成加粗、收敛多余空行。
     lark_md 能渲染 **加粗**/换行/`-` 列表, 但不认 # 标题(会原样露出), 故此处兜底转换。"""
@@ -56,7 +65,7 @@ def build_text_summary(submission: WeatherSubmission) -> str:
             f"预测日：{submission.target_date}",
             f"数据抓取时间：{retrieved_at}",
             f"业务提交截止：{business_submission_deadline}",
-            f"数据来源：{' / '.join(submission.aggregated_forecast.providers_used)}",
+            f"数据来源：{' / '.join(_source_labels(submission))}",
             "",
             "核心结果：",
             f"- 最高温：{summary.max_temperature}℃",
@@ -257,7 +266,7 @@ def build_feishu_card(
         submission.time_info.business_submission_deadline or submission.data_cutoff_time
     )
     scope_bits.append(f"业务提交截止 {_fmt_cutoff(business_submission_deadline)}")
-    scope_bits.append("来源 " + " / ".join(submission.aggregated_forecast.providers_used))
+    scope_bits.append("来源 " + " / ".join(_source_labels(submission)))
     _sm = submission.aggregated_forecast.summary
     if _sm.sunrise and _sm.sunset:
         scope_bits.append(f"日出 {_sm.sunrise} · 日落 {_sm.sunset}")

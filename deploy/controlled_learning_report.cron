@@ -1,3 +1,5 @@
-# 云云受控学习摘要发布：使用与 controlled_learning.cron 相同的 cron 时区，晚 30 分钟运行。
+# 云云受控学习摘要发布（北京时间 11:00），比学习任务晚 30 分钟运行。
 # 该入口不会覆盖任何发送开关；默认配置下只返回 learning_report_send_disabled，零发送。
-0 3 * * * docker exec -i powerpals-weather-bot-1 python -m services.weather_bot.controlled_learning_report_cli >> /var/log/weather-controlled-learning-report.log 2>&1
+SHELL=/bin/sh
+CRON_TZ=Asia/Shanghai
+0 11 * * * docker exec -i powerpals-weather-bot-1 python -m services.weather_bot.controlled_learning_report_cli >> /var/log/weather-controlled-learning-report.log 2>&1

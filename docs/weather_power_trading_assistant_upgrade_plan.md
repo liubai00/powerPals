@@ -1143,7 +1143,7 @@ GET https://{reviewed-api-host}/weatheralert/v1/current/{latitude}/{longitude}
 
 禁止用测试策略、虚构条款版本、示例 endpoint、测试 chat_id 或“先上线再补审批”绕过此门禁。当前默认 `WEATHER_SOURCE_POLICIES_JSON=[]` 和 `POWER_BRIEFING_TARGETS_JSON=[]` 正是有意的部署硬阻断，不是待随手补齐的普通配置。
 
-代码侧必须运行 `python -m services.weather_bot.release_preflight --phase <shadow|passive|scheduled> --evidence <外部证据文件>`，把上述可机器核验项固化为 `READY/BLOCKED` 和退出码。证据文件只保存审批/备份/提交/配置哈希/责任人引用及有效期，不得含 Token、API Key、chat_id、open_id 或许可正文。`shadow` 必须是 `DRY_RUN=true`、0 回复、0 主动发送；`passive` 只允许鉴权后的用户触发回复；`scheduled` 首轮只允许一个具备独立审批引用的晨报目标。preflight 通过只是发布必要条件，不得代替人工许可、目标授权、监控值守或变更审批。
+代码侧必须运行 `python -m services.weather_bot.release_preflight --phase <shadow|passive|scheduled> --evidence <外部证据文件>`，把上述可机器核验项固化为 `READY/BLOCKED` 和退出码。证据文件只保存所有者确认/备份/提交/配置哈希/责任人引用及有效期，不得含 Token、API Key、chat_id、open_id 或许可正文。`shadow` 必须是 `DRY_RUN=true`、0 回复、0 主动发送；`passive` 只允许鉴权后的用户触发回复；`scheduled` 允许保留所有者逐一确认的既有目标，但配置内每个目标的唯一引用必须与 evidence 精确匹配。preflight 通过只是发布必要条件，不得代替真实许可、目标授权、监控值守或变更审批。
 
 ### 21.5 灰度步骤
 

@@ -73,10 +73,7 @@ def _shadow_settings(**overrides: object) -> Settings:
         "feishu_weather_app_secret": "injected-weather-secret",
         "feishu_weather_verification_token": "injected-weather-token",
         "feishu_weather_bot_open_id": "ou_weather_bot",
-        "feishu_task_app_id": "task-app",
-        "feishu_task_app_secret": "injected-task-secret",
-        "feishu_task_verification_token": "injected-task-token",
-        "feishu_task_bot_open_id": "ou_task_bot",
+        "release_required_bot_roles_json": '["weather"]',
         "power_briefing_allow_send": False,
         "power_briefing_targets_json": "[]",
         "legacy_weather_scheduler_enabled": False,
@@ -124,10 +121,37 @@ def test_fully_evidenced_shadow_configuration_passes_without_exposing_secrets() 
         settings.admin_api_token,
         settings.feishu_weather_app_secret,
         settings.feishu_weather_verification_token,
-        settings.feishu_task_app_secret,
-        settings.feishu_task_verification_token,
     ):
         assert secret not in serialized
+
+
+def test_weather_only_release_does_not_require_an_unused_task_bot_identity() -> None:
+    settings = _shadow_settings(
+        feishu_task_app_id=None,
+        feishu_task_app_secret=None,
+        feishu_task_verification_token=None,
+        feishu_task_bot_open_id=None,
+    )
+
+    result = evaluate_release_preflight(
+        settings,
+        phase="shadow",
+        evidence=_release_evidence(),
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+
+    assert "feishu_bot_identities_bound" not in result.failed_codes
+
+
+def test_preflight_fails_closed_for_an_invalid_required_bot_role_list() -> None:
+    result = evaluate_release_preflight(
+        _shadow_settings(release_required_bot_roles_json='["weather","unknown"]'),
+        phase="shadow",
+        evidence=_release_evidence(),
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+
+    assert "feishu_bot_identities_bound" in result.failed_codes
 
 
 def test_scheduled_phase_fails_closed_for_duplicate_or_unapproved_targets() -> None:
@@ -242,6 +266,81 @@ def test_scheduled_phase_can_review_morning_and_afternoon_briefing_paths_togethe
     )
 
     assert "scheduled_effects_scoped" not in result.failed_codes
+
+
+def test_scheduled_phase_accepts_multiple_distinct_existing_targets_when_each_is_bound_to_evidence() -> None:
+    approvals = [
+        "owner-confirmed-existing-target-a-20260811",
+        "owner-confirmed-existing-target-b-20260811",
+    ]
+    evidence = _release_evidence()
+    evidence["target_approval_references"] = approvals
+    settings = _shadow_settings(
+        dry_run=False,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [
+                {
+                    "name": "existing-group-a",
+                    "chat_id": "oc_existing_a",
+                    "approval_reference": approvals[0],
+                },
+                {
+                    "name": "existing-group-b",
+                    "chat_id": "oc_existing_b",
+                    "approval_reference": approvals[1],
+                },
+            ]
+        ),
+    )
+
+    result = evaluate_release_preflight(
+        settings,
+        phase="scheduled",
+        evidence=evidence,
+        now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+    )
+
+    assert "scheduled_target_reviewed" not in result.failed_codes
+
+
+def test_scheduled_phase_rejects_target_evidence_that_is_missing_duplicated_or_unbound() -> None:
+    configured_approvals = ["existing-a", "existing-b"]
+    settings = _shadow_settings(
+        dry_run=False,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [
+                {
+                    "name": "existing-group-a",
+                    "chat_id": "oc_existing_a",
+                    "approval_reference": configured_approvals[0],
+                },
+                {
+                    "name": "existing-group-b",
+                    "chat_id": "oc_existing_b",
+                    "approval_reference": configured_approvals[1],
+                },
+            ]
+        ),
+    )
+
+    for evidence_approvals in (
+        [configured_approvals[0]],
+        [configured_approvals[0], configured_approvals[0]],
+        [configured_approvals[0], "different-target"],
+    ):
+        evidence = _release_evidence()
+        evidence["target_approval_references"] = evidence_approvals
+        result = evaluate_release_preflight(
+            settings,
+            phase="scheduled",
+            evidence=evidence,
+            now=datetime(2026, 8, 9, 2, tzinfo=timezone.utc),
+        )
+        assert "scheduled_target_reviewed" in result.failed_codes
 
 
 def test_preflight_rejects_legacy_external_data_workbench_in_every_phase() -> None:

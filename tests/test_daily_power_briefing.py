@@ -13,6 +13,7 @@ from services.weather_bot.config import Settings
 from services.weather_bot.feishu import FeishuClient
 from services.weather_bot.models import (
     AggregatedForecast,
+    DataProfile,
     ForecastPoint,
     ForecastSummary,
     ProviderForecast,
@@ -535,6 +536,34 @@ def _card_section(card: dict, heading: str) -> str:
         if isinstance(text, dict) and heading in text.get("content", ""):
             return text["content"]
     return ""
+
+
+def test_briefing_uses_reviewed_source_disclosure_labels_for_required_attribution():
+    disclosure = "open_meteo — Weather data by Open-Meteo.com (CC BY 4.0)"
+    today = _submission("2026-07-27").model_copy(
+        update={"data_profile": DataProfile(data_sources_summary=[disclosure])}
+    )
+    tomorrow = _submission("2026-07-28").model_copy(
+        update={"data_profile": DataProfile(data_sources_summary=[disclosure])}
+    )
+    rows = [
+        {
+            "market_id": "cn-test",
+            "market": "测试分析区",
+            "province": "测试地区",
+            "point_id": "test-main",
+            "city": "测试城市",
+            "roles": [],
+            "submissions": {
+                "2026-07-27": today,
+                "2026-07-28": tomorrow,
+            },
+        }
+    ]
+
+    text = _card_text(build_briefing_card(rows, "2026-07-27"))
+
+    assert disclosure in text
 
 
 def test_continuous_windows_reports_ranges_instead_of_first_hit():

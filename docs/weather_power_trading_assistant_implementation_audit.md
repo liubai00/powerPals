@@ -36,7 +36,7 @@
 |---|---|---|
 | 管理 API 鉴权 | 已完成：Bearer、actor、administrator 角色、默认拒绝 | 生产 Token 和 actor 只能由密钥系统注入 |
 | 管理发布安全 | 已完成：独立发送开关、目标白名单、幂等键、稳定 UUID、最小审计回执 | 未配置真实授权目标，默认 0 发送 |
-| 飞书事件认证 | 已完成：生产 token 默认必需；伪造事件在认领前拒绝 | 生产 verification token 与 bot open_id 待人工复核 |
+| 飞书事件认证 | 已完成：生产 token 默认必需；伪造事件在认领前拒绝；发布预检只核验显式部署角色 | 当前部署角色为云云 `weather`，需绑定其 verification token 与 bot open_id |
 | 群聊门禁 | 已完成：结构化 mention 必须匹配当前 bot open_id；同名用户和手打 `@云云` 静默 | 被动回复仍需独立开关且受 `DRY_RUN` 否决 |
 | 交易结论边界 | 已完成：LLM 调用前后双重 fail-closed，覆盖价格、申报、仓位及自然同义表达 | 无外部电力数据时仅允许 W1/W2 |
 | 真实时间与版本 | 已完成：抓取、源起报、聚合、有效窗口、run_id、业务截止分离 | 缺失字段不伪造 |
@@ -89,7 +89,7 @@
 - `production_environment`：本地运行环境不是生产作用域；
 - `source_policies_reviewed`：没有完整、人工审核的生产计算来源策略；
 - `admin_identity_bound`：生产管理 actor/角色/Token 尚未注入；
-- `feishu_bot_identities_bound`：生产双机器人凭证与精确 open_id 尚未复核；
+- `feishu_bot_identities_bound`：`RELEASE_REQUIRED_BOT_ROLES_JSON` 中每个实际部署角色的凭证与精确 open_id 必须绑定；当前仅要求云云；
 - `shadow_external_effects_disabled`：当前本地运行配置不是一份完整的生产 shadow 配置；
 - `release_evidence_current`：缺少当前发布、上一稳定版本、配置哈希、备份、监控、回滚和审批引用。
 
@@ -121,7 +121,7 @@
 2. `DRY_RUN=true`，所有回复、主动发送和五项受控能力关闭；
 3. 使用真实审核后的 SourcePolicy 影子运行至少 7 天；
 4. 只开放内部私聊和电力气象分析，被动回复仍要求飞书认证；
-5. 仅开放一个已审核的 09:00 晨报目标；15:00 差异快报另行审批；
+5. 仅开放所有者逐一确认且引用与配置精确绑定的既有晨报目标；15:00 差异快报使用独立开关；
 6. 订阅和主动告警最后单独灰度，不补发历史事件。
 
 回滚顺序：

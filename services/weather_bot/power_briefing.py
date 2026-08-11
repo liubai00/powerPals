@@ -926,12 +926,15 @@ def _risk_priority_key(insight: MarketInsight) -> tuple[float, float, int, float
 
 
 def _source_summary(rows: list[dict[str, Any]]) -> str:
-    sources = {
-        provider
-        for row in rows
-        for submission in (row.get("submissions") or {}).values()
-        for provider in submission.aggregated_forecast.providers_used
-    }
+    sources: set[str] = set()
+    for row in rows:
+        for submission in (row.get("submissions") or {}).values():
+            reviewed = [
+                str(item).strip()
+                for item in submission.data_profile.data_sources_summary
+                if str(item).strip()
+            ]
+            sources.update(reviewed or submission.aggregated_forecast.providers_used)
     return " / ".join(sorted(sources)) if sources else "暂无可用源"
 
 
