@@ -20,6 +20,7 @@ from services.weather_bot.source_registry import (
 )
 
 logger = logging.getLogger(__name__)
+SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 QWEATHER_TYPHOON_PROVIDER = "qweather_tropical_cyclone"
 _TYPHOON_PATHS = (
@@ -490,7 +491,9 @@ def format_active_for_briefing(
             valid_time = item.get("impact_valid_time") or {}
             lines.append(f"关联关注分析区：{'、'.join(affected)}")
             lines.append(
-                f"影响窗口：{valid_time.get('start')} 至 {valid_time.get('end')}"
+                "影响窗口："
+                f"{_briefing_timestamp(valid_time.get('start'), '%m/%d %H:%M')}–"
+                f"{_briefing_timestamp(valid_time.get('end'), '%m/%d %H:%M')}"
             )
     provenance = [
         item[part]["_provenance"]
@@ -499,16 +502,28 @@ def format_active_for_briefing(
     ]
     latest_retrieval = max(str(item["retrieved_at"]) for item in provenance)
     attributions = sorted({str(item["attribution"]) for item in provenance})
-    source_urls = sorted({str(item["source_url"]) for item in provenance})
     lines.append(
-        "来源：%s｜抓取：%s｜可追溯接口：%s"
-        % (" / ".join(attributions), latest_retrieval, "、".join(source_urls))
+        "来源：%s｜更新时间：%s"
+        % (
+            "、".join(attributions),
+            _briefing_timestamp(latest_retrieval, "%H:%M"),
+        )
     )
     lines.append(
         "边界：台风路径与10米近中心风仅为气象侧证据；风电切出、光伏出力、负荷及交易影响"
         "须结合场站和电力数据另行判断。"
     )
     return "\n".join(lines)
+
+
+def _briefing_timestamp(value: Any, pattern: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return "未记录"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return "未记录"
+    return parsed.astimezone(SHANGHAI_TZ).strftime(pattern)
 
 
 def _verified_market_relevance(item: dict[str, Any], market_ids: set[str]) -> bool:

@@ -996,7 +996,7 @@ def _run_public_event_scenario(
         passed = bool(
             generated.get("status") == "handled"
             and generated.get("mode") == "power_briefing"
-            and "电力气象交易晨报" in str(title or "")
+            and "电力气象晨报" in str(title or "")
             and (generated.get("coverage") or {}).get("markets", {}).get("total") == 33
             and service.requests
         )

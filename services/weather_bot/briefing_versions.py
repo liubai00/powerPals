@@ -392,21 +392,29 @@ def _comparison_provenance_complete(payload: Any) -> bool:
 
 def _risk_comparison_identity(
     item: Any,
-) -> tuple[str, tuple[str, str, str], str, str] | None:
+) -> tuple[
+    str,
+    tuple[str, str, str],
+    str,
+    str,
+    tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+] | None:
     if not isinstance(item, dict):
         return None
     market_id = _non_empty(item.get("market_id"))
     valid_time = _valid_time_identity(item.get("target_valid_time"))
     proxy_version = _non_empty(item.get("proxy_method_version"))
     weight_version = _non_empty(item.get("weight_version"))
+    sampling_scope = _sampling_scope_identity(item)
     if (
         market_id is None
         or valid_time is None
         or proxy_version is None
         or weight_version is None
+        or sampling_scope is None
     ):
         return None
-    return market_id, valid_time, proxy_version, weight_version
+    return market_id, valid_time, proxy_version, weight_version, sampling_scope
 
 
 def compare_market_risk_versions(
@@ -459,6 +467,7 @@ def compare_market_risk_versions(
     mismatched_valid_time = False
     mismatched_proxy_version = False
     mismatched_weight_version = False
+    mismatched_sampling_scope = False
     incomplete_identity = False
     current_methodology_conflict = False
     previous_methodology_conflict = False
@@ -502,6 +511,9 @@ def compare_market_risk_versions(
         if current_identity[3] != previous_identity[3]:
             mismatched_weight_version = True
             continue
+        if current_identity[4] != previous_identity[4]:
+            mismatched_sampling_scope = True
+            continue
         aligned_markets.append(market_id)
         comparison_identity = (
             current_identity[1],
@@ -520,6 +532,8 @@ def compare_market_risk_versions(
             reason = "proxy_method_version_mismatch"
         elif mismatched_weight_version:
             reason = "weight_version_mismatch"
+        elif mismatched_sampling_scope:
+            reason = "sampling_or_source_scope_mismatch"
         elif incomplete_identity:
             reason = "market_comparison_metadata_incomplete"
         else:
@@ -591,9 +605,47 @@ def _window_assessment_identity(
         return identity
     proxy_version = _non_empty(item.get("proxy_method_version"))
     weight_version = _non_empty(item.get("weight_version"))
-    if proxy_version is None or weight_version is None:
+    sampling_scope = _sampling_scope_identity(item)
+    if proxy_version is None or weight_version is None or sampling_scope is None:
         return None
-    return (*identity, proxy_version, weight_version)
+    return (*identity, proxy_version, weight_version, sampling_scope)
+
+
+def _sampling_scope_identity(
+    item: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None:
+    configured = item.get("configured_point_ids")
+    covered = item.get("covered_point_ids")
+    sources = item.get("source_set")
+    if not all(isinstance(value, list) for value in (configured, covered, sources)):
+        return None
+    configured_ids = tuple(
+        sorted(str(value).strip() for value in configured if str(value).strip())
+    )
+    covered_ids = tuple(
+        sorted(str(value).strip() for value in covered if str(value).strip())
+    )
+    source_ids = tuple(
+        sorted(str(value).strip() for value in sources if str(value).strip())
+    )
+    try:
+        configured_count = int(item.get("configured_points") or 0)
+        covered_count = int(item.get("covered_points") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not configured_ids
+        or not covered_ids
+        or not source_ids
+        or len(set(configured_ids)) != len(configured_ids)
+        or len(set(covered_ids)) != len(covered_ids)
+        or len(set(source_ids)) != len(source_ids)
+        or len(configured_ids) != configured_count
+        or len(covered_ids) != covered_count
+        or not set(covered_ids).issubset(configured_ids)
+    ):
+        return None
+    return configured_ids, covered_ids, source_ids
 
 
 def _empty_window_counts() -> dict[str, int]:
@@ -723,7 +775,20 @@ def compare_window_assessment_versions(
             continue
         exact_identity = _window_assessment_identity(item, include_methodology=True)
         base_identity = _window_assessment_identity(item, include_methodology=False)
-        if exact_identity is None or base_identity is None:
+        if base_identity is None:
+            continue
+        if exact_identity is None:
+            counts["first_observation"] += 1
+            items.append(
+                _window_change_item(
+                    item,
+                    None,
+                    lifecycle="first_observation",
+                    current_run_id=current_run_id,
+                    previous_run_id=previous_run_id,
+                    reason="current_sampling_scope_incomplete",
+                )
+            )
             continue
         if (
             item.get("proxy_method_version")
@@ -740,14 +805,26 @@ def compare_window_assessment_versions(
 
         matched = previous_exact.get(exact_identity) if previous_is_usable else None
         if matched is None:
-            methodology_mismatch = bool(previous_base.get(base_identity))
+            same_base = previous_base.get(base_identity) or []
+            methodology_matches = [
+                candidate
+                for candidate in same_base
+                if candidate.get("proxy_method_version") == item.get("proxy_method_version")
+                and candidate.get("weight_version") == item.get("weight_version")
+            ]
+            sampling_scope_mismatch = bool(methodology_matches)
+            methodology_mismatch = bool(same_base) and not sampling_scope_mismatch
             reason = (
-                "methodology_mismatch"
-                if methodology_mismatch
+                "sampling_or_source_scope_mismatch"
+                if sampling_scope_mismatch
                 else (
-                    "no_same_target_snapshot"
-                    if previous_is_usable
-                    else "no_previous_comparable_snapshot"
+                    "methodology_mismatch"
+                    if methodology_mismatch
+                    else (
+                        "no_same_target_snapshot"
+                        if previous_is_usable
+                        else "no_previous_comparable_snapshot"
+                    )
                 )
             )
             lifecycle = (

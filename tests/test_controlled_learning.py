@@ -765,8 +765,9 @@ async def test_all_provider_failure_is_archived_without_secret_error_text(tmp_pa
 def test_controlled_learning_cron_has_no_feishu_or_send_command():
     cron = Path("deploy/controlled_learning.cron").read_text(encoding="utf-8")
 
-    assert "CRON_TZ=Asia/Shanghai" in cron
-    assert "30 10 * * *" in cron
+    assert "production host timezone: UTC" in cron
+    assert "CRON_TZ=Asia/Shanghai" not in cron
+    assert "30 2 * * *" in cron
     assert "controlled_learning_cli run" in cron
     command = cron.splitlines()[-1].lower()
     assert "feishu" not in command

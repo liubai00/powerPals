@@ -21,9 +21,24 @@ def meaningful_afternoon_changes(snapshot: dict[str, Any]) -> list[dict[str, Any
     change = snapshot.get("window_version_change")
     if not isinstance(change, dict) or change.get("status") != "available":
         return []
+    try:
+        edition_cutoff = datetime.fromisoformat(
+            f"{snapshot['report_date']}T{snapshot['release_slot']}:00+08:00"
+        )
+    except (KeyError, TypeError, ValueError):
+        return []
     candidates: list[dict[str, Any]] = []
     for item in change.get("items") or []:
         if not isinstance(item, dict):
+            continue
+        valid_time = item.get("target_valid_time")
+        try:
+            valid_end = datetime.fromisoformat(str(valid_time["end"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if valid_end.tzinfo is None or valid_end.utcoffset() is None:
+            continue
+        if valid_end.astimezone(SHANGHAI_TZ) <= edition_cutoff:
             continue
         lifecycle = str(item.get("lifecycle") or "")
         severity = int(item.get("current_severity") or 0)
@@ -107,6 +122,41 @@ def _relative_day(report_date: str, target_date: Any) -> str:
     return str(target_date or "目标日")
 
 
+def _display_clock(value: Any) -> str:
+    try:
+        timestamp = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return "未记录"
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return "未记录"
+    timestamp = timestamp.astimezone(SHANGHAI_TZ)
+    return timestamp.strftime("%H:%M")
+
+
+def _plain_weather_message(value: Any) -> str:
+    text = str(value or "").strip()
+    if "负荷天气压力代理" in text:
+        if any(word in text for word in ("下调", "减弱", "缓解")):
+            return "高温或严寒影响有所缓解，用电天气压力减轻"
+        return "高温或严寒可能增加用电需求，需结合负荷预测观察"
+    if "光资源代理" in text or "光资源天气条件" in text:
+        if any(word in text for word in ("改善", "增强")):
+            return "云量减少，光伏发电天气条件有所改善"
+        return "云量或降雨增加，光伏发电天气条件转弱"
+    if "地面风" in text or "10米风" in text:
+        return "地面风速明显变化，新能源预测波动可能增加"
+    return text or "暂未形成可展示的天气判断"
+
+
+def _plain_reliability(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("较高") or text.startswith("高"):
+        return "较可靠"
+    if text.startswith("中等"):
+        return "可参考"
+    return "继续观察"
+
+
 def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     """Build an incremental Feishu card, or ``None`` when silence is required."""
 
@@ -114,11 +164,6 @@ def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | Non
     if not items:
         return None
     report_date = str(snapshot.get("report_date") or "")
-    current_run_id = str(snapshot.get("forecast_run_id") or "未提供")
-    previous_run_id = str(
-        (snapshot.get("window_version_change") or {}).get("previous_run_id")
-        or "未提供"
-    )
     lifecycle_labels = {
         "upgraded": "风险升级",
         "weakened": "风险减弱",
@@ -127,12 +172,18 @@ def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | Non
         "time_shifted": "时段移动",
         "confidence_changed": "可信度变化",
     }
+    reasons = "；".join(
+        (
+            f"{item.get('market')}·{item.get('representative_point')}代表点"
+            f"{item.get('window_label')}{lifecycle_labels.get(str(item.get('lifecycle')), '预测变化')}"
+        )
+        for item in items[:3]
+    )
     lines = [
-        "**比较基准**",
-        "对比今日09:00晨报",
-        f"预测批次：{previous_run_id} → {current_run_id}",
+        "**为什么发送**",
+        f"相较今天09:00晨报，{reasons}，因此发送本次更新。",
         "",
-        "**本次只列发生实质变化的窗口**",
+        "**变化详情**",
     ]
     for index, item in enumerate(items, start=1):
         relative_day = _relative_day(report_date, item.get("target_date"))
@@ -145,8 +196,8 @@ def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | Non
                     f"{item.get('window_label')}｜{lifecycle}**"
                 ),
                 (
-                    f"   {item.get('previous_direction') or '此前无同时间判断'} → "
-                    f"{item.get('current_direction')}"
+                    f"   {_plain_weather_message(item.get('previous_direction') or '此前无同时间判断')} → "
+                    f"{_plain_weather_message(item.get('current_direction'))}"
                 ),
                 *(
                     (
@@ -166,11 +217,14 @@ def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | Non
                     else ()
                 ),
                 f"   变化原因：{item.get('driver')}",
-                f"   建议核对：{item.get('verification_item')}",
-                f"   可信度：{item.get('confidence')}",
+                f"   继续观察：{item.get('verification_item')}",
+                f"   可靠程度：{_plain_reliability(item.get('confidence'))}",
             )
         )
-    generated_at = str(snapshot.get("retrieved_at") or snapshot.get("generated_at") or "未提供")
+    retrieved_at = _display_clock(
+        snapshot.get("retrieved_at") or snapshot.get("generated_at")
+    )
+    display_date = report_date[5:].replace("-", "/") if len(report_date) >= 10 else report_date
     return {
         "msg_type": "interactive",
         "card": {
@@ -179,7 +233,7 @@ def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | Non
                 "template": "orange",
                 "title": {
                     "tag": "plain_text",
-                    "content": "⏱ 15:00 电力气象变更快报",
+                    "content": f"🔔 午后气象变化提醒｜{display_date} 15:00",
                 },
             },
             "elements": [
@@ -188,7 +242,9 @@ def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | Non
                     "elements": [
                         {
                             "tag": "plain_text",
-                            "content": f"更新 {generated_at}｜仅在09:00后出现实质变化时发送",
+                            "content": (
+                                f"对比基准：今天09:00晨报｜最新数据：{retrieved_at}"
+                            ),
                         }
                     ],
                 },
@@ -203,7 +259,7 @@ def build_afternoon_delta_card(snapshot: dict[str, Any]) -> dict[str, Any] | Non
                         {
                             "tag": "plain_text",
                             "content": (
-                                "仅为天气侧代理变化；请结合负荷预测、新能源功率预测、"
+                                "仅为天气侧变化；请结合负荷预测、新能源功率预测、"
                                 "机组和线路信息核查，不构成价格、报价、仓位或买卖建议。"
                             ),
                         }

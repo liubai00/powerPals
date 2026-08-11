@@ -518,7 +518,7 @@ def test_weather_help_advertises_current_briefing_version(tmp_path):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "handled"
-    assert "电力气象交易晨报 3.1" in body["text"]
+    assert "电力气象交易晨报 3.2" in body["text"]
     assert "电力气象决策晨报 2.0" not in body["text"]
 
 

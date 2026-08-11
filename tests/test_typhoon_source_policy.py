@@ -538,4 +538,6 @@ def test_briefing_formatter_only_renders_storms_with_a_verified_market_relevance
     assert relevant is not None
     assert "测试台风" in relevant
     assert "关联关注分析区：cn-44-guangdong" in relevant
-    assert "影响窗口：2026-08-11T08:00:00+08:00 至 2026-08-12T20:00:00+08:00" in relevant
+    assert "影响窗口：08/11 08:00–08/12 20:00" in relevant
+    assert "来源：QWeather｜更新时间：08:50" in relevant
+    assert "https://" not in relevant

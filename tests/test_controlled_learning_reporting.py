@@ -418,8 +418,9 @@ async def test_report_without_stable_run_identity_makes_no_feishu_request(tmp_pa
 def test_learning_report_has_a_separate_schedule_without_overriding_send_gates() -> None:
     cron = Path("deploy/controlled_learning_report.cron").read_text(encoding="utf-8")
 
-    assert "CRON_TZ=Asia/Shanghai" in cron
-    assert "0 11 * * *" in cron
+    assert "production host timezone: UTC" in cron
+    assert "CRON_TZ=Asia/Shanghai" not in cron
+    assert "0 3 * * *" in cron
     assert "controlled_learning_report_cli --check-target" not in cron
     assert "controlled_learning_report_cli" in cron
     assert "CONTROLLED_LEARNING_REPORT_SEND_ENABLED=true" not in cron
@@ -430,5 +431,6 @@ def test_learning_report_has_a_separate_schedule_without_overriding_send_gates()
 def test_controlled_learning_schedule_is_explicitly_beijing_time() -> None:
     cron = Path("deploy/controlled_learning.cron").read_text(encoding="utf-8")
 
-    assert "CRON_TZ=Asia/Shanghai" in cron
-    assert "30 10 * * *" in cron
+    assert "production host timezone: UTC" in cron
+    assert "CRON_TZ=Asia/Shanghai" not in cron
+    assert "30 2 * * *" in cron

@@ -372,11 +372,11 @@ summary
 
 旧版社区节奏 scheduler 只有在 `LEGACY_WEATHER_SCHEDULER_ENABLED=true` 时才会运行，并读取 `.env` 中的 `DEFAULT_WEATHER_REGION`、`DEFAULT_WEATHER_LATITUDE`、`DEFAULT_WEATHER_LONGITUDE`；该开关默认关闭，不能因开启晨报的全局发送开关而被连带启用。不配置地点时默认使用深圳。后续如果要做“每天多个城市自动任务”，建议增加独立审核的任务配置表、发送开关和目标白名单。
 
-电力气象交易晨报 3.1 使用独立入口 `scripts/daily_power_briefing.py`，生产定时配置保存在 `deploy/power_briefing.cron`。全国版本覆盖 31 个省级地区、33 个电力气象分析区和 75 个代表城市。09:00 完整晨报的范围固定为“今日 09:00–24:00 + 明日 00:00–24:00”，逐一检查夜间、早峰、午间光伏、下午过渡、晚峰和深夜窗口；已过去的时段不会写成未来风险。今日变化只能与昨日 09:00 对今日同地区、同窗口、同代理指标和同方法版本的快照比较，明日首次出现则明确写“首次观察”，不再使用含糊的“较上一版”。
+电力气象交易晨报 3.2 使用独立入口 `scripts/daily_power_briefing.py`，生产定时配置保存在 `deploy/power_briefing.cron`。全国版本覆盖 31 个省级地区、33 个电力气象分析区和 75 个代表城市。09:00 完整晨报的范围固定为“今日 09:00–24:00 + 明日 00:00–24:00”，逐一检查早峰、午间光伏、下午过渡、晚峰和深夜窗口；已过去的时段不会写成未来风险。今日变化只能与昨日 09:00 对今日同地区、同窗口、同代理指标、同方法版本、同代表点范围和同数据源组合的快照比较，明日首次出现则明确写“首次观察”，不再使用含糊的“较上一版”。
 
-定时链保留四个北京时间节点：08:50 `precompute` 生成 09:00 不可变快照，09:00 `send` 只发送该快照；14:50 `afternoon_precompute` 必须先读到同日 09:00 快照，15:00 `afternoon_send` 只在风险新增、升级、减弱、解除、同一事件时段移动或可信度改变时发送差异卡，无实质变化则静默。上午与下午分别由 `POWER_BRIEFING_ALLOW_SEND` 和 `POWER_BRIEFING_AFTERNOON_ALLOW_SEND` 授权；每次发送还必须满足 `GLOBAL_FEISHU_SEND_ENABLED=true`、目标 `chat_id` 位于人工审核的 `POWER_BRIEFING_TARGETS_JSON`，且 `DRY_RUN=false`。任一条件不满足都不发送，也不会占用发送幂等键。cron 只选择运行模式，不覆盖计划开关。
+定时链保留四个北京时间节点：08:50 `precompute` 生成 09:00 不可变快照，09:00 `send` 只发送该快照；14:50 `afternoon_precompute` 必须先读到同日 09:00 快照，15:00 `afternoon_send` 只在风险新增、升级、减弱、解除、同一事件时段移动或可信度改变时发送差异卡，无实质变化则静默。生产主机使用 UTC，因此仓库 cron 模板已把上述北京时间显式换算为 00:50/01:00/06:50/07:00 UTC，不依赖可能被忽略的 `CRON_TZ`。发送晚于计划时次超过 `POWER_BRIEFING_MAX_SEND_DELAY_MINUTES`（默认 10 分钟）即失败关闭，禁止下午补发标题仍为 09:00 的旧晨报。上午与下午分别由 `POWER_BRIEFING_ALLOW_SEND` 和 `POWER_BRIEFING_AFTERNOON_ALLOW_SEND` 授权；每次发送还必须满足 `GLOBAL_FEISHU_SEND_ENABLED=true`、目标 `chat_id` 位于人工审核的 `POWER_BRIEFING_TARGETS_JSON`，且 `DRY_RUN=false`。任一条件不满足都不发送，也不会占用发送幂等键。cron 只选择运行模式，不覆盖计划开关。
 
-09:00/15:00 发送均只读取对应时次、带 `forecast_run_id` 的新鲜快照；缺失、过期、时次错误或身份不一致时以 `precompute_snapshot_missing` 失败关闭，不现场抓取和生成。每个“日期化发布时次 + 目标 + 快照 + run_id”使用 SQLite 持久化发送账本和稳定飞书 UUID；重复或并发运行最多产生一次外部消息，明确失败或过期租约使用同一 UUID 安全重试，账本默认清理 90 天前记录。代码中不保存群 ID。快照默认保留 24 小时；用户在群内真实 @云云手动生成晨报后，可回复该机器人消息并发送“展开全部分析区”读取同一快照，不会重复抓取。正常数据只显示一行更新时间、覆盖和可信度；缺失、降级、低可信或主动展开时才显示运行 ID、起报/有效时间、来源链接和内容指纹。代表城市不足时明确写“只按已有城市展示，不外推整个分析区”，单城市分析区不参与全区排行。
+09:00/15:00 发送均只读取对应时次、带 `forecast_run_id` 的新鲜快照；缺失、过期、时次错误或身份不一致时以 `precompute_snapshot_missing` 失败关闭，不现场抓取和生成。每个“日期化发布时次 + 目标 + 快照 + run_id”使用 SQLite 持久化发送账本和稳定飞书 UUID；重复或并发运行最多产生一次外部消息，明确失败或过期租约使用同一 UUID 安全重试，账本默认清理 90 天前记录。代码中不保存群 ID。快照默认保留 24 小时；用户在群内真实 @云云手动生成晨报后，可回复该机器人消息并发送“展开全部分析区”读取同一快照，不会重复抓取。主卡片只显示交易员可读的重点、全天时段、预测变化、明日关注、来源和更新时间；运行 ID、原始链接、内容指纹、起报时间及模型版本只保留在后台或展开详情中。代表城市不足时明确写“只按已有城市展示，不外推整个分析区”，单城市分析区不参与全区排行。
 
 订阅本身不是发送授权：私聊必须明确回复“确认订阅”，群聊还必须由配置的审核管理员在同一群、同一线程二次明确确认，“可以”“好的”等模糊回复不会激活。订阅状态即使成为 `ACTIVE` 也不能绕过全局发送开关、告警发送开关、目标范围和 `DRY_RUN`；当前生产应保持 `ALERT_SEND_ENABLED=false`，直至主动通知发送链、来源许可和目标白名单全部独立验收。
 
@@ -475,6 +475,7 @@ LOCAL_NEWS_JSONL_PATH=data/news_items.jsonl
 LOCAL_HYDROLOGY_JSONL_PATH=data/hydrology_records.jsonl
 POWER_BRIEFING_ALLOW_SEND=false
 POWER_BRIEFING_AFTERNOON_ALLOW_SEND=false
+POWER_BRIEFING_MAX_SEND_DELAY_MINUTES=10
 POWER_BRIEFING_TARGETS_JSON=[]
 LEGACY_WEATHER_SCHEDULER_ENABLED=false
 WEATHER_SOURCE_POLICIES_JSON=[]
@@ -512,7 +513,7 @@ PUBLIC_BASE_URL=
 监控与回滚责任人、逐来源所有者确认引用及有效期；计划发送可保留多个既有目标，但每个目标必须拥有唯一引用，并与 evidence 中的引用集合精确一致。
 preflight 的 `READY` 只是必要条件，不能替代真实许可、目标授权和变更审批。
 
-现有 08:50/09:00 与 14:50/15:00 任务定义在灰度和回滚中都保留；只有重新核对来源、目标、幂等和快照后才可恢复对应时次发送。晨报 3.1 的信息结构、演示卡和 22 项验收矩阵见 `docs/power_briefing_3_1_design.md`，完整发布检查表见 `docs/weather_power_trading_assistant_upgrade_plan.md`。
+现有 08:50/09:00 与 14:50/15:00 任务定义在灰度和回滚中都保留；只有重新核对来源、目标、幂等和快照后才可恢复对应时次发送。晨报 3.2 沿用的基线信息结构、演示卡和 22 项验收矩阵见 `docs/power_briefing_3_1_design.md`，完整发布检查表见 `docs/weather_power_trading_assistant_upgrade_plan.md`。
 
 ## Docker
 

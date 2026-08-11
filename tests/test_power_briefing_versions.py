@@ -5,7 +5,10 @@ from datetime import datetime
 import pytest
 
 from services.weather_bot.briefing_cache import BriefingCache
-from services.weather_bot.briefing_versions import compare_window_assessment_versions
+from services.weather_bot.briefing_versions import (
+    compare_market_risk_versions,
+    compare_window_assessment_versions,
+)
 from services.weather_bot import power_briefing
 from services.weather_bot.models import (
     AggregatedForecast,
@@ -131,9 +134,66 @@ def _window_assessment(
         "driver": "体感温度峰值39.0℃",
         "verification_item": "晚峰负荷预测、机组可用状态",
         "confidence": "中等",
+        "configured_point_ids": ["jinan", "qingdao"],
+        "covered_point_ids": ["jinan", "qingdao"],
+        "source_set": ["open_meteo", "qweather"],
+        "configured_points": 2,
+        "covered_points": 2,
         "proxy_method_version": proxy_method_version,
         "weight_version": "market-risk-weight-v1",
     }
+
+
+def _market_risk(*, severity: int, source_set: list[str] | None = None) -> dict:
+    return {
+        "market_id": "cn-37-shandong",
+        "severity": severity,
+        "target_valid_time": {
+            "start": "2026-08-11T00:00:00+08:00",
+            "end": "2026-08-11T23:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        "proxy_method_version": "power-weather-proxy-v1",
+        "weight_version": "market-risk-weight-v1",
+        "configured_point_ids": ["jinan", "qingdao"],
+        "covered_point_ids": ["jinan", "qingdao"],
+        "source_set": source_set or ["open_meteo", "qweather"],
+        "configured_points": 2,
+        "covered_points": 2,
+    }
+
+
+def test_market_version_comparison_fails_closed_when_the_source_set_changes():
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["market_risk_snapshots"] = [_market_risk(severity=1)]
+    current = _market_risk(severity=3, source_set=["open_meteo"])
+
+    result = compare_market_risk_versions(
+        [current],
+        previous,
+        current_run_metadata=_snapshot(run_id="briefing-run-20260810-0900"),
+    )
+
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "sampling_or_source_scope_mismatch"
+    assert "upgraded_markets" not in result
+
+
+def test_market_version_comparison_fails_closed_on_malformed_sampling_counts():
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["market_risk_snapshots"] = [_market_risk(severity=1)]
+    current = _market_risk(severity=3)
+    current["configured_points"] = "unknown"
+
+    result = compare_market_risk_versions(
+        [current],
+        previous,
+        current_run_metadata=_snapshot(run_id="briefing-run-20260810-0900"),
+    )
+
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "market_comparison_metadata_incomplete"
+    assert "upgraded_markets" not in result
 
 
 def test_window_version_comparison_reports_explicit_same_target_upgrade():
@@ -192,6 +252,28 @@ def test_window_version_comparison_never_compares_different_target_dates():
     assert result["counts"]["first_observation"] == 1
     assert result["items"][0]["lifecycle"] == "first_observation"
     assert result["items"][0]["comparison_basis"]["reason"] == "no_same_target_snapshot"
+
+
+def test_window_version_comparison_does_not_claim_an_upgrade_across_source_or_sampling_scope_changes():
+    previous = _snapshot(run_id="briefing-run-20260809-0900", report_date="2026-08-09")
+    previous["window_assessment_snapshots"] = [_window_assessment(severity=1)]
+    current = _window_assessment(severity=3)
+    current["source_set"] = ["open_meteo"]
+    current["covered_point_ids"] = ["jinan"]
+    current["covered_points"] = 1
+
+    result = compare_window_assessment_versions(
+        [current],
+        previous,
+        current_run_metadata=_snapshot(run_id="briefing-run-20260810-0900"),
+    )
+
+    assert result["counts"]["upgraded"] == 0
+    assert result["counts"]["first_observation"] == 1
+    assert result["items"][0]["lifecycle"] == "first_observation"
+    assert result["items"][0]["comparison_basis"]["reason"] == (
+        "sampling_or_source_scope_mismatch"
+    )
 
 
 @pytest.mark.parametrize(
@@ -475,13 +557,18 @@ async def test_generated_briefing_uses_yesterdays_forecast_for_the_same_today_wi
         f"{power_briefing.MARKET_CONFIG_VERSION}:"
         f"{power_briefing.POWER_BRIEFING_REPORT_VERSION}"
     )
-    previous["window_assessment_snapshots"] = [
-        _window_assessment(
-            target_date="2026-08-10",
-            severity=1,
-            direction="负荷天气压力代理轻微抬升",
-        )
-    ]
+    previous_assessment = _window_assessment(
+        target_date="2026-08-10",
+        severity=1,
+        direction="负荷天气压力代理轻微抬升",
+    )
+    previous_assessment.update(
+        configured_point_ids=["jinan"],
+        covered_point_ids=["jinan"],
+        configured_points=1,
+        covered_points=1,
+    )
+    previous["window_assessment_snapshots"] = [previous_assessment]
     assert cache.claim_generation(previous["cache_key"], "previous", now=100)
     cache.save_and_release(
         previous["cache_key"],
@@ -501,12 +588,18 @@ async def test_generated_briefing_uses_yesterdays_forecast_for_the_same_today_wi
         release_slot="09:00",
     )
 
-    assert current["report_version"] == "power-briefing-3.1"
+    assert current["report_version"] == "power-briefing-3.2"
     assessments = current["window_assessment_snapshots"]
     assert {item["target_date"] for item in assessments} == {
         "2026-08-10",
         "2026-08-11",
     }
+    assert all(item["configured_point_ids"] == ["jinan"] for item in assessments)
+    assert all(item["covered_point_ids"] == ["jinan"] for item in assessments)
+    assert all(
+        item["source_set"] == ["open_meteo", "qweather"]
+        for item in assessments
+    )
     change = next(
         item
         for item in current["window_version_change"]["items"]
@@ -527,15 +620,15 @@ async def test_generated_briefing_uses_yesterdays_forecast_for_the_same_today_wi
 
     card_text = _card_text(current["summary_card"])
     title = current["summary_card"]["card"]["header"]["title"]["content"]
-    assert "电力气象交易晨报｜08/10 09:00" in title
-    assert "分析范围：今日09:00–24:00 + 明日00:00–24:00" in card_text
-    assert "今日预测修正" in card_text
+    assert "电力气象晨报｜08/10 09:00" in title
+    assert "全天时段" in card_text
+    assert "今日预测变化" in card_text
     assert "对比昨日09:00对今日相同时段的预测" in card_text
-    assert "负荷天气压力代理轻微抬升 → 负荷天气压力代理偏高" in card_text
-    assert "明日首次观察" in card_text
+    assert "高温或严寒影响轻微增加 → 高温或严寒可能增加用电需求" in card_text
+    assert "明日提前关注" in card_text
     assert "首次纳入观察，暂无同时间可比预测" in card_text
-    assert "放心清单" in card_text
-    assert "结论有效期" in card_text
+    assert "放心清单" not in card_text
+    assert "结论有效期" not in card_text
     assert "Top 5 气象侧风险" not in card_text
     assert "资源代理排行" not in card_text
 
@@ -593,11 +686,29 @@ def test_healthy_summary_keeps_data_health_compact_until_user_expands():
 
     summary_text = _card_text(summary)
     detail_text = _card_text(detail)
-    assert "更新 2026-08-10 08:58｜分析区有数据 1/1｜总体可信度：高" in summary_text
+    assert "数据来源：Open-Meteo｜更新时间：08:58" in summary_text
     assert "预报版本与数据质量" not in summary_text
     assert "SHA-256" not in summary_text
     assert "预报版本与数据质量" in detail_text
     assert "SHA-256 " + "a" * 64 in detail_text
+
+
+def test_compact_summary_says_plainly_when_there_is_no_weather_change_to_highlight():
+    run_metadata = _snapshot(run_id="briefing-run-quiet")
+    summary = power_briefing.build_briefing_card(
+        [_row(hot_tomorrow=False)],
+        "2026-08-10",
+        generated_at=datetime.fromisoformat("2026-08-10T09:00:00+08:00"),
+        market_config=_market_config(),
+        run_metadata=run_metadata,
+        version_change=run_metadata["version_change"],
+        window_version_change={"status": "available", "items": []},
+    )
+
+    text = _card_text(summary)
+    assert "今天没有需要特别提醒的气象变化" in text
+    assert "早峰、午间光伏时段和晚峰" in text
+    assert "Top 5" not in text
 
 
 def test_cache_persists_an_immutable_briefing_version_by_forecast_run_id(tmp_path):
@@ -827,6 +938,12 @@ async def test_generated_briefing_3_snapshot_exposes_traceable_run_and_quality_m
         "timezone": "Asia/Shanghai",
     }
     assert snapshot["sources"] == ["open_meteo", "qweather"]
+    assert snapshot["market_risk_snapshots"][0]["configured_point_ids"] == ["jinan"]
+    assert snapshot["market_risk_snapshots"][0]["covered_point_ids"] == ["jinan"]
+    assert snapshot["market_risk_snapshots"][0]["source_set"] == [
+        "open_meteo",
+        "qweather",
+    ]
     assert snapshot["quality"]["status"] == "degraded"
     assert "provider_issued_at_missing:open_meteo" in snapshot["quality"]["reasons"]
     assert snapshot["previous_run_id"] is None
@@ -836,23 +953,28 @@ async def test_generated_briefing_3_snapshot_exposes_traceable_run_and_quality_m
         "previous_run_id": None,
     }
     assert all("raw" not in item for item in snapshot["provider_run_metadata"])
-    assert snapshot["report_version"] == "power-briefing-3.1"
+    assert snapshot["report_version"] == "power-briefing-3.2"
 
     card_text = _card_text(snapshot["summary_card"])
-    assert "电力气象交易晨报｜08/10 09:00" in card_text
-    assert "briefing-run-20260810-0900" in card_text
-    assert "实际抓取 2026-08-10 08:58" in card_text
-    assert "聚合完成 2026-08-10 08:58" in card_text
-    assert "Open-Meteo 起报时间未提供" in card_text
-    assert "代理口径 power-weather-proxy-v1" in card_text
-    assert "权重版本 market-risk-weight-v1" in card_text
-    assert "https://api.open-meteo.com/v1/forecast" in card_text
-    assert "SHA-256 " + "a" * 64 in card_text
-    assert "数据质量 降级" in card_text
+    assert "电力气象晨报｜08/10 09:00" in card_text
+    assert "数据来源：Open-Meteo、和风天气｜更新时间：08:58" in card_text
+    assert "今日一句话" in card_text
+    assert "今天重点看" in card_text
+    assert "全天时段" in card_text
+    assert "明日提前关注" in card_text
+    assert "其他地区" in card_text
+    assert "放心清单" not in card_text
+    assert "结论有效期" not in card_text
+    assert "回复 **“展开全部分析区”**" not in card_text
+    assert len(snapshot["summary_card"]["card"]["elements"]) <= 9
+    assert "briefing-run-20260810-0900" not in card_text
+    assert "聚合完成" not in card_text
+    assert "起报时间" not in card_text
+    assert "power-weather-proxy-v1" not in card_text
+    assert "market-risk-weight-v1" not in card_text
+    assert "https://" not in card_text
+    assert "SHA-256" not in card_text
     assert "provider_issued_at_missing" not in card_text
-    assert "同目标时段比较基准：未找到可追溯快照；本卡不输出升降结论" in card_text
-    assert "上一版本" not in card_text
-    assert "上一同发布时次" not in card_text
     assert "未接入负荷、出力、机组、联络线及价格数据" in card_text
 
 
@@ -894,6 +1016,11 @@ async def test_briefing_refuses_to_compare_yesterdays_tomorrow_with_todays_tomor
             },
             "proxy_method_version": "power-weather-proxy-v1",
             "weight_version": "market-risk-weight-v1",
+            "configured_point_ids": ["jinan"],
+            "covered_point_ids": ["jinan"],
+            "source_set": ["open_meteo", "qweather"],
+            "configured_points": 1,
+            "covered_points": 1,
         }
     ]
     previous_key = previous["cache_key"]
@@ -922,7 +1049,8 @@ async def test_briefing_refuses_to_compare_yesterdays_tomorrow_with_todays_tomor
     assert "upgraded_markets" not in current["version_change"]
     assert "downgraded_markets" not in current["version_change"]
     card_text = _card_text(current["summary_card"])
-    assert "比较基准与本次目标有效时间不同，不进行升降比较" in card_text
+    assert "暂无同口径历史预测，本次不判断风险升高或降低" not in card_text
+    assert "对比昨日09:00对今日相同时段的预测" in card_text
     assert "较上一同发布时次 briefing-run-20260809-0900：" not in card_text
 
 
@@ -966,6 +1094,11 @@ async def test_briefing_refuses_a_risk_row_that_conflicts_with_the_previous_run_
             # A row may not claim a newer methodology than its parent run.
             "proxy_method_version": "power-weather-proxy-v1",
             "weight_version": "market-risk-weight-v1",
+            "configured_point_ids": ["jinan"],
+            "covered_point_ids": ["jinan"],
+            "source_set": ["open_meteo", "qweather"],
+            "configured_points": 1,
+            "covered_points": 1,
         }
     ]
     previous_key = previous["cache_key"]
@@ -1033,6 +1166,11 @@ async def test_briefing_compares_the_same_region_target_time_and_methodology(
             },
             "proxy_method_version": "power-weather-proxy-v1",
             "weight_version": "market-risk-weight-v1",
+            "configured_point_ids": ["jinan"],
+            "covered_point_ids": ["jinan"],
+            "source_set": ["open_meteo", "qweather"],
+            "configured_points": 1,
+            "covered_points": 1,
         }
     ]
     previous_key = previous["cache_key"]

@@ -168,6 +168,13 @@ class _AfternoonScheduledDateTime(datetime):
         return value.replace(tzinfo=tz) if tz is not None else value
 
 
+class _SeverelyLateMorningDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 8, 9, 17, 0)
+        return value.replace(tzinfo=tz) if tz is not None else value
+
+
 def _seed_scheduled_snapshot(db_path: str) -> dict:
     snapshot = _scheduled_snapshot()
     cache = BriefingCache(db_path, ttl_seconds=3600)
@@ -222,7 +229,7 @@ async def test_scheduled_send_requires_the_fresh_0850_precomputed_snapshot(
     class FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
-            value = cls(2026, 8, 9, 9, 0)
+            value = cls(2026, 8, 9, 9, 3)
             return value.replace(tzinfo=tz) if tz is not None else value
 
     def fail_forecast_service(*args, **kwargs):
@@ -281,7 +288,7 @@ async def test_scheduled_send_publishes_one_exact_precomputed_snapshot_with_a_st
     class FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
-            value = cls(2026, 8, 9, 9, 0)
+            value = cls(2026, 8, 9, 9, 3)
             return value.replace(tzinfo=tz) if tz is not None else value
 
     async def fake_send(self, chat_id, card, *, idempotency_key=None):
@@ -305,9 +312,43 @@ async def test_scheduled_send_publishes_one_exact_precomputed_snapshot_with_a_st
         (
             "oc_reviewed",
             snapshot["summary_card"],
-            "c792d9da-6452-5859-9056-35e4a782a9ff",
+            "17f575ec-313b-5fb1-8b8b-5057d2765651",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_rejects_a_severely_late_release_before_feishu(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    db_path = str(tmp_path / "briefing.db")
+    _seed_scheduled_snapshot(db_path)
+    settings = Settings(
+        _env_file=None,
+        power_briefing_cache_db=db_path,
+        power_briefing_cache_ttl_seconds=86400,
+        power_briefing_max_send_delay_minutes=10,
+        global_feishu_send_enabled=True,
+        power_briefing_allow_send=True,
+        power_briefing_targets_json=json.dumps(
+            [{"name": "reviewed briefing group", "chat_id": "oc_reviewed"}],
+        ),
+    )
+
+    async def fail_send(*args, **kwargs):
+        raise AssertionError("a 09:00 edition must not be sent at 17:00")
+
+    monkeypatch.setattr(weather_main, "Settings", lambda: settings)
+    monkeypatch.setattr(daily_power_briefing, "datetime", _SeverelyLateMorningDateTime)
+    monkeypatch.setattr(FeishuClient, "send_interactive_card", fail_send)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    result = await daily_power_briefing.go("send")
+
+    assert result == "release_window_expired"
+    assert "reason=release_window_expired" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -660,10 +701,10 @@ def test_0900_briefing_names_the_actual_today_and_tomorrow_windows_that_need_att
     focus = _card_section(card, "今天先看哪三件事")
 
     assert "广东样本区·广州代表点｜今日10:00–16:00｜午间光伏" in focus
-    assert "光资源代理转弱" in focus
-    assert "建议核对：新能源功率预测和场站运行信息" in focus
+    assert "云量或降雨增加，光伏发电天气条件转弱" in focus
+    assert "继续观察：新能源功率预测和场站运行信息" in focus
     assert "江苏样本区·盐城代表点｜明日06:00–10:00｜早峰" in focus
-    assert "局地风雨复合天气风险" in focus
+    assert "风雨同时增强，需关注新能源预测和电网运行变化" in focus
     assert "今日17:00–21:00｜晚峰｜已检查，暂无需要重点跟踪的信号" in text
 
 

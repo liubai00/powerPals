@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""电力气象交易晨报 3.1：完整窗口、同目标比较和代理边界优先。"""
+"""电力气象交易晨报 3.2：完整窗口、同目标比较和代理边界优先。"""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from services.weather_bot.typhoon import TyphoonClient, format_active_for_briefi
 from services.weather_bot.workbench import collect_forecasts_with_errors
 
 
-POWER_BRIEFING_REPORT_VERSION = "power-briefing-3.1"
+POWER_BRIEFING_REPORT_VERSION = "power-briefing-3.2"
 POWER_WEATHER_PROXY_VERSION = "power-weather-proxy-v1"
 MARKET_RISK_WEIGHT_VERSION = "market-risk-weight-v1"
 MARKET_POINTS = representative_points()
@@ -1294,6 +1294,7 @@ def _window_assessment_snapshots(
         for market in market_config:
             market_rows = rows_by_market.get(market.market_id, [])
             expected_points = len(market.points)
+            configured_point_ids = sorted(point.point_id for point in market.points)
             for window in market.analysis_windows:
                 start_minutes = window.start_hour * 60
                 end_minutes = window.end_hour * 60
@@ -1307,6 +1308,8 @@ def _window_assessment_snapshots(
                 selected_city = market.points[0].city if market.points else market.market_name
                 selected_confidence = "不可用"
                 source_run_ids: set[str] = set()
+                covered_point_ids: set[str] = set()
+                source_set: set[str] = set()
                 for row in market_rows:
                     submission = (row.get("submissions") or {}).get(target_date)
                     if submission is None:
@@ -1322,6 +1325,14 @@ def _window_assessment_snapshots(
                     if not points:
                         continue
                     covered_points += 1
+                    point_id = str(row.get("point_id") or row.get("city") or "").strip()
+                    if point_id:
+                        covered_point_ids.add(point_id)
+                    source_set.update(
+                        str(provider).strip()
+                        for provider in submission.aggregated_forecast.providers_used
+                        if str(provider).strip()
+                    )
                     run_id = str(
                         getattr(submission.time_info, "forecast_run_id", None) or ""
                     ).strip()
@@ -1394,6 +1405,9 @@ def _window_assessment_snapshots(
                         "confidence": selected_confidence,
                         "covered_points": covered_points,
                         "configured_points": expected_points,
+                        "configured_point_ids": configured_point_ids,
+                        "covered_point_ids": sorted(covered_point_ids),
+                        "source_set": sorted(source_set),
                         "source_forecast_run_ids": sorted(source_run_ids),
                         "proxy_method_version": POWER_WEATHER_PROXY_VERSION,
                         "weight_version": MARKET_RISK_WEIGHT_VERSION,
@@ -1440,10 +1454,7 @@ def _today_revision_text(
         and item.get("target_date") == start_date
         and item.get("lifecycle") in {"upgraded", "weakened", "resolved"}
     ]
-    basis = (
-        f"对比昨日{release_slot}对今日相同时段的预测"
-        + (f"（批次 {previous_run_id}）" if previous_run_id else "")
-    )
+    basis = f"对比昨日{release_slot}对今日相同时段的预测"
     if not current_changes:
         if previous_run_id:
             return basis + "\n- 同目标时段未发现达到展示阈值的预测修正。"
@@ -1462,9 +1473,15 @@ def _today_revision_text(
                     f"今日{_clock_range(item.get('target_valid_time'))}｜{item.get('window_label')}｜"
                     f"{lifecycle_labels.get(str(item.get('lifecycle')), '预测修正')}**"
                 ),
-                f"  {item.get('previous_direction') or '此前无判断'} → {item.get('current_direction')}",
+                (
+                    f"  {_plain_weather_message(item.get('previous_direction') or '此前无判断')} → "
+                    f"{_plain_weather_message(item.get('current_direction'))}"
+                ),
                 f"  变化原因：{item.get('driver')}",
-                f"  建议核对：{item.get('verification_item')}｜可信度：{item.get('confidence')}",
+                (
+                    f"  继续观察：{item.get('verification_item')}｜"
+                    f"可靠程度：{_plain_reliability(item.get('confidence'))}"
+                ),
             )
         )
     return "\n".join(lines)
@@ -1485,15 +1502,21 @@ def _tomorrow_first_observation_text(
     if not items:
         return "明日全部窗口已完成首次检查，暂无达到关注阈值的天气侧信号。"
     lines = ["首次纳入观察，暂无同时间可比预测。"]
-    for item in items[:5]:
+    for item in items[:3]:
         lines.extend(
             (
                 (
                     f"- **{item.get('market')}·{item.get('representative_point')}代表点｜"
                     f"明日{_clock_range(item.get('target_valid_time'))}｜{item.get('window_label')}**"
                 ),
-                f"  {item.get('current_direction')}；驱动：{item.get('driver')}",
-                f"  建议核对：{item.get('verification_item')}｜可信度：{item.get('confidence')}",
+                (
+                    f"  {_plain_weather_message(item.get('current_direction'))}；"
+                    f"原因：{item.get('driver')}"
+                ),
+                (
+                    f"  继续观察：{item.get('verification_item')}｜"
+                    f"可靠程度：{_plain_reliability(item.get('confidence'))}"
+                ),
             )
         )
     return "\n".join(lines)
@@ -1522,10 +1545,10 @@ def _top_focus_text(
                     f"{index}. **{item.market}·{item.city}代表点｜{item.relative_day}"
                     f"{item.start_hour:02d}:00–{item.end_hour:02d}:00｜{item.window_label}**"
                 ),
-                f"   {item.direction}；驱动：{item.driver}",
+                f"   {_plain_weather_message(item.direction)}；原因：{item.driver}",
                 f"   为什么关注：{item.why_attention}",
-                f"   建议核对：{item.verification_item}",
-                f"   可信度：{item.confidence}",
+                f"   继续观察：{item.verification_item}",
+                f"   可靠程度：{_plain_reliability(item.confidence)}",
             )
         )
     return "\n".join(lines)
@@ -1545,12 +1568,15 @@ def _focus_conclusion(
         market_config=market_config,
     )[:3]
     if not items:
-        return "未来窗口均已检查，暂无达到重点跟踪阈值的天气侧信号。"
+        return (
+            "今天没有需要特别提醒的气象变化。"
+            "早峰、午间光伏时段和晚峰均未发现达到关注阈值的天气信号。"
+        )
     return "；".join(
         (
             f"{item.relative_day}{item.market}·{item.city}代表点"
             f"{item.start_hour:02d}:00–{item.end_hour:02d}:00"
-            f"{item.direction}"
+            f"{_plain_weather_message(item.direction)}"
         )
         for item in items
     ) + "。"
@@ -1798,28 +1824,57 @@ def _market_risk_snapshots(
     """Persist derived market features only; provider raw payloads never enter versions."""
 
     target_date = (date.fromisoformat(start_date) + timedelta(days=1)).isoformat()
-    return [
-        {
-            "market_id": item.market_id,
-            "market": item.market,
-            "province": item.province,
-            "representative_point": item.city,
-            "severity": item.severity,
-            "window": item.window,
-            "directions": list(item.directions),
-            "confidence": item.confidence,
-            "covered_points": item.covered_points,
-            "configured_points": item.configured_points,
-            "target_valid_time": _market_target_valid_time(
-                rows,
-                market_id=item.market_id,
-                target_date=target_date,
-            ),
-            "proxy_method_version": POWER_WEATHER_PROXY_VERSION,
-            "weight_version": MARKET_RISK_WEIGHT_VERSION,
-        }
-        for item in insights
-    ]
+    snapshots: list[dict[str, Any]] = []
+    for item in insights:
+        market_rows = [
+            row for row in rows if str(row.get("market_id") or "") == item.market_id
+        ]
+        configured_point_ids = sorted(
+            {
+                point_id
+                for row in market_rows
+                if (point_id := str(row.get("point_id") or "").strip())
+            }
+        )
+        covered_point_ids: set[str] = set()
+        source_set: set[str] = set()
+        for row in market_rows:
+            submission = (row.get("submissions") or {}).get(target_date)
+            if submission is None or not submission.aggregated_forecast.points:
+                continue
+            point_id = str(row.get("point_id") or "").strip()
+            if point_id:
+                covered_point_ids.add(point_id)
+            source_set.update(
+                str(provider).strip()
+                for provider in submission.aggregated_forecast.providers_used
+                if str(provider).strip()
+            )
+        snapshots.append(
+            {
+                "market_id": item.market_id,
+                "market": item.market,
+                "province": item.province,
+                "representative_point": item.city,
+                "severity": item.severity,
+                "window": item.window,
+                "directions": list(item.directions),
+                "confidence": item.confidence,
+                "covered_points": item.covered_points,
+                "configured_points": item.configured_points,
+                "configured_point_ids": configured_point_ids,
+                "covered_point_ids": sorted(covered_point_ids),
+                "source_set": sorted(source_set),
+                "target_valid_time": _market_target_valid_time(
+                    rows,
+                    market_id=item.market_id,
+                    target_date=target_date,
+                ),
+                "proxy_method_version": POWER_WEATHER_PROXY_VERSION,
+                "weight_version": MARKET_RISK_WEIGHT_VERSION,
+            }
+        )
+    return snapshots
 
 
 def _display_timestamp(value: Any) -> str:
@@ -1976,27 +2031,95 @@ def _should_show_run_quality_details(
     *,
     expanded: bool,
 ) -> bool:
-    """Keep the normal card compact; expand provenance when it changes trust."""
-    if expanded:
-        return True
-    quality = run_metadata.get("quality") or {}
-    if str(quality.get("status") or "").lower() != "good":
-        return True
-    confidence = str((run_metadata.get("confidence") or {}).get("level") or "").strip().lower()
-    if confidence in {"low", "very_low", "低", "偏低", "不可用"}:
-        return True
-    markets = coverage.get("markets") or {}
-    points = coverage.get("points") or {}
-    baseline_points = coverage.get("baseline_points") or {}
-    return any(
-        int(value or 0) > 0
-        for value in (
-            markets.get("partial"),
-            markets.get("missing"),
-            points.get("missing"),
-            baseline_points.get("missing"),
-        )
+    """Technical provenance belongs only to the explicit detail card."""
+    return expanded
+
+
+def _briefing_source_line(
+    rows: list[dict[str, Any]],
+    run_metadata: dict[str, Any],
+) -> str:
+    providers = [
+        _provider_label(str(provider))
+        for provider in run_metadata.get("sources") or []
+        if str(provider).strip()
+    ]
+    source_text = "、".join(dict.fromkeys(providers)) or _source_summary(rows).replace(
+        " / ",
+        "、",
     )
+    retrieved = _parse_aware_timestamp(run_metadata.get("retrieved_at"))
+    update_text = retrieved.strftime("%H:%M") if retrieved is not None else "未记录"
+    return f"数据来源：{source_text}｜更新时间：{update_text}"
+
+
+def _plain_weather_message(value: Any) -> str:
+    text = str(value or "").strip()
+    if "负荷天气压力代理" in text:
+        if any(word in text for word in ("下调", "减弱", "缓解")):
+            return "高温或严寒影响有所缓解，用电天气压力减轻"
+        if "轻微" in text:
+            return "高温或严寒影响轻微增加"
+        return "高温或严寒可能增加用电需求，需结合负荷预测观察"
+    if "光资源代理" in text or "光资源天气条件" in text:
+        if any(word in text for word in ("改善", "增强")):
+            return "云量减少，光伏发电天气条件有所改善"
+        return "云量或降雨增加，光伏发电天气条件转弱"
+    if "地面风" in text or "10米风" in text:
+        return "地面风速明显变化，新能源预测波动可能增加"
+    if "风雨复合" in text:
+        return "风雨同时增强，需关注新能源预测和电网运行变化"
+    return text or "暂未形成可展示的天气判断"
+
+
+def _plain_reliability(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("较高") or text.startswith("高"):
+        return "较可靠"
+    if text.startswith("中等"):
+        return "可参考"
+    return "继续观察"
+
+
+def _compact_trading_windows_text(
+    rows: list[dict[str, Any]],
+    start_date: str,
+) -> str:
+    windows = (
+        ("早峰", 8, 10),
+        ("午间光伏", 11, 15),
+        ("晚峰", 17, 21),
+    )
+    lines: list[str] = []
+    for label, start_hour, end_hour in windows:
+        status = _window_status(
+            rows,
+            target_date=start_date,
+            start_hour=start_hour,
+            end_hour=end_hour,
+        )
+        if "数据不足" in status:
+            summary = "部分地区数据不足，本次不强行判断"
+        elif match := re.search(r"(\d+)个分析区需要重点跟踪", status):
+            summary = f"{match.group(1)}个地区出现需关注变化，详见上方重点"
+        else:
+            summary = "暂未发现需要特别提醒的变化"
+        lines.append(f"- {label} {start_hour:02d}:00–{end_hour:02d}:00：{summary}")
+    return "\n".join(lines)
+
+
+def _compact_other_regions_text(coverage: dict[str, Any]) -> str:
+    areas = coverage.get("provincial_areas") or {}
+    total = int(areas.get("total") or 0)
+    covered = int(areas.get("covered") or 0)
+    missing = max(0, total - covered)
+    if missing:
+        base = f"{total}个地区中{covered}个已更新，{missing}个最新数据暂缺；缺失地区不作判断。"
+    else:
+        base = "其余已覆盖地区暂未发现需要特别提醒的气象变化。"
+    if int((coverage.get("markets") or {}).get("partial") or 0) > 0:
+        base += "部分地区仅有部分代表城市数据，不外推为全区结论。"
+    return base
 
 
 def build_briefing_card(
@@ -2065,12 +2188,7 @@ def build_briefing_card(
         f"来源 {_source_summary(rows)}"
     )
     if run_metadata is not None:
-        confidence_level = str((run_metadata.get("confidence") or {}).get("level") or "不可用")
-        health = (
-            f"更新 {_display_timestamp(run_metadata.get('retrieved_at'))}｜"
-            f"分析区有数据 {coverage['markets']['covered']}/{coverage['markets']['total']}｜"
-            f"总体可信度：{confidence_level}"
-        )
+        health = _briefing_source_line(rows, run_metadata)
     other_lines: list[str] = []
     if remaining_risks and not expanded:
         other_lines.append(f"另有 {len(remaining_risks)} 个较低优先级风险分析区未在卡片展开")
@@ -2104,6 +2222,110 @@ def build_briefing_card(
             "光资源代理质量：短波辐射缺失，"
             f"{fallback_points} 个代表点降级为云量+降水代理"
         )
+
+    if run_metadata is not None and not expanded:
+        compact_elements: list[dict[str, Any]] = [
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": health}]},
+        ]
+        if typhoon_block:
+            compact_elements.append(
+                {"tag": "div", "text": {"tag": "lark_md", "content": typhoon_block}}
+            )
+        compact_elements.extend(
+            [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**今日一句话**\n{conclusion}",
+                    },
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "**今天重点看**\n"
+                        + _top_focus_text(
+                            rows,
+                            start_date,
+                            cutoff=cutoff,
+                            market_config=market_config,
+                        ),
+                    },
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "**全天时段**\n"
+                        + _compact_trading_windows_text(rows, start_date),
+                    },
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            "**今日预测变化**\n"
+                            + _today_revision_text(
+                                window_version_change,
+                                start_date,
+                                release_slot=str(
+                                    run_metadata.get("release_slot") or "09:00"
+                                ),
+                            )
+                        ),
+                    },
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "**明日提前关注**\n"
+                        + _tomorrow_first_observation_text(
+                            window_version_change,
+                            tomorrow_date,
+                        ),
+                    },
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "**其他地区**\n" + _compact_other_regions_text(coverage),
+                    },
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": (
+                                "当前为代表城市气象扫描，不代表全省实况。"
+                                "未接入负荷、出力、机组、联络线及价格数据，"
+                                "不构成交易或报价建议。"
+                            ),
+                        }
+                    ],
+                },
+            ]
+        )
+        display_date = start_date[5:].replace("-", "/")
+        release_slot = str(run_metadata.get("release_slot") or "09:00")
+        return {
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "template": template,
+                    "title": {
+                        "tag": "plain_text",
+                        "content": f"⚡ 电力气象晨报｜{display_date} {release_slot}",
+                    },
+                },
+                "elements": compact_elements,
+            },
+        }
 
     elements: list[dict[str, Any]] = [
         {"tag": "note", "elements": [{"tag": "plain_text", "content": health}]},

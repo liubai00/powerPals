@@ -126,7 +126,8 @@ async def go(mode: str | None = None) -> str | None:
     is_send = selected_mode in {"send", "afternoon_send"}
     declared_release_slot = "15:00" if is_afternoon else "09:00"
     dry_run = bool(settings.dry_run) or os.getenv("DRY_RUN") == "1"
-    start_date = datetime.now(SHANGHAI_TZ).date().isoformat()
+    now_shanghai = datetime.now(SHANGHAI_TZ)
+    start_date = now_shanghai.date().isoformat()
     selected_card: dict[str, Any]
 
     if is_send:
@@ -150,6 +151,25 @@ async def go(mode: str | None = None) -> str | None:
         if not initial_decision.allowed:
             print("NO-SEND mode=%s reason=%s" % (selected_mode, initial_decision.reason))
             return initial_decision.reason
+        release_hour, release_minute = (
+            int(part) for part in declared_release_slot.split(":", 1)
+        )
+        scheduled_at = now_shanghai.replace(
+            hour=release_hour,
+            minute=release_minute,
+            second=0,
+            microsecond=0,
+        )
+        delay_minutes = (now_shanghai - scheduled_at).total_seconds() / 60.0
+        if delay_minutes < 0:
+            print("NO-SEND mode=%s reason=release_window_not_open" % selected_mode)
+            return "release_window_not_open"
+        if delay_minutes > max(0, int(settings.power_briefing_max_send_delay_minutes)):
+            print(
+                "NO-SEND mode=%s reason=release_window_expired delay_minutes=%.1f"
+                % (selected_mode, delay_minutes)
+            )
+            return "release_window_expired"
         cache = BriefingCache(
             settings.power_briefing_cache_db,
             ttl_seconds=settings.power_briefing_cache_ttl_seconds,

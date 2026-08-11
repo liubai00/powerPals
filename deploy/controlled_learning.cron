@@ -1,4 +1,4 @@
 # 云云受控持续学习（北京时间 10:30）。只读取公开实况并写本地评测库/报告；不发飞书、不改配置、不部署。
+# production host timezone: UTC；北京时间 10:30 对应 UTC 02:30。
 SHELL=/bin/sh
-CRON_TZ=Asia/Shanghai
-30 10 * * * docker exec -i powerpals-weather-bot-1 python -m services.weather_bot.controlled_learning_cli run >> /var/log/weather-controlled-learning.log 2>&1
+30 2 * * * docker exec -i powerpals-weather-bot-1 python -m services.weather_bot.controlled_learning_cli run >> /var/log/weather-controlled-learning.log 2>&1

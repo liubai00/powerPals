@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     power_briefing_cache_ttl_seconds: int = 86400
     power_briefing_allow_send: bool = False
     power_briefing_afternoon_allow_send: bool = False
+    power_briefing_max_send_delay_minutes: int = 10
     power_briefing_targets_json: str = "[]"
     legacy_weather_scheduler_enabled: bool = False
     controlled_learning_enabled: bool = False

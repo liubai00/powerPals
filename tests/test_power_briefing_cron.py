@@ -8,7 +8,8 @@ DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 def test_power_briefing_cron_keeps_morning_and_conditional_afternoon_releases_separate():
     assert CRON_TEMPLATE.is_file()
     content = CRON_TEMPLATE.read_text(encoding="utf-8")
-    assert "CRON_TZ=Asia/Shanghai" in content
+    assert "production host timezone: UTC" in content
+    assert "CRON_TZ=Asia/Shanghai" not in content
     assert "WEATHER_AGENT_COMPOSE_DIR=" in content
     lines = [
         line.strip()
@@ -26,11 +27,11 @@ def test_power_briefing_cron_keeps_morning_and_conditional_afternoon_releases_se
         line for line in lines if "POWER_BRIEFING_MODE=afternoon_send" in line
     )
 
-    assert precompute.startswith("50 8 * * * ")
+    assert precompute.startswith("50 0 * * * ")
     assert "POWER_BRIEFING_ALLOW_SEND=1" not in precompute
-    assert scheduled_send.startswith("0 9 * * * ")
-    assert afternoon_precompute.startswith("50 14 * * * ")
-    assert afternoon_send.startswith("0 15 * * * ")
+    assert scheduled_send.startswith("0 1 * * * ")
+    assert afternoon_precompute.startswith("50 6 * * * ")
+    assert afternoon_send.startswith("0 7 * * * ")
     assert "POWER_BRIEFING_ALLOW_SEND=1" not in scheduled_send
     assert "POWER_BRIEFING_AFTERNOON_ALLOW_SEND=1" not in afternoon_send
     for line in lines:
