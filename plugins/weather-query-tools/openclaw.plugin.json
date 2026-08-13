@@ -1,0 +1,47 @@
+{
+  "id": "weather-query-tools",
+  "name": "Weather Query Tools",
+  "description": "Native QWeather and Open-Meteo query tools for a single OpenClaw agent.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "qweatherApiHost": {
+        "type": "string",
+        "description": "Dedicated QWeather API Host; may omit https://."
+      },
+      "qweatherApiKey": {
+        "type": "string",
+        "description": "QWeather API key. Prefer QWEATHER_API_KEY in runtime env."
+      },
+      "openMeteoForecastHost": {
+        "type": "string",
+        "description": "Open-Meteo forecast API origin override."
+      },
+      "openMeteoGeocodingHost": {
+        "type": "string",
+        "description": "Open-Meteo geocoding API origin override."
+      },
+      "openMeteoApiKey": {
+        "type": "string",
+        "description": "Optional Open-Meteo commercial customer API key."
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 60000,
+        "description": "Defaults to 15 seconds."
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "qweather_query",
+      "openmeteo_query"
+    ]
+  }
+}

@@ -1,0 +1,239 @@
+// Sanitized reference for the dedicated weather-agent profile.
+// scripts/setup.ps1 writes the real absolute workspace/plugin paths.
+{
+  secrets: {
+    providers: {
+      model_key_file: {
+        source: "file",
+        path: "~/.openclaw-weather-agent/secrets/model-api-key.txt",
+        mode: "singleValue",
+        // Windows fallback only after restricting the file ACL.
+        allowInsecurePath: true,
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      workspace: "${WEATHER_AGENT_WORKSPACE}",
+      skipBootstrap: true,
+      model: {
+        primary: "weather-llm/gpt-5.6-sol",
+      },
+      models: {
+        "weather-llm/gpt-5.6-sol": {},
+      },
+      memorySearch: {
+        enabled: true,
+        provider: "local",
+        fallback: "none",
+        sync: {
+          onSessionStart: true,
+          onSearch: true,
+          watch: true,
+        },
+      },
+      imageGenerationModel: {
+        primary: "comfy/workflow",
+        timeoutMs: 600000,
+      },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      "weather-llm": {
+        baseUrl: "${LLM_API_BASE_URL}",
+        api: "openai-completions",
+        apiKey: {
+          source: "file",
+          provider: "model_key_file",
+          id: "value",
+        },
+        models: [
+          {
+            id: "gpt-5.6-sol",
+            name: "gpt-5.6-sol (Custom Provider)",
+            contextWindow: 128000,
+            maxTokens: 4096,
+            input: ["text"],
+            reasoning: false,
+          },
+        ],
+      },
+    },
+  },
+  gateway: {
+    mode: "local",
+    port: 18789,
+    bind: "loopback",
+    auth: {
+      mode: "token",
+      token: {
+        source: "env",
+        provider: "default",
+        id: "OPENCLAW_GATEWAY_TOKEN",
+      },
+    },
+    tailscale: {
+      mode: "off",
+      resetOnExit: false,
+    },
+  },
+  session: {
+    dmScope: "per-channel-peer",
+  },
+  tools: {
+    profile: "minimal",
+    alsoAllow: [
+      "group:fs",
+      "group:memory",
+      "web_search",
+      "web_fetch",
+      "cron",
+      "message",
+      "image_generate",
+      "qweather_query",
+      "openmeteo_query",
+    ],
+    web: {
+      search: {
+        enabled: true,
+        provider: "tavily",
+      },
+    },
+  },
+  cron: {
+    enabled: true,
+  },
+  channels: {
+    feishu: {
+      accounts: {
+        default: {
+          appId: "${FEISHU_WEATHER_APP_ID}",
+          appSecret: {
+            source: "env",
+            provider: "default",
+            id: "FEISHU_WEATHER_APP_SECRET",
+          },
+          name: "云云",
+          domain: "feishu",
+          enabled: true,
+        },
+      },
+      enabled: true,
+      defaultAccount: "default",
+      connectionMode: "websocket",
+      domain: "feishu",
+      dmPolicy: "pairing",
+      groupPolicy: "allowlist",
+      groupAllowFrom: [
+        "replace-with-reviewed-group-id-1",
+        "replace-with-reviewed-group-id-2",
+      ],
+      requireMention: true,
+      groupSessionScope: "group_sender",
+      streaming: false,
+      typingIndicator: false,
+      resolveSenderNames: false,
+      reactionNotifications: "off",
+      replyInThread: "disabled",
+      // Short replies stay as text; reports containing plaintext code blocks
+      // are promoted to Feishu Markdown cards automatically.
+      renderMode: "auto",
+      markdown: {
+        mode: "native",
+        tableMode: "ascii",
+      },
+      configWrites: false,
+      dynamicAgentCreation: {
+        enabled: false,
+      },
+      tools: {
+        doc: false,
+        chat: false,
+        wiki: false,
+        drive: false,
+        perm: false,
+        scopes: false,
+        bitable: false,
+      },
+    },
+  },
+  plugins: {
+    allow: [
+      "weather-query-tools",
+      "feishu",
+      "tavily",
+      "llama-cpp",
+      "memory-core",
+      "active-memory",
+      "comfy",
+    ],
+    load: {
+      paths: ["${WEATHER_QUERY_TOOLS_PLUGIN}",],
+    },
+    entries: {
+      "weather-query-tools": {
+        enabled: true,
+        config: {},
+      },
+      feishu: {
+        enabled: true,
+      },
+      tavily: {
+        enabled: true,
+        config: {
+          webSearch: {
+            apiKey: {
+              source: "env",
+              provider: "default",
+              id: "TAVILY_API_KEY",
+            },
+          },
+        },
+      },
+      "llama-cpp": {
+        enabled: true,
+      },
+      "memory-core": {
+        enabled: true,
+        config: {
+          dreaming: {
+            enabled: true,
+            frequency: "0 3 * * *",
+            timezone: "Asia/Shanghai",
+          },
+        },
+      },
+      "active-memory": {
+        enabled: true,
+        config: {
+          enabled: true,
+          agents: ["main"],
+          allowedChatTypes: ["direct"],
+          queryMode: "recent",
+          promptStyle: "preference-only",
+          timeoutMs: 15000,
+          maxSummaryChars: 220,
+          persistTranscripts: false,
+          logging: true,
+        },
+      },
+      comfy: {
+        enabled: true,
+        config: {
+          mode: "local",
+          baseUrl: "http://127.0.0.1:8188",
+          image: {
+            workflowPath: "${COMFY_WORKFLOW_PATH}",
+            promptNodeId: "27",
+            promptInputName: "text",
+            outputNodeId: "9",
+            pollIntervalMs: 1500,
+            timeoutMs: 600000,
+          },
+        },
+      },
+    },
+  },
+}

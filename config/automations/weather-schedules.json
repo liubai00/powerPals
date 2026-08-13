@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "timezone": "Asia/Shanghai",
+  "defaultLocation": "全国",
+  "agent": "main",
+  "morningBaselineFile": "runtime/weather-briefings/morning-latest.md",
+  "analysisGuide": "power-weather-scope.md",
+  "responseTemplate": "../../workspace/formats/power-weather-report.md",
+  "delivery": {
+    "channel": "feishu",
+    "account": "default"
+  },
+  "execution": {
+    "timeoutSeconds": 900,
+    "thinking": "medium",
+    "tools": [
+      "qweather_query",
+      "openmeteo_query",
+      "web_search",
+      "web_fetch",
+      "memory_search",
+      "memory_get"
+    ]
+  },
+  "jobs": [
+    {
+      "declarationKey": "weather-agent.daily.morning-0900",
+      "name": "全国电力交易气象晨报 09:00",
+      "displayName": "09:00 全国电力交易气象晨报",
+      "description": "每天 09:00 扫描全国天气对负荷、风光出力与净负荷的方向性影响。",
+      "cron": "0 9 * * *",
+      "prompt": "prompts/morning.md",
+      "additionalTools": ["write"],
+      "enabled": true
+    },
+    {
+      "declarationKey": "weather-agent.daily.recheck-1630",
+      "name": "全国交易气象变化复核 16:30",
+      "displayName": "16:30 全国交易气象变化复核",
+      "description": "每天 16:30 复核全国重点天气信号，仅在交易相关判断有实质变化时发送。",
+      "cron": "30 16 * * *",
+      "prompt": "prompts/recheck.md",
+      "additionalTools": ["read"],
+      "enabled": true
+    },
+    {
+      "declarationKey": "weather-agent.daily.tomorrow-1700",
+      "name": "全国次日电力交易气象预报 17:00",
+      "displayName": "17:00 全国次日电力交易气象预报",
+      "description": "每天 17:00 发送下一自然日全国负荷与风光气象风险预报。",
+      "cron": "0 17 * * *",
+      "prompt": "prompts/tomorrow.md",
+      "enabled": true
+    }
+  ]
+}

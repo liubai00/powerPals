@@ -1,8 +1,0 @@
-# 电力气象消息（北京时间：09:00完整晨报；15:00仅在相较09:00有实质变化时发送）
-# production host timezone: UTC；北京时间固定为 UTC+8，不能依赖该主机不支持的 CRON_TZ。
-SHELL=/bin/sh
-WEATHER_AGENT_COMPOSE_DIR=/data/application/openclaw/powerPals
-50 0 * * * cd "$WEATHER_AGENT_COMPOSE_DIR" && docker compose exec -T -e POWER_BRIEFING_MODE=precompute weather-bot python -m scripts.daily_power_briefing >> /var/log/power_briefing-precompute.log 2>&1
-0 1 * * * cd "$WEATHER_AGENT_COMPOSE_DIR" && docker compose exec -T -e POWER_BRIEFING_MODE=send weather-bot python -m scripts.daily_power_briefing >> /var/log/power_briefing.log 2>&1
-50 6 * * * cd "$WEATHER_AGENT_COMPOSE_DIR" && docker compose exec -T -e POWER_BRIEFING_MODE=afternoon_precompute weather-bot python -m scripts.daily_power_briefing >> /var/log/power_briefing-afternoon-precompute.log 2>&1
-0 7 * * * cd "$WEATHER_AGENT_COMPOSE_DIR" && docker compose exec -T -e POWER_BRIEFING_MODE=afternoon_send weather-bot python -m scripts.daily_power_briefing >> /var/log/power_briefing-afternoon.log 2>&1
