@@ -112,6 +112,15 @@ openclaw.cmd --profile weather-agent cron list --all
 .\scripts\setup-automations.ps1 -ValidateOnly
 ```
 
+Linux 服务器使用独立的 Docker Compose 部署包，见
+`deploy/openclaw/README.md`。需要通过 SSH 隧道从管理机同步定时任务时，可向
+`setup-automations.ps1` 传入 `-GatewayUrl`；令牌通过 `-GatewayToken` 或 profile
+的 `OPENCLAW_GATEWAY_TOKEN` 提供，脚本不会输出令牌。
+
+全国定时报告会在多次气象工具调用后进行一次较长的最终推理，模型 provider
+使用 `timeoutSeconds: 180`，避免 OpenClaw 默认 60 秒空闲上限中止报告；单条
+cron 仍由声明中的 900 秒总上限约束。
+
 图片服务状态可以这样检查：
 
 ```powershell

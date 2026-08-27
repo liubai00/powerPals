@@ -15,6 +15,8 @@ jobs:
       - name: Test scheduled multi-group delivery contract
         shell: pwsh
         run: ./tests/automation-delivery-contract.ps1
+      - name: Test Linux OpenClaw config normalization
+        run: python -m unittest tests/test_normalize_openclaw_config.py
 
   weather-plugin:
     runs-on: ubuntu-latest

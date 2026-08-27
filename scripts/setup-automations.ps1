@@ -4,6 +4,8 @@ param(
     [string]$DeliveryTarget,
     [string[]]$DeliveryTargets,
     [string]$Location,
+    [string]$GatewayUrl,
+    [string]$GatewayToken,
     [switch]$Disable,
     [switch]$ValidateOnly
 )
@@ -248,6 +250,24 @@ if ($null -ne $DeliveryTargets -and $DeliveryTargets.Length -gt 0) {
 
 $targetConfigured = $configuredTargets.Length -gt 0
 $explicitDeliveryInstructions = Get-ExplicitDeliveryInstructions -Targets $configuredTargets -Channel ([string]$manifest.delivery.channel) -Account ([string]$manifest.delivery.account)
+
+$connectionArguments = @()
+if (-not [string]::IsNullOrWhiteSpace($GatewayUrl)) {
+    $GatewayUrl = $GatewayUrl.Trim()
+    if ($GatewayUrl.Length -gt 500 -or $GatewayUrl -match "[\r\n]" -or $GatewayUrl -notmatch "^wss?://") {
+        throw "GatewayUrl must be a single ws:// or wss:// URL."
+    }
+    if ([string]::IsNullOrWhiteSpace($GatewayToken)) {
+        $GatewayToken = Get-ProfileEnvironmentValue -Name "OPENCLAW_GATEWAY_TOKEN"
+    }
+    if ([string]::IsNullOrWhiteSpace($GatewayToken)) {
+        throw "GatewayToken is required when GatewayUrl is configured."
+    }
+    $connectionArguments = @("--url", $GatewayUrl, "--token", $GatewayToken)
+} elseif (-not [string]::IsNullOrWhiteSpace($GatewayToken)) {
+    throw "GatewayUrl is required when GatewayToken is configured."
+}
+
 foreach ($job in $jobs) {
     $taskPrompt = Get-Content -LiteralPath $promptPaths[[string]$job.declarationKey] -Encoding utf8 -Raw
     $renderedMessage = ($taskPrompt.Trim() + "`n`n---`n`n" + $analysisGuide.Trim() + "`n`n---`n`n" + $responseTemplate.Trim()).Replace("{{LOCATION}}", $Location).Replace("{{MORNING_BASELINE_FILE}}", $baselineRelativePath.Replace("\", "/"))
@@ -290,7 +310,8 @@ foreach ($job in $jobs) {
     $cronArguments = @(
         "--profile", $OpenClawProfile,
         "cron", "add",
-        "--json",
+        "--json"
+    ) + $connectionArguments + @(
         "--declaration-key", [string]$job.declarationKey,
         "--display-name", [string]$job.displayName,
         "--name", [string]$job.name,
@@ -325,18 +346,18 @@ foreach ($job in $jobs) {
     }
 
     if ($shouldEnable) {
-        $editResult = & $openClawCommand.Source --profile $OpenClawProfile cron edit $jobId --name ([string]$job.name) --description ([string]$job.description) --enable --no-deliver --clear-to --clear-channel --clear-account --clear-session-key 2>&1
+        $editResult = & $openClawCommand.Source --profile $OpenClawProfile cron edit $jobId @connectionArguments --name ([string]$job.name) --description ([string]$job.description) --enable --no-deliver --clear-to --clear-channel --clear-account --clear-session-key 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "Automation '$($job.name)' was declared but could not be enabled: $($editResult | Out-String)"
         }
     } else {
-        $editResult = & $openClawCommand.Source --profile $OpenClawProfile cron edit $jobId --name ([string]$job.name) --description ([string]$job.description) --disable --no-deliver --clear-to --clear-channel --clear-account --clear-session-key 2>&1
+        $editResult = & $openClawCommand.Source --profile $OpenClawProfile cron edit $jobId @connectionArguments --name ([string]$job.name) --description ([string]$job.description) --disable --no-deliver --clear-to --clear-channel --clear-account --clear-session-key 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "Automation '$($job.name)' was declared but could not be disabled safely: $($editResult | Out-String)"
         }
     }
 
-    $verifiedJob = (& $openClawCommand.Source --profile $OpenClawProfile cron get $jobId 2>&1) | Out-String | ConvertFrom-Json
+    $verifiedJob = (& $openClawCommand.Source --profile $OpenClawProfile cron get $jobId @connectionArguments 2>&1) | Out-String | ConvertFrom-Json
     $expectedDeliveryMode = "none"
     $actualTools = @($verifiedJob.payload.toolsAllow)
     $actualDeliveryTarget = if ($null -ne $verifiedJob.delivery.PSObject.Properties["to"]) { [string]$verifiedJob.delivery.to } else { "" }

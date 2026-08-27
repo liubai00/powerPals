@@ -44,6 +44,9 @@
       "weather-llm": {
         baseUrl: "${LLM_API_BASE_URL}",
         api: "openai-completions",
+        // National scheduled reports can make a final model call after many
+        // weather tool results; keep this above the 60-second default idle limit.
+        timeoutSeconds: 180,
         apiKey: {
           source: "file",
           provider: "model_key_file",

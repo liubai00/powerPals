@@ -1,0 +1,36 @@
+name: weather-agent-v2
+
+services:
+  openclaw-gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/openclaw/Dockerfile
+      args:
+        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.7.1-2}
+    image: weather-agent-v2/openclaw:${WEATHER_AGENT_IMAGE_TAG:?WEATHER_AGENT_IMAGE_TAG is required}
+    env_file:
+      - ${WEATHER_AGENT_ENV_FILE:?WEATHER_AGENT_ENV_FILE is required}
+    environment:
+      HOME: /home/node
+      NODE_ENV: production
+      OPENCLAW_CONFIG_PATH: /home/node/.openclaw-weather-agent/openclaw.json
+      OPENCLAW_STATE_DIR: /home/node/.openclaw-weather-agent
+      OPENCLAW_TZ: Asia/Shanghai
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw-weather-agent/workspace
+      TZ: Asia/Shanghai
+      WEATHER_AGENT_WORKSPACE: /home/node/.openclaw-weather-agent/workspace
+      WEATHER_QUERY_TOOLS_PLUGIN: /opt/weather-query-tools
+      COMFY_WORKFLOW_PATH: /opt/weather-agent/config/workflows/z-image-turbo-nvfp4-api.json
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+    ports:
+      - "127.0.0.1:${WEATHER_AGENT_GATEWAY_PORT:-18895}:18789"
+    volumes:
+      - ${WEATHER_AGENT_STATE_DIR:?WEATHER_AGENT_STATE_DIR is required}:/home/node/.openclaw-weather-agent
+      - ${WEATHER_AGENT_WORKSPACE_DIR:?WEATHER_AGENT_WORKSPACE_DIR is required}:/home/node/.openclaw-weather-agent/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
