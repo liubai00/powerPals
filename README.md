@@ -90,7 +90,7 @@ openclaw.cmd --profile weather-agent channels status
 
 6. 配置并同步定时简报：
 
-在 profile 的 `.env` 中填写已审核的飞书群目标和报告范围。目标顺序固定且会去重；第一项使用 OpenClaw cron 原生投递，其余项由同一次 Agent 运行通过 OpenClaw 原生 `message` 工具同步相同报告，不会重复生成三份内容：
+在 profile 的 `.env` 中填写已审核的飞书群目标和报告范围。目标顺序固定且会去重；同一次 Agent 运行只生成一次报告，再通过 OpenClaw 原生 `message` 工具显式发送给每个目标群。cron 自身不转发模型的最终收尾文本，避免工具调用后偶发的简短确认替代某个群的完整报告：
 
 ```dotenv
 WEATHER_SCHEDULE_FEISHU_TARGETS=chat:replace-with-reviewed-group-1,chat:replace-with-reviewed-group-2
@@ -104,7 +104,7 @@ Gateway 运行后执行：
 openclaw.cmd --profile weather-agent cron list --all
 ```
 
-脚本使用稳定的 `declarationKey` 幂等更新三条全国电力交易气象任务：09:00 全国晨报、16:30 变化复核、17:00 次日预报。全国任务先筛查七大区域，再精查 6～10 个重点省份，将天气翻译为负荷、光伏、风电和净负荷的方向性影响；不预测电价或 MW。16:30 只有相较晨报出现实质变化时才向所有目标群发送，没有变化时返回 `NO_REPLY`。如果没有配置发送目标，任务会被创建为禁用状态且不投递，防止误发。旧的单目标变量 `WEATHER_SCHEDULE_FEISHU_TARGET` 仍可兼容读取，但新配置统一使用复数变量。
+脚本使用稳定的 `declarationKey` 幂等更新三条全国电力交易气象任务：09:00 全国晨报、16:30 变化复核、17:00 次日预报。全国任务先筛查七大区域，再精查 6～10 个重点省份，将天气翻译为负荷、光伏、风电和净负荷的方向性影响；不预测电价或 MW。16:30 只有相较晨报出现实质变化时才向所有目标群发送，没有变化时返回 `NO_REPLY`。每条任务完成显式群发后也以 `NO_REPLY` 收尾，且 cron 投递模式保持关闭，因此不会额外发送“已收到”等模型确认语。如果没有配置发送目标，任务会被创建为禁用状态且不投递，防止误发。旧的单目标变量 `WEATHER_SCHEDULE_FEISHU_TARGET` 仍可兼容读取，但新配置统一使用复数变量。
 
 只校验声明、不修改 OpenClaw 时：
 

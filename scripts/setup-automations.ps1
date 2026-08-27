@@ -113,29 +113,29 @@ function Get-NormalizedDeliveryTargets {
     return @($normalized)
 }
 
-function Get-FanOutInstructions {
+function Get-ExplicitDeliveryInstructions {
     param(
-        [string[]]$SecondaryTargets,
+        [string[]]$Targets,
         [string]$Channel,
         [string]$Account
     )
 
-    if ($null -eq $SecondaryTargets -or $SecondaryTargets.Length -eq 0) {
+    if ($null -eq $Targets -or $Targets.Length -eq 0) {
         return ""
     }
 
-    $targetLines = @($SecondaryTargets | ForEach-Object { '- `{0}`' -f $_ }) -join "`n"
+    $targetLines = @($Targets | ForEach-Object { '- `{0}`' -f $_ }) -join "`n"
     return @(
         "## Multi-group delivery",
         "",
-        "OpenClaw automatically delivers your final answer to the primary group. Send an identical copy of the completed report to each additional group below:",
+        "This scheduled task owns delivery explicitly. Send an identical copy of the completed report to every group below:",
         "",
         $targetLines,
         "",
-        "- Complete the whole report first. Then call the message tool once per additional target with action=send, channel=$Channel, accountId=$Account, target set to that group, and message set to the complete final report.",
-        "- Do not use the message tool for the primary group; the cron delivery owns that copy.",
+        "- Complete the whole report once before sending. Then call the message tool once per target with action=send, channel=$Channel, accountId=$Account, target set to that group, and message set to the complete final report.",
+        "- Do not omit a target and do not treat any target as the primary group. OpenClaw cron delivery is disabled so that a short model acknowledgement can never replace the report in one group.",
         "- If the task rules require NO_REPLY, do not call the message tool and return exactly NO_REPLY.",
-        "- If one additional send fails, continue with the other targets and still return the complete final report for primary delivery.",
+        "- If a report is sent, attempt every target even when one send fails. After all attempts, return exactly NO_REPLY; never return an acknowledgement such as 已收到。",
         "- Group ids and delivery operations are internal details. Never include them in the report body."
     ) -join "`n"
 }
@@ -247,17 +247,12 @@ if ($null -ne $DeliveryTargets -and $DeliveryTargets.Length -gt 0) {
 }
 
 $targetConfigured = $configuredTargets.Length -gt 0
-$primaryDeliveryTarget = if ($targetConfigured) { [string]$configuredTargets[0] } else { "" }
-$secondaryDeliveryTargets = @()
-if ($configuredTargets.Length -gt 1) {
-    $secondaryDeliveryTargets = @($configuredTargets | Select-Object -Skip 1)
-}
-$fanOutInstructions = Get-FanOutInstructions -SecondaryTargets $secondaryDeliveryTargets -Channel ([string]$manifest.delivery.channel) -Account ([string]$manifest.delivery.account)
+$explicitDeliveryInstructions = Get-ExplicitDeliveryInstructions -Targets $configuredTargets -Channel ([string]$manifest.delivery.channel) -Account ([string]$manifest.delivery.account)
 foreach ($job in $jobs) {
     $taskPrompt = Get-Content -LiteralPath $promptPaths[[string]$job.declarationKey] -Encoding utf8 -Raw
     $renderedMessage = ($taskPrompt.Trim() + "`n`n---`n`n" + $analysisGuide.Trim() + "`n`n---`n`n" + $responseTemplate.Trim()).Replace("{{LOCATION}}", $Location).Replace("{{MORNING_BASELINE_FILE}}", $baselineRelativePath.Replace("\", "/"))
-    if (-not [string]::IsNullOrWhiteSpace($fanOutInstructions)) {
-        $renderedMessage = $renderedMessage.Trim() + "`n`n---`n`n" + $fanOutInstructions.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($explicitDeliveryInstructions)) {
+        $renderedMessage = $renderedMessage.Trim() + "`n`n---`n`n" + $explicitDeliveryInstructions.Trim()
     }
     if ($renderedMessage -match "\{\{[^{}]+\}\}") {
         throw "Automation '$($job.name)' contains an unresolved prompt token."
@@ -283,13 +278,13 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $baselinePath) -Force | O
 foreach ($job in $jobs) {
     $taskPrompt = Get-Content -LiteralPath $promptPaths[[string]$job.declarationKey] -Encoding utf8 -Raw
     $message = ($taskPrompt.Trim() + "`n`n---`n`n" + $analysisGuide.Trim() + "`n`n---`n`n" + $responseTemplate.Trim()).Replace("{{LOCATION}}", $Location).Replace("{{MORNING_BASELINE_FILE}}", $baselineRelativePath.Replace("\", "/"))
-    if (-not [string]::IsNullOrWhiteSpace($fanOutInstructions)) {
-        $message = $message.Trim() + "`n`n---`n`n" + $fanOutInstructions.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($explicitDeliveryInstructions)) {
+        $message = $message.Trim() + "`n`n---`n`n" + $explicitDeliveryInstructions.Trim()
     }
     $shouldEnable = ($job.enabled -eq $true) -and (-not $Disable) -and $targetConfigured
     $additionalTools = if ($null -ne $job.PSObject.Properties["additionalTools"]) { @($job.additionalTools) } else { @() }
-    $fanOutTools = if ($secondaryDeliveryTargets.Length -gt 0) { @("message") } else { @() }
-    $jobTools = @($baseTools + $additionalTools + $fanOutTools | Select-Object -Unique)
+    $deliveryTools = if ($targetConfigured) { @("message") } else { @() }
+    $jobTools = @($baseTools + $additionalTools + $deliveryTools | Select-Object -Unique)
     $tools = $jobTools -join ","
 
     $cronArguments = @(
@@ -313,13 +308,7 @@ foreach ($job in $jobs) {
     )
 
     if ($shouldEnable) {
-        $cronArguments += @(
-            "--announce",
-            "--best-effort-deliver",
-            "--channel", [string]$manifest.delivery.channel,
-            "--account", [string]$manifest.delivery.account,
-            "--to", $primaryDeliveryTarget
-        )
+        $cronArguments += @("--no-deliver")
     } else {
         $cronArguments += @("--no-deliver", "--disabled")
     }
@@ -336,7 +325,7 @@ foreach ($job in $jobs) {
     }
 
     if ($shouldEnable) {
-        $editResult = & $openClawCommand.Source --profile $OpenClawProfile cron edit $jobId --name ([string]$job.name) --description ([string]$job.description) --enable --clear-session-key 2>&1
+        $editResult = & $openClawCommand.Source --profile $OpenClawProfile cron edit $jobId --name ([string]$job.name) --description ([string]$job.description) --enable --no-deliver --clear-to --clear-channel --clear-account --clear-session-key 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "Automation '$($job.name)' was declared but could not be enabled: $($editResult | Out-String)"
         }
@@ -348,16 +337,17 @@ foreach ($job in $jobs) {
     }
 
     $verifiedJob = (& $openClawCommand.Source --profile $OpenClawProfile cron get $jobId 2>&1) | Out-String | ConvertFrom-Json
-    $expectedDeliveryMode = if ($shouldEnable) { "announce" } else { "none" }
+    $expectedDeliveryMode = "none"
     $actualTools = @($verifiedJob.payload.toolsAllow)
+    $actualDeliveryTarget = if ($null -ne $verifiedJob.delivery.PSObject.Properties["to"]) { [string]$verifiedJob.delivery.to } else { "" }
     if ([bool]$verifiedJob.enabled -ne $shouldEnable) {
         throw "Automation '$($job.name)' enabled state did not converge."
     }
     if ([string]$verifiedJob.delivery.mode -ne $expectedDeliveryMode) {
         throw "Automation '$($job.name)' delivery mode did not converge."
     }
-    if ($shouldEnable -and [string]$verifiedJob.delivery.to -ne $primaryDeliveryTarget) {
-        throw "Automation '$($job.name)' primary delivery target did not converge."
+    if ($shouldEnable -and -not [string]::IsNullOrWhiteSpace($actualDeliveryTarget)) {
+        throw "Automation '$($job.name)' retained a cron delivery target."
     }
     if ([string]$verifiedJob.payload.message -ne $message) {
         throw "Automation '$($job.name)' prompt was truncated or changed during synchronization."

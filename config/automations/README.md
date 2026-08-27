@@ -22,4 +22,4 @@
 
 OpenClaw 的隔离 cron 每次运行都会创建独立会话，因此 09:00 晨报会覆盖写入 `workspace/runtime/weather-briefings/morning-latest.md`，16:30 只读取日期和范围匹配的当天基线。该文件是可丢弃的运行数据，被 Git 忽略，也不会进入长期记忆。
 
-没有飞书发送目标时，同步脚本仍会创建三条任务，但保持禁用且不配置投递，避免误发。配置逗号或分号分隔的 `WEATHER_SCHEDULE_FEISHU_TARGETS` 后再次执行脚本即可收敛为启用状态。每个目标必须使用 `chat:<chat_id>`；第一项由 OpenClaw cron 原生投递，其余项在同一次 Agent 运行中通过原生 `message` 工具同步完全相同的报告，因此不会为不同群重复查询和生成。16:30 返回 `NO_REPLY` 时不会向任何群发送。
+没有飞书发送目标时，同步脚本仍会创建三条任务，但保持禁用且不配置投递，避免误发。配置逗号或分号分隔的 `WEATHER_SCHEDULE_FEISHU_TARGETS` 后再次执行脚本即可收敛为启用状态。每个目标必须使用 `chat:<chat_id>`；同一次 Agent 运行只生成一次报告，再通过原生 `message` 工具显式发送给每个目标群。cron 自身保持 `delivery.mode=none`，任务群发后以 `NO_REPLY` 收尾，避免模型在工具调用后的简短确认被额外投递。16:30 判断无实质变化时不调用 `message`，因此不会向任何群发送。

@@ -11,7 +11,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate OpenClaw automation package
         shell: pwsh
-        run: ./scripts/setup-automations.ps1 -ValidateOnly
+        run: ./scripts/setup-automations.ps1 -ValidateOnly -DeliveryTargets @("chat:ci-group-1", "chat:ci-group-2", "chat:ci-group-3")
+      - name: Test scheduled multi-group delivery contract
+        shell: pwsh
+        run: ./tests/automation-delivery-contract.ps1
 
   weather-plugin:
     runs-on: ubuntu-latest
