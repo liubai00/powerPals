@@ -41,7 +41,7 @@
       "cron": "30 16 * * *",
       "prompt": "prompts/recheck.md",
       "additionalTools": ["read"],
-      "enabled": true
+      "enabled": false
     },
     {
       "declarationKey": "weather-agent.daily.tomorrow-1700",
@@ -50,7 +50,7 @@
       "description": "每天 17:00 发送下一自然日全国负荷与风光气象风险预报。",
       "cron": "0 17 * * *",
       "prompt": "prompts/tomorrow.md",
-      "enabled": true
+      "enabled": false
     }
   ]
 }
